@@ -119,6 +119,10 @@ pub struct RawTradesPage {
 pub enum PageError {
     #[error("Data API trades limit must be in 1..={MAX_BATCH_LIMIT}, got {0}")]
     InvalidLimit(usize),
+    #[error(
+        "Data API trades minimum token size must be an exact positive decimal (zero means the provider default)"
+    )]
+    InvalidMinimumSize,
     #[error("Data API trades endpoint must use HTTPS (loopback HTTP only for local tests)")]
     InvalidEndpoint,
     #[error("Data API trades request failed")]
@@ -153,7 +157,7 @@ pub async fn fetch_v2_trades_page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<TradesPage, PageError> {
-    let page = fetch_raw_trades_page(client, base_url, Some(user), limit, cursor).await?;
+    let page = fetch_raw_trades_page(client, base_url, Some(user), limit, cursor, None).await?;
     let observations = page
         .rows
         .iter()
@@ -182,7 +186,31 @@ pub async fn fetch_v2_global_trades_page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<RawTradesPage, PageError> {
-    fetch_raw_trades_page(client, base_url, None, limit, cursor).await
+    fetch_raw_trades_page(client, base_url, None, limit, cursor, None).await
+}
+
+/// Read a global page with an explicit positive `TOKENS` minimum. In particular,
+/// zero is rejected because the provider treats zero as its default 0.01 floor,
+/// not as an unfiltered request. The caller owns the selected product precision
+/// and must retain the same filter on every cursor request. No coverage claim.
+///
+/// # Errors
+/// Rejects zero, negative or inexact/unparseable minimums before requesting,
+/// plus the same bounded transport/envelope errors as the default global reader.
+pub async fn fetch_v2_global_trades_page_with_min_size(
+    client: &reqwest::Client,
+    base_url: &str,
+    min_size: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<RawTradesPage, PageError> {
+    let minimum = rust_decimal::Decimal::from_str_exact(min_size)
+        .map_err(|_| PageError::InvalidMinimumSize)?;
+    if minimum <= rust_decimal::Decimal::ZERO {
+        return Err(PageError::InvalidMinimumSize);
+    }
+    let minimum = minimum.normalize().to_string();
+    fetch_raw_trades_page(client, base_url, None, limit, cursor, Some(&minimum)).await
 }
 
 async fn fetch_raw_trades_page(
@@ -191,6 +219,7 @@ async fn fetch_raw_trades_page(
     user: Option<&str>,
     limit: usize,
     cursor: Option<&str>,
+    min_size: Option<&str>,
 ) -> Result<RawTradesPage, PageError> {
     if !(1..=MAX_BATCH_LIMIT).contains(&limit) {
         return Err(PageError::InvalidLimit(limit));
@@ -208,6 +237,10 @@ async fn fetch_raw_trades_page(
     let mut query = vec![("taker_only", "false".to_owned())];
     if let Some(user) = user {
         query.push(("user", user.to_owned()));
+    }
+    if let Some(minimum) = min_size {
+        query.push(("filter_type", "TOKENS".to_owned()));
+        query.push(("filter_amount", minimum.to_owned()));
     }
     if let Some(cursor) = cursor {
         query.push(("cursor", cursor.to_owned()));

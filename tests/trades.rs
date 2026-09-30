@@ -1,7 +1,7 @@
 use axum::{Router, body::Body, http::StatusCode, routing::get};
 use polymarket_data::{
-    PageError, TradeRowError, TradeSide, fetch_v2_global_trades_page, fetch_v2_trades_page,
-    parse_v2_trade,
+    PageError, TradeRowError, TradeSide, fetch_v2_global_trades_page,
+    fetch_v2_global_trades_page_with_min_size, fetch_v2_trades_page, parse_v2_trade,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -193,6 +193,58 @@ async fn global_feed_rejects_malformed_data_or_pagination_instead_of_false_exhau
         );
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn explicit_nonzero_token_filter_includes_micro_fills_and_survives_cursor_paging() {
+    let app = Router::new().route(
+        "/v2/trades",
+        get(
+            |axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| async move {
+                assert!(!query.contains_key("user"));
+                assert_eq!(query["taker_only"], "false");
+                assert_eq!(query["filter_type"], "TOKENS");
+                assert_eq!(query["filter_amount"], "0.000001");
+                if query.contains_key("cursor") {
+                    assert!(!query.contains_key("limit"));
+                }
+                let mut tiny = row();
+                tiny["size"] = json!("0.000001");
+                axum::Json(json!({"data":[tiny],"pagination":{"next_cursor":"next"}}))
+            },
+        ),
+    );
+    let (base, server) = serve(app).await;
+    let client = reqwest::Client::new();
+    let first = fetch_v2_global_trades_page_with_min_size(&client, &base, "0.000001", 1000, None)
+        .await
+        .unwrap();
+    assert_eq!(first.rows[0]["size"], "0.000001");
+    fetch_v2_global_trades_page_with_min_size(
+        &client,
+        &base,
+        "0.000001",
+        1000,
+        first.next_cursor.as_deref(),
+    )
+    .await
+    .unwrap();
+    for invalid in [
+        "0",
+        "-1",
+        "NaN",
+        "private-invalid-value",
+        "0.00000000000000000000000000001",
+    ] {
+        let error = fetch_v2_global_trades_page_with_min_size(&client, &base, invalid, 1000, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, PageError::InvalidMinimumSize);
+        assert!(!error.to_string().contains(invalid));
+    }
+    server.abort();
 }
 
 #[tokio::test]
