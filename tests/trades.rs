@@ -1,5 +1,8 @@
 use axum::{Router, body::Body, http::StatusCode, routing::get};
-use polymarket_data::{PageError, TradeRowError, TradeSide, fetch_v2_trades_page, parse_v2_trade};
+use polymarket_data::{
+    PageError, TradeRowError, TradeSide, fetch_v2_global_trades_page, fetch_v2_trades_page,
+    parse_v2_trade,
+};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -69,6 +72,165 @@ async fn bounded_read_keeps_cursor_and_exact_evidence_without_project_conversion
         .unwrap();
     assert_eq!(page.observations[0].vendor_row(), &vendor);
     assert_eq!(page.next_cursor.as_deref(), Some("opaque-next"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_feed_omits_user_and_bounds_and_preserves_mixed_rows_and_multiplicity() {
+    let mut unenriched = row();
+    unenriched["condition_id"] = json!("");
+    unenriched["outcome"] = json!("");
+    let rows = vec![row(), row(), unenriched];
+    let expected = rows.clone();
+    let app = Router::new().route(
+        "/v2/trades",
+        get(
+            move |axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| {
+                let rows = rows.clone();
+                async move {
+                    assert_eq!(query.get("taker_only").map(String::as_str), Some("false"));
+                    assert!(!query.contains_key("user"));
+                    assert!(!query.contains_key("start"));
+                    assert!(!query.contains_key("end"));
+                    if query.contains_key("cursor") {
+                        assert_eq!(query["cursor"], "opaque+/=cursor");
+                        assert!(!query.contains_key("limit"));
+                    } else {
+                        assert_eq!(query["limit"], "3");
+                    }
+                    axum::Json(json!({"data":rows,"pagination":{"next_cursor":"opaque+/=cursor"}}))
+                }
+            },
+        ),
+    );
+    let (base, server) = serve(app).await;
+    let client = reqwest::Client::new();
+    let first = fetch_v2_global_trades_page(&client, &base, 3, None)
+        .await
+        .unwrap();
+    assert_eq!(first.rows, expected);
+    let next = fetch_v2_global_trades_page(&client, &base, 3, first.next_cursor.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(next.rows, expected);
+    server.abort();
+}
+
+#[tokio::test]
+async fn wallet_query_remains_explicit_and_global_transport_errors_are_typed() {
+    let app = Router::new().route(
+        "/v2/trades",
+        get(
+            |axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| async move {
+                assert_eq!(query["user"], WALLET);
+                assert_eq!(query["taker_only"], "false");
+                assert_eq!(query["cursor"], "saved-cursor");
+                assert!(!query.contains_key("limit"));
+                axum::Json(json!({"data":[row()],"pagination":{"next_cursor":null}}))
+            },
+        ),
+    );
+    let (base, server) = serve(app).await;
+    fetch_v2_trades_page(
+        &reqwest::Client::new(),
+        &base,
+        WALLET,
+        3,
+        Some("saved-cursor"),
+    )
+    .await
+    .unwrap();
+    server.abort();
+    let app = Router::new().route(
+        "/v2/trades",
+        get(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "7")],
+                "private vendor body",
+            )
+        }),
+    );
+    let (base, server) = serve(app).await;
+    assert_eq!(
+        fetch_v2_global_trades_page(&reqwest::Client::new(), &base, 3, None)
+            .await
+            .unwrap_err(),
+        PageError::RateLimitedWithDelay(7)
+    );
+    assert_eq!(
+        fetch_v2_global_trades_page(&reqwest::Client::new(), &base, 0, None)
+            .await
+            .unwrap_err(),
+        PageError::InvalidLimit(0)
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_feed_rejects_malformed_data_or_pagination_instead_of_false_exhaustion() {
+    for reply in [
+        json!({"pagination":{"next_cursor":null}}),
+        json!({"data":null,"pagination":{"next_cursor":null}}),
+        json!({"data":[],"pagination":null}),
+        json!({"data":[],"pagination":{}}),
+        json!({"data":[],"pagination":{"next_cursor":" "}}),
+        json!({"data":[],"pagination":{"next_cursor":42}}),
+        json!({"data":[],"pagination":{"next_cursor":null,"has_more":true}}),
+        json!({"data":[],"pagination":{"next_cursor":"next","has_more":false}}),
+    ] {
+        let app = Router::new().route("/v2/trades", get(move || async move { axum::Json(reply) }));
+        let (base, server) = serve(app).await;
+        assert_eq!(
+            fetch_v2_global_trades_page(&reqwest::Client::new(), &base, 3, None)
+                .await
+                .unwrap_err(),
+            PageError::InvalidEnvelope
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn global_feed_surfaces_cache_age_without_inventing_freshness() {
+    for (age, expected) in [("103", Some(103)), ("not-an-age", None)] {
+        let app = Router::new().route(
+            "/v2/trades",
+            get(move || async move {
+                (
+                    [("age", age)],
+                    axum::Json(json!({"data":[],"pagination":{"next_cursor":null}})),
+                )
+            }),
+        );
+        let (base, server) = serve(app).await;
+        let page = fetch_v2_global_trades_page(&reqwest::Client::new(), &base, 3, None)
+            .await
+            .unwrap();
+        assert_eq!(page.cache_age_seconds, expected);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn global_feed_accepts_explicit_terminal_empty_page() {
+    let app = Router::new().route(
+        "/v2/trades",
+        get(|| async {
+            axum::Json(json!({"data":[],"pagination":{"next_cursor":null,"has_more":false}}))
+        }),
+    );
+    let (base, server) = serve(app).await;
+    let page = fetch_v2_global_trades_page(&reqwest::Client::new(), &base, 3, None)
+        .await
+        .unwrap();
+    assert!(page.rows.is_empty());
+    assert!(page.next_cursor.is_none());
+    assert!(page.cache_age_seconds.is_none());
     server.abort();
 }
 

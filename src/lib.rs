@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
-//! Bounded, read-only public Polymarket data. Initial scope: Data API v2
-//! trade pages, without order submission, account state or P&L claims.
+//! Bounded, read-only public Polymarket Data API v2 trade pages and CLOB
+//! book observations, without order submission, account state or P&L claims.
+
+pub mod clob;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -101,6 +103,18 @@ pub struct TradesPage {
     pub next_cursor: Option<String>,
 }
 
+/// Unmodified global-feed rows, including products without ordinary market
+/// metadata. Rows are not validated trades, unique fills or executable signals.
+#[derive(Debug)]
+pub struct RawTradesPage {
+    pub rows: Vec<Value>,
+    /// Opaque vendor seek cursor; not a per-row identity or coverage proof.
+    pub next_cursor: Option<String>,
+    /// Parsed HTTP Age header. Missing/invalid is unknown, NOT a cache miss or
+    /// zero age. Even zero age supplies no upstream publication guarantee.
+    pub cache_age_seconds: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PageError {
     #[error("Data API trades limit must be in 1..={MAX_BATCH_LIMIT}, got {0}")]
@@ -139,6 +153,45 @@ pub async fn fetch_v2_trades_page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<TradesPage, PageError> {
+    let page = fetch_raw_trades_page(client, base_url, Some(user), limit, cursor).await?;
+    let observations = page
+        .rows
+        .iter()
+        .map(parse_v2_trade)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PageError::InvalidTrade)?;
+    Ok(TradesPage {
+        observations,
+        next_cursor: page.next_cursor,
+    })
+}
+
+/// Fetch one global v2 page, omitting `user` and including maker rows.
+/// Keeps every vendor row in order, including equal tuples and unenriched
+/// products. No market mapping, deduplication, time bounds or retries.
+/// Global `start/end` bounds are unsupported by the provider and are not sent.
+///
+/// # Errors
+///
+/// Rejects invalid limits/endpoints, unsuccessful status, oversized bodies and
+/// malformed envelopes. Row validation belongs to the consumer; raw JSON is
+/// evidence only. Errors omit URLs and response bodies.
+pub async fn fetch_v2_global_trades_page(
+    client: &reqwest::Client,
+    base_url: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<RawTradesPage, PageError> {
+    fetch_raw_trades_page(client, base_url, None, limit, cursor).await
+}
+
+async fn fetch_raw_trades_page(
+    client: &reqwest::Client,
+    base_url: &str,
+    user: Option<&str>,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<RawTradesPage, PageError> {
     if !(1..=MAX_BATCH_LIMIT).contains(&limit) {
         return Err(PageError::InvalidLimit(limit));
     }
@@ -152,10 +205,10 @@ pub async fn fetch_v2_trades_page(
     {
         return Err(PageError::InvalidEndpoint);
     }
-    let mut query = vec![
-        ("user", user.to_owned()),
-        ("taker_only", "false".to_owned()),
-    ];
+    let mut query = vec![("taker_only", "false".to_owned())];
+    if let Some(user) = user {
+        query.push(("user", user.to_owned()));
+    }
     if let Some(cursor) = cursor {
         query.push(("cursor", cursor.to_owned()));
     } else {
@@ -190,6 +243,11 @@ pub async fn fetch_v2_trades_page(
     {
         return Err(PageError::ResponseTooLarge);
     }
+    let cache_age_seconds = response
+        .headers()
+        .get(reqwest::header::AGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -202,30 +260,36 @@ pub async fn fetch_v2_trades_page(
         body.extend_from_slice(&chunk);
     }
     let page: VendorPage = serde_json::from_slice(&body).map_err(|_| PageError::InvalidEnvelope)?;
-    let observations = page
-        .data
-        .unwrap_or_default()
-        .iter()
-        .map(parse_v2_trade)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(PageError::InvalidTrade)?;
-    Ok(TradesPage {
-        observations,
-        next_cursor: page.pagination.next_cursor,
+    let next_cursor = match page.pagination.next_cursor {
+        Value::Null => None,
+        Value::String(cursor) if !cursor.trim().is_empty() => Some(cursor),
+        _ => return Err(PageError::InvalidEnvelope),
+    };
+    if page
+        .pagination
+        .has_more
+        .is_some_and(|has_more| has_more != next_cursor.is_some())
+    {
+        return Err(PageError::InvalidEnvelope);
+    }
+    Ok(RawTradesPage {
+        rows: page.data,
+        next_cursor,
+        cache_age_seconds,
     })
 }
 
 #[derive(Deserialize)]
 struct VendorPage {
-    #[serde(default)]
-    data: Option<Vec<Value>>,
+    data: Vec<Value>,
     pagination: Pagination,
 }
 
 #[derive(Deserialize)]
 struct Pagination {
+    next_cursor: Value,
     #[serde(default)]
-    next_cursor: Option<String>,
+    has_more: Option<bool>,
 }
 
 fn require_string<'a>(
