@@ -914,6 +914,66 @@ fn move_activity_second_split_into_block100(
         .insert(100, proofs);
 }
 
+fn native_two_condition_activity_quiet_lot_fixture() -> (CtfInventoryFixture, [B256; 2], String) {
+    let (mut fixture, conditions, owner) = native_two_condition_activity_fixture();
+    let mut rooted = fixture.rooted_gas_block.take().unwrap();
+    let trade = rooted.transactions.remove(2);
+    let trade_logs = rooted.receipt_logs.remove(2);
+    rooted.receipt_statuses.remove(2);
+    rooted.cumulative_gas_used.remove(2);
+    rooted.receipt_types.remove(2);
+    let second_split = fixture.extra_direct_call_transaction.take().unwrap();
+    let second_split_logs = fixture.extra_inventory_logs.take().unwrap();
+    rooted.transactions.push(second_split);
+    rooted.receipt_logs.push(second_split_logs);
+    rooted.receipt_statuses.push(1);
+    rooted.cumulative_gas_used.push(63_000);
+    rooted.receipt_types.push(0);
+    fixture.rooted_gas_block = Some(rooted);
+    fixture.third_direct_call_transaction = Some(trade);
+    fixture.third_inventory_logs = Some(trade_logs);
+
+    let (shared_root, shared_proofs) = activity_rooted_point(
+        &owner,
+        conditions,
+        [U256::from(4_u64); 2],
+        [U256::from(6_u64); 2],
+        990,
+        0,
+        U256::ONE,
+    );
+    let (closing_root, closing_proofs) = activity_rooted_point(
+        &owner,
+        conditions,
+        [U256::ZERO, U256::from(4_u64)],
+        [U256::from(6_u64); 2],
+        993,
+        0,
+        U256::ONE,
+    );
+    fixture.post_state = Some((shared_root.clone(), Value::Null));
+    fixture.extra_post_state = Some((shared_root, Value::Null));
+    fixture.third_post_state = Some((closing_root, Value::Null));
+    fixture.extra_direct_call_transaction = None;
+    fixture.extra_inventory_logs = None;
+    fixture
+        .fifth_code_proofs_by_block
+        .as_mut()
+        .unwrap()
+        .insert(100, shared_proofs.clone());
+    fixture
+        .fifth_code_proofs_by_block
+        .as_mut()
+        .unwrap()
+        .insert(101, shared_proofs);
+    fixture
+        .fifth_code_proofs_by_block
+        .as_mut()
+        .unwrap()
+        .insert(102, closing_proofs);
+    (fixture, conditions, owner)
+}
+
 fn capture_native_two_condition_splits(
     fixture: &CtfInventoryFixture,
     report: &super::FifthNativeBinaryTwoConditionSplitObservation,
@@ -1096,6 +1156,124 @@ fn capture_native_two_condition_activity(
     });
     let path =
         std::path::Path::new(&directory).join("fifth-native-two-condition-activity-rpc.json");
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap()
+        .write_all(&serde_json::to_vec(&envelope).unwrap())
+        .unwrap();
+}
+
+fn capture_native_two_condition_activity_intervals(
+    fixture: &CtfInventoryFixture,
+    report: &super::FifthNativeBinaryTwoConditionActivityObservation,
+    conditions: [B256; 2],
+    owner: &str,
+) {
+    let Ok(directory) =
+        std::env::var("POLYMARKET_DATA_CAPTURE_NATIVE_TWO_CONDITION_ACTIVITY_INTERVALS_DIRECTORY")
+    else {
+        return;
+    };
+    let mut unique = BTreeMap::new();
+    for row in fixture.rpc_capture.lock().unwrap().iter() {
+        let key = serde_json::to_string(&json!([row["method"], row["params"]])).unwrap();
+        if let Some(previous) = unique.insert(key, row.clone()) {
+            assert_eq!(previous["result"], row["result"]);
+        }
+    }
+    let boundary = |pair: &[FifthNativeBinaryModuleOperationBoundary; 2]| {
+        pair.iter()
+            .map(|point| {
+                let selected = point.native_context().selected_balances();
+                json!({
+                    "block_number":selected.block_number(),
+                    "block_hash":selected.block_hash(),
+                    "state_root":selected.state_root(),
+                    "condition_id":format!("{:#x}",point.native_context().condition_id()),
+                    "position_ids":point.native_context().position_ids().map(|id|format!("{id:#x}")),
+                    "owner_positions":[format!("{:#x}",selected.position_balance_a()),format!("{:#x}",selected.position_balance_b())],
+                    "owner_cash":format!("{:#x}",selected.pusd_balance()),
+                    "module_positions":point.module_position_balances().map(|value|format!("{value:#x}")),
+                    "module_cash":format!("{:#x}",point.module_pusd_balance()),
+                    "module_role":format!("{:#x}",point.module_role_bitmap()),
+                    "legacy_mapping":format!("{:#x}",point.native_context().legacy_mapping_value()),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let direct_locator = |value: &FifthDirectModuleTransactionLocator| {
+        json!({
+            "block_number":value.block_number(),
+            "block_hash":value.block_hash(),
+            "transaction_hash":value.transaction_hash(),
+            "transaction_index":value.transaction_index(),
+            "log_index":value.log_index(),
+        })
+    };
+    let trade_locator = |fact: &super::fifth_binary_trades::FifthTradeTransactionFact| {
+        json!({
+            "block_number":fact.block_number(),
+            "block_hash":fact.block_hash(),
+            "transaction_hash":fact.transaction_hash(),
+            "transaction_index":fact.transaction_index(),
+            "owner_position_inflows":fact.owner_position_inflows().map(|value|format!("{value:#x}")),
+            "owner_position_outflows":fact.owner_position_outflows().map(|value|format!("{value:#x}")),
+            "owner_pusd_inflow":format!("{:#x}",fact.owner_pusd_inflow()),
+            "owner_pusd_outflow":format!("{:#x}",fact.owner_pusd_outflow()),
+            "owner_fee_amount":format!("{:#x}",fact.owner_fee_amount()),
+        })
+    };
+    let intervals = report
+        .intervals()
+        .iter()
+        .map(|anchor| {
+            json!({
+                "from_block":anchor.from_block,
+                "through_block":anchor.through_block,
+                "parent_hash":anchor.expected_parent_hash,
+                "end_hash":anchor.expected_end_hash,
+            })
+        })
+        .collect::<Vec<_>>();
+    let first = report.intervals().first().unwrap();
+    let last = report.intervals().last().unwrap();
+    let envelope = json!({
+        "provenance":"Synthetic signed Polygon owner funding, native splits and Exchange source trade with root-bound owner/module proofs across contiguous chunks; no external chain observation.",
+        "case":"two-condition-funded-split-and-trade-contiguous-activity",
+        "owner":owner,
+        "conditions":conditions.map(|condition|format!("{condition:#x}")),
+        "from_block":first.from_block,
+        "through_block":last.through_block,
+        "parent_hash":first.expected_parent_hash,
+        "end_hash":last.expected_end_hash,
+        "intervals":intervals,
+        "source_policy_version":report.source_policy_version(),
+        "opening":boundary(report.opening()),
+        "block_observations":report.block_observations().iter().map(boundary).collect::<Vec<_>>(),
+        "funding":{
+            "transaction":direct_locator(report.funding().transaction()),
+            "asset":format!("{:?}",report.funding().asset()),
+            "amount":format!("{:#x}",report.funding().amount()),
+        },
+        "splits":report.splits().iter().map(|fact|json!({
+            "condition_index":fact.condition_index(),
+            "condition_id":format!("{:#x}",fact.condition_id()),
+            "amount":format!("{:#x}",fact.amount()),
+            "operation_transaction":direct_locator(fact.operation_transaction()),
+        })).collect::<Vec<_>>(),
+        "trades":report.trades().iter().map(|fact|json!({
+            "condition_index":fact.condition_index(),
+            "transaction":trade_locator(fact.transaction()),
+        })).collect::<Vec<_>>(),
+        "actual_request_count":fixture.requests.load(Ordering::Relaxed),
+        "deduplicated_request_count":unique.len(),
+        "rpc_responses":unique.into_values().collect::<Vec<_>>(),
+    });
+    let path = std::path::Path::new(&directory)
+        .join("fifth-native-two-condition-activity-intervals-rpc.json");
     use std::io::Write as _;
     std::fs::OpenOptions::new()
         .write(true)
@@ -3346,6 +3524,472 @@ async fn native_two_condition_activity_replays_funding_split_trade_and_shared_ca
         &owner,
         opening["hash"].as_str().unwrap(),
         closing["hash"].as_str().unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn native_two_condition_activity_batch_carries_module_cash_across_chunks() {
+    let (fixture, conditions, owner) = native_two_condition_activity_fixture();
+    let (opening, block100, block101, _) = ctf_inventory_headers_with_102(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let condition_text = conditions.map(|condition| format!("{condition:#x}"));
+    let intervals = [
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+    ];
+    let report = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+            &owner,
+            [condition_text[0].as_str(), condition_text[1].as_str()],
+            &intervals,
+            5_000,
+            Duration::from_secs(45),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.source_policy_version(),
+        super::FIFTH_NATIVE_TWO_CONDITION_ACTIVITY_INTERVALS_POLICY_VERSION
+    );
+    assert_eq!(report.intervals(), intervals);
+    assert_eq!(report.evidence().blocks().len(), 2);
+    assert_eq!(report.funding().amount(), U256::from(10_u64));
+    assert_eq!(report.splits().len(), 2);
+    assert_eq!(report.trades().len(), 1);
+    let middle = &report.block_observations()[0];
+    assert_eq!(middle[0].module_pusd_balance(), U256::from(6_u64));
+    assert_eq!(middle[1].module_pusd_balance(), U256::from(6_u64));
+    let close = &report.block_observations()[1];
+    assert_eq!(close[0].module_pusd_balance(), U256::ZERO);
+    assert_eq!(close[1].module_pusd_balance(), U256::ZERO);
+    assert_eq!(fixture.requests.load(Ordering::Relaxed), 280);
+    capture_native_two_condition_activity_intervals(&fixture, &report, conditions, &owner);
+}
+
+#[tokio::test]
+async fn native_two_condition_activity_batch_accepts_advancing_finality_at_stable_anchor() {
+    let (mut fixture, conditions, owner) = native_two_condition_activity_fixture();
+    fixture.finalized_height_reads =
+        Some(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+    let (opening, block100, block101, _) = ctf_inventory_headers_with_102(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let condition_text = conditions.map(|condition| format!("{condition:#x}"));
+    let intervals = [
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+    ];
+    let report = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+            &owner,
+            [condition_text[0].as_str(), condition_text[1].as_str()],
+            &intervals,
+            5_000,
+            Duration::from_secs(45),
+        )
+        .await
+        .unwrap();
+    let first = report.block_observations()[0][0]
+        .native_context()
+        .selected_balances()
+        .code_context()
+        .primary_finalized_height();
+    let second = report.block_observations()[1][0]
+        .native_context()
+        .selected_balances()
+        .code_context()
+        .primary_finalized_height();
+    assert!(second > first);
+    assert_eq!(report.evidence().blocks()[0].block_hash(), block100["hash"]);
+}
+
+#[tokio::test]
+async fn native_two_condition_activity_batch_preflights_all_anchors_and_budget() {
+    use super::BoundedFifthNativeBinaryTwoConditionActivityError as Error;
+
+    let (fixture, conditions, owner) = native_two_condition_activity_fixture();
+    let (opening, block100, block101, block102) = ctf_inventory_headers_with_102(&fixture);
+    let valid = [
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+    ];
+    let condition_text = conditions.map(|condition| format!("{condition:#x}"));
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
+    let mut skipped = valid.clone();
+    skipped[1] = super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+        102,
+        102,
+        block100["hash"].as_str().unwrap(),
+        block102["hash"].as_str().unwrap(),
+    );
+    let result = verifier
+        .verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+            &owner,
+            [condition_text[0].as_str(), condition_text[1].as_str()],
+            &skipped,
+            5_000,
+            Duration::from_secs(45),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(Error::Verification(ChainLogAuditError::InvalidInput))
+    );
+    assert_eq!(fixture.requests.load(Ordering::Relaxed), 0);
+    let malformed = [
+        [
+            valid[0].clone(),
+            super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+                100,
+                100,
+                block100["hash"].as_str().unwrap(),
+                block100["hash"].as_str().unwrap(),
+            ),
+        ],
+        [
+            valid[0].clone(),
+            super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+                101,
+                101,
+                format!("0x{}", "33".repeat(32)),
+                block101["hash"].as_str().unwrap(),
+            ),
+        ],
+        [valid[1].clone(), valid[0].clone()],
+        [
+            super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+                100,
+                116,
+                opening["hash"].as_str().unwrap(),
+                block100["hash"].as_str().unwrap(),
+            ),
+            valid[1].clone(),
+        ],
+    ];
+    for invalid_anchors in malformed {
+        let result = verifier
+            .verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+                &owner,
+                [condition_text[0].as_str(), condition_text[1].as_str()],
+                &invalid_anchors,
+                5_000,
+                Duration::from_secs(45),
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(Error::Verification(ChainLogAuditError::InvalidInput))
+        );
+    }
+    assert_eq!(fixture.requests.load(Ordering::Relaxed), 0);
+
+    let (fixture, conditions, owner) = native_two_condition_activity_fixture();
+    let (opening, block100, block101, _) = ctf_inventory_headers_with_102(&fixture);
+    let anchors = [
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+    ];
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let condition_text = conditions.map(|condition| format!("{condition:#x}"));
+    let result = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+            &owner,
+            [condition_text[0].as_str(), condition_text[1].as_str()],
+            &anchors,
+            279,
+            Duration::from_secs(45),
+        )
+        .await;
+    assert_eq!(result, Err(Error::RequestBudgetExceeded));
+    assert_eq!(fixture.requests.load(Ordering::Relaxed), 278);
+}
+
+#[tokio::test]
+async fn native_two_condition_activity_batch_uses_one_deadline_and_cancellation() {
+    use super::{
+        BoundedFifthNativeBinaryTwoConditionActivityError as Error, CtfInventoryDeadlineGate,
+    };
+
+    let (mut fixture, conditions, owner) = native_two_condition_activity_fixture();
+    fixture.initial_clock_advance_ms = Some(500);
+    let gate = std::sync::Arc::new(CtfInventoryDeadlineGate::new());
+    fixture.deadline_gate = Some(gate.clone());
+    tokio::time::pause();
+    let (opening, block100, block101, _) = ctf_inventory_headers_with_102(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
+    let condition_text = conditions.map(|condition| format!("{condition:#x}"));
+    let anchors = [
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+    ];
+    let owner_for_task = owner.clone();
+    let requests = fixture.requests.clone();
+    let mut task = tokio::spawn(async move {
+        verifier
+            .verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+                &owner_for_task,
+                [condition_text[0].as_str(), condition_text[1].as_str()],
+                &anchors,
+                5_000,
+                Duration::from_secs(1),
+            )
+            .await
+    });
+    tokio::select! {
+        _ = gate.started.notified() => {}
+        result = &mut task => panic!("batch deadline gate returned early: {result:?}"),
+        _ = test_wall_timeout(Duration::from_secs(30)) => panic!("batch deadline gate was not reached"),
+    }
+    let before_release = requests.load(Ordering::Relaxed);
+    assert!(before_release > 0);
+    tokio::time::advance(Duration::from_millis(600)).await;
+    let result = tokio::select! {
+        result = &mut task => result.unwrap(),
+        _ = test_wall_timeout(Duration::from_secs(30)) => panic!("batch deadline did not settle"),
+    };
+    gate.release.send_replace(true);
+    assert_eq!(result, Err(Error::Timeout));
+    assert_eq!(requests.load(Ordering::Relaxed), before_release);
+    tokio::time::resume();
+
+    let (mut fixture, conditions, owner) = native_two_condition_activity_fixture();
+    let cancel_gate = std::sync::Arc::new(CtfInventoryDeadlineGate::new());
+    fixture.deadline_gate = Some(cancel_gate.clone());
+    let (opening, block100, block101, _) = ctf_inventory_headers_with_102(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
+    let condition_text = conditions.map(|condition| format!("{condition:#x}"));
+    let anchors = [
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+    ];
+    let requests = fixture.requests.clone();
+    let mut task = tokio::spawn(async move {
+        verifier
+            .verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+                &owner,
+                [condition_text[0].as_str(), condition_text[1].as_str()],
+                &anchors,
+                5_000,
+                Duration::from_secs(10),
+            )
+            .await
+    });
+    tokio::select! {
+        _ = cancel_gate.started.notified() => {}
+        result = &mut task => panic!("batch cancellation gate returned early: {result:?}"),
+        _ = test_wall_timeout(Duration::from_secs(30)) => panic!("batch cancellation gate was not reached"),
+    }
+    let sent = requests.load(Ordering::Relaxed);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    cancel_gate.release.send_replace(true);
+    test_wall_timeout(Duration::from_millis(50)).await;
+    assert_eq!(requests.load(Ordering::Relaxed), sent);
+}
+
+#[tokio::test]
+async fn native_two_condition_activity_batch_carries_stock_through_quiet_chunk_before_sale() {
+    let (fixture, conditions, owner) = native_two_condition_activity_quiet_lot_fixture();
+    let (opening, block100, block101, block102) = ctf_inventory_headers_with_102(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let condition_text = conditions.map(|condition| format!("{condition:#x}"));
+    let intervals = [
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            102,
+            102,
+            block101["hash"].as_str().unwrap(),
+            block102["hash"].as_str().unwrap(),
+        ),
+    ];
+    let report = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+            &owner,
+            [condition_text[0].as_str(), condition_text[1].as_str()],
+            &intervals,
+            5_000,
+            Duration::from_secs(45),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.block_observations().len(), 3);
+    let quiet = &report.block_observations()[1];
+    assert_eq!(
+        quiet[0]
+            .native_context()
+            .selected_balances()
+            .position_balance_a(),
+        U256::from(4_u64)
+    );
+    assert_eq!(
+        quiet[0]
+            .native_context()
+            .selected_balances()
+            .position_balance_b(),
+        U256::from(4_u64)
+    );
+    assert_eq!(quiet[0].module_pusd_balance(), U256::ZERO);
+    assert_eq!(report.trades().len(), 1);
+    assert_eq!(
+        report.trades()[0].transaction().owner_position_outflows(),
+        [U256::from(4_u64), U256::ZERO]
+    );
+    assert_eq!(
+        report.trades()[0].transaction().owner_pusd_inflow(),
+        U256::from(3_u64)
+    );
+    let closing = report.block_observations().last().unwrap();
+    assert_eq!(
+        closing[0]
+            .native_context()
+            .selected_balances()
+            .pusd_balance(),
+        U256::from(993_u64)
+    );
+    assert_eq!(
+        closing[0]
+            .native_context()
+            .selected_balances()
+            .position_balance_a(),
+        U256::ZERO
+    );
+}
+
+#[tokio::test]
+async fn native_two_condition_activity_batch_refuses_final_module_cash_residue() {
+    use super::BoundedFifthNativeBinaryTwoConditionActivityError as Error;
+
+    let (mut fixture, conditions, owner) = native_two_condition_activity_fixture();
+    let (residual_root, residual_proofs) = activity_rooted_point(
+        &owner,
+        conditions,
+        [U256::ZERO, U256::from(4_u64)],
+        [U256::from(6_u64); 2],
+        993,
+        1,
+        U256::ONE,
+    );
+    fixture.extra_post_state = Some((residual_root, Value::Null));
+    fixture
+        .fifth_code_proofs_by_block
+        .as_mut()
+        .unwrap()
+        .insert(101, residual_proofs);
+    let (opening, block100, block101, _) = ctf_inventory_headers_with_102(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let condition_text = conditions.map(|condition| format!("{condition:#x}"));
+    let intervals = [
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+    ];
+    let result = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+            &owner,
+            [condition_text[0].as_str(), condition_text[1].as_str()],
+            &intervals,
+            5_000,
+            Duration::from_secs(45),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(Error::Verification(ChainLogAuditError::Unverified))
     );
 }
 

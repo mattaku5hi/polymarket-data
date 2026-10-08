@@ -199,6 +199,12 @@ owner/module cash and position state. It acquires one receipt interval and
 applies one request budget and deadline; the sealed report is complete-or-error
 and does not combine independently verified per-condition reports.
 
+`verify_fifth_native_binary_two_condition_activity_intervals_bounded` applies
+the same single source scan and shared owner/module replay across 1–16 adjacent
+rooted chunks (up to 256 blocks total). Module pUSD may carry between chunk
+boundaries; funding, both splits, trade cash, and final residue are verified once
+over the complete interval set with one request budget and deadline.
+
 Context minimum sizes retain endpoint-specific units: Gamma `orderMinSize` is
 labelled USDC notional by its documentation, book `min_order_size` is shares,
 and compact CLOB `mos` has an unspecified unit. Typed unit getters describe those

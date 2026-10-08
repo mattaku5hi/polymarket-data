@@ -6,6 +6,7 @@ use super::fifth_direct_module_operations::{
     self as source, FifthDirectModuleFundingFact, FundingCall, ModuleCall, ModuleOperationPoint,
 };
 use super::fifth_exchange_controls::FifthExchangeControlsObservation;
+use super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor;
 use super::fifth_native_binary::is_canonical_native_binary_condition;
 use super::fifth_native_binary_trades::{
     BoundedFifthNativeBinaryTradeError, transaction_has_control_or_upgrade_event,
@@ -23,18 +24,41 @@ use super::fifth_native_two_condition_trades::{
     tag_trade_fact,
 };
 use super::{
-    ChainLogAuditError, ChainLogVerifier, ChainReceiptIntervalEvidence, MAX_BLOCKS,
-    TransactionRequestBudget, parse_fixed_b256, validate_hex,
+    CHAIN_ID, ChainLogAuditError, ChainLogVerifier, ChainReceiptIntervalEvidence, MAX_BLOCKS,
+    RECEIPT_INTERVAL_POLICY_VERSION, TransactionRequestBudget, parse_fixed_b256, validate_hex,
 };
 use alloy_primitives::{Address, B256, U256};
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 use thiserror::Error;
 use tokio::time::Instant;
 
 const POLICY_VERSION: &str =
     "fifth-native-binary-two-condition-activity-source-and-shared-pusd-replay/1";
+const INTERVALS_POLICY_VERSION: &str =
+    "fifth-native-binary-two-condition-activity-contiguous-shared-custody-replay/1";
 
 pub const FIFTH_NATIVE_TWO_CONDITION_ACTIVITY_POLICY_VERSION: &str = POLICY_VERSION;
+pub const FIFTH_NATIVE_TWO_CONDITION_ACTIVITY_INTERVALS_POLICY_VERSION: &str =
+    INTERVALS_POLICY_VERSION;
+
+const MAX_ACTIVITY_INTERVALS: usize = 16;
+const MAX_ACTIVITY_INTERVAL_BLOCKS: u64 = 16;
+const MAX_ACTIVITY_TOTAL_BLOCKS: u64 = 256;
+
+struct ValidatedActivityInterval {
+    from_block: u64,
+    through_block: u64,
+    parent_hash: String,
+    end_hash: String,
+}
+
+struct CollectedActivity {
+    evidence: ChainReceiptIntervalEvidence,
+    intervals: Vec<FifthNativeBinaryActivityIntervalAnchor>,
+    policy: &'static str,
+    opening: [FifthNativeBinaryModuleOperationBoundary; 2],
+    block_observations: Vec<[FifthNativeBinaryModuleOperationBoundary; 2]>,
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BoundedFifthNativeBinaryTwoConditionActivityError {
@@ -50,6 +74,8 @@ pub enum BoundedFifthNativeBinaryTwoConditionActivityError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FifthNativeBinaryTwoConditionActivityObservation {
     evidence: ChainReceiptIntervalEvidence,
+    intervals: Vec<FifthNativeBinaryActivityIntervalAnchor>,
+    source_policy_version: &'static str,
     opening: [FifthNativeBinaryModuleOperationBoundary; 2],
     block_observations: Vec<[FifthNativeBinaryModuleOperationBoundary; 2]>,
     funding: FifthDirectModuleFundingFact,
@@ -62,6 +88,11 @@ impl FifthNativeBinaryTwoConditionActivityObservation {
     #[must_use]
     pub const fn evidence(&self) -> &ChainReceiptIntervalEvidence {
         &self.evidence
+    }
+
+    #[must_use]
+    pub fn intervals(&self) -> &[FifthNativeBinaryActivityIntervalAnchor] {
+        &self.intervals
     }
 
     #[must_use]
@@ -96,7 +127,7 @@ impl FifthNativeBinaryTwoConditionActivityObservation {
 
     #[must_use]
     pub const fn source_policy_version(&self) -> &'static str {
-        POLICY_VERSION
+        self.source_policy_version
     }
 }
 
@@ -156,7 +187,118 @@ impl ChainLogVerifier {
             &parent_hash,
             &end_hash,
             deadline,
+            vec![FifthNativeBinaryActivityIntervalAnchor::new(
+                from_block,
+                through_block,
+                parent_hash.clone(),
+                end_hash.clone(),
+            )],
+            POLICY_VERSION,
         );
+        tokio::pin!(verification);
+        let deadline_wait = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_wait);
+        tokio::select! {
+            biased;
+            _ = exhaustion.wait_for(|is_exhausted| *is_exhausted) => {
+                Err(BoundedFifthNativeBinaryTwoConditionActivityError::RequestBudgetExceeded)
+            }
+            () = &mut deadline_wait => {
+                if budget.is_exhausted() {
+                    Err(BoundedFifthNativeBinaryTwoConditionActivityError::RequestBudgetExceeded)
+                } else {
+                    Err(BoundedFifthNativeBinaryTwoConditionActivityError::Timeout)
+                }
+            }
+            result = &mut verification => {
+                if budget.is_exhausted() {
+                    Err(BoundedFifthNativeBinaryTwoConditionActivityError::RequestBudgetExceeded)
+                } else if Instant::now() >= deadline {
+                    Err(BoundedFifthNativeBinaryTwoConditionActivityError::Timeout)
+                } else {
+                    result
+                }
+            }
+        }
+    }
+
+    pub async fn verify_fifth_native_binary_two_condition_activity_intervals_bounded(
+        &self,
+        owner: &str,
+        conditions: [&str; 2],
+        intervals: &[FifthNativeBinaryActivityIntervalAnchor],
+        max_requests: usize,
+        total_timeout: Duration,
+    ) -> Result<
+        FifthNativeBinaryTwoConditionActivityObservation,
+        BoundedFifthNativeBinaryTwoConditionActivityError,
+    > {
+        let owner = validate_hex(owner, 20).map_err(|_| ChainLogAuditError::InvalidInput)?;
+        let owner_bytes = hex::decode(&owner[2..]).map_err(|_| ChainLogAuditError::InvalidInput)?;
+        let conditions = [
+            parse_fixed_b256(conditions[0]).map_err(|_| ChainLogAuditError::InvalidInput)?,
+            parse_fixed_b256(conditions[1]).map_err(|_| ChainLogAuditError::InvalidInput)?,
+        ];
+        if owner_bytes.iter().all(|byte| *byte == 0)
+            || conditions[0] == conditions[1]
+            || !(1..=MAX_ACTIVITY_INTERVALS).contains(&intervals.len())
+            || max_requests == 0
+            || total_timeout.is_zero()
+            || conditions
+                .iter()
+                .any(|condition| !is_canonical_native_binary_condition(*condition))
+        {
+            return Err(ChainLogAuditError::InvalidInput.into());
+        }
+
+        let mut validated: Vec<ValidatedActivityInterval> = Vec::with_capacity(intervals.len());
+        let mut total_blocks = 0_u64;
+        for anchor in intervals {
+            if anchor.from_block == 0
+                || anchor.from_block > anchor.through_block
+                || anchor.through_block - anchor.from_block >= MAX_ACTIVITY_INTERVAL_BLOCKS
+            {
+                return Err(ChainLogAuditError::InvalidInput.into());
+            }
+            let parent_hash = validate_hex(&anchor.expected_parent_hash, 32)
+                .map_err(|_| ChainLogAuditError::InvalidInput)?;
+            let end_hash = validate_hex(&anchor.expected_end_hash, 32)
+                .map_err(|_| ChainLogAuditError::InvalidInput)?;
+            let blocks = anchor
+                .through_block
+                .checked_sub(anchor.from_block)
+                .and_then(|length| length.checked_add(1))
+                .ok_or(ChainLogAuditError::InvalidInput)?;
+            total_blocks = total_blocks
+                .checked_add(blocks)
+                .ok_or(ChainLogAuditError::InvalidInput)?;
+            if total_blocks > MAX_ACTIVITY_TOTAL_BLOCKS {
+                return Err(ChainLogAuditError::InvalidInput.into());
+            }
+            if let Some(previous) = validated.last()
+                && (previous.through_block.checked_add(1) != Some(anchor.from_block)
+                    || previous.end_hash != parent_hash)
+            {
+                return Err(ChainLogAuditError::InvalidInput.into());
+            }
+            validated.push(ValidatedActivityInterval {
+                from_block: anchor.from_block,
+                through_block: anchor.through_block,
+                parent_hash,
+                end_hash,
+            });
+        }
+
+        let owner = Address::from_slice(&owner_bytes);
+        let ids = conditions.map(native_position_ids);
+        let deadline = Instant::now()
+            .checked_add(total_timeout)
+            .ok_or(ChainLogAuditError::InvalidInput)?;
+        let budget = TransactionRequestBudget::new(max_requests);
+        let mut exhaustion = budget.0.exhaustion.subscribe();
+        let scoped = self.with_request_budget(budget.inner());
+        let verification =
+            scoped.verify_two_condition_activity_intervals_inner(owner, ids, validated, deadline);
         tokio::pin!(verification);
         let deadline_wait = tokio::time::sleep_until(deadline);
         tokio::pin!(deadline_wait);
@@ -194,6 +336,8 @@ impl ChainLogVerifier {
         parent_hash: &str,
         end_hash: &str,
         deadline: Instant,
+        intervals: Vec<FifthNativeBinaryActivityIntervalAnchor>,
+        policy: &'static str,
     ) -> Result<
         FifthNativeBinaryTwoConditionActivityObservation,
         BoundedFifthNativeBinaryTwoConditionActivityError,
@@ -247,6 +391,148 @@ impl ChainLogVerifier {
         } = collected;
         let module = opening[0].native_context().module_proxy();
         let scanned = scan_activity(&evidence, &block_observations, owner, ids, module, deadline)?;
+        self.finish_collected_activity(
+            CollectedActivity {
+                evidence,
+                intervals,
+                policy,
+                opening,
+                block_observations,
+            },
+            deadline,
+            scanned,
+        )
+        .await
+    }
+
+    async fn verify_two_condition_activity_intervals_inner(
+        &self,
+        owner: Address,
+        ids: [[B256; 2]; 2],
+        intervals: Vec<ValidatedActivityInterval>,
+        deadline: Instant,
+    ) -> Result<
+        FifthNativeBinaryTwoConditionActivityObservation,
+        BoundedFifthNativeBinaryTwoConditionActivityError,
+    > {
+        let mut collected = Vec::with_capacity(intervals.len());
+        let mut global_opening: Option<[FifthNativeBinaryModuleOperationBoundary; 2]> = None;
+        let mut previous_closing: Option<[FifthNativeBinaryModuleOperationBoundary; 2]> = None;
+        let mut module = None;
+        for (interval_index, anchor) in intervals.iter().enumerate() {
+            ensure_deadline(deadline)?;
+            let chunk = collect_two_condition_evidence(
+                self,
+                owner,
+                ids,
+                TwoConditionAnchor {
+                    from_block: anchor.from_block,
+                    through_block: anchor.through_block,
+                    parent_hash: &anchor.parent_hash,
+                    end_hash: &anchor.end_hash,
+                    deadline,
+                },
+                |opening| {
+                    if opening.iter().any(|point| {
+                        point.module_position_balances() != [U256::ZERO; 2]
+                            || !source::has_minter_role(point.module_role_bitmap())
+                            || (interval_index == 0 && !point.module_pusd_balance().is_zero())
+                    }) {
+                        return Err(ChainLogAuditError::Unverified);
+                    }
+                    if let Some(previous) = previous_closing.as_ref()
+                        && !same_activity_pair_boundary(previous, opening)
+                    {
+                        return Err(ChainLogAuditError::Unverified);
+                    }
+                    if let Some(opening0) = global_opening.as_ref()
+                        && opening.iter().any(|point| {
+                            point.module_role_bitmap() != opening0[0].module_role_bitmap()
+                        })
+                    {
+                        return Err(ChainLogAuditError::Unverified);
+                    }
+                    Ok(())
+                },
+                |opening, previous, pair, _block| {
+                    if pair.iter().any(|point| {
+                        point.native_context().legacy_mapping_value() != U256::ZERO
+                            || point.module_position_balances() != [U256::ZERO; 2]
+                            || !source::has_minter_role(point.module_role_bitmap())
+                    }) {
+                        return Err(ChainLogAuditError::Unverified);
+                    }
+                    for index in 0..2 {
+                        if !ModuleOperationPoint::source_identity_continues(
+                            &previous[index],
+                            &pair[index],
+                        ) || pair[index].module_role_bitmap()
+                            != opening[index].module_role_bitmap()
+                        {
+                            return Err(ChainLogAuditError::Unverified);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(map_trade_error)?;
+            if global_opening.is_none() {
+                module = Some(chunk.opening[0].native_context().module_proxy());
+                global_opening = Some(chunk.opening.clone());
+            }
+            previous_closing = chunk.block_observations.last().cloned();
+            collected.push(chunk);
+        }
+
+        let opening = global_opening.ok_or(ChainLogAuditError::Unverified)?;
+        let module = module.ok_or(ChainLogAuditError::Unverified)?;
+        let evidence = flatten_activity_evidence(&collected, &intervals)?;
+        let mut block_observations = Vec::with_capacity(evidence.blocks().len());
+        for chunk in &collected {
+            block_observations.extend(chunk.block_observations.iter().cloned());
+        }
+        let scanned = scan_activity(&evidence, &block_observations, owner, ids, module, deadline)?;
+        self.finish_collected_activity(
+            CollectedActivity {
+                evidence,
+                intervals: intervals
+                    .iter()
+                    .map(|anchor| {
+                        FifthNativeBinaryActivityIntervalAnchor::new(
+                            anchor.from_block,
+                            anchor.through_block,
+                            anchor.parent_hash.clone(),
+                            anchor.end_hash.clone(),
+                        )
+                    })
+                    .collect(),
+                policy: INTERVALS_POLICY_VERSION,
+                opening,
+                block_observations,
+            },
+            deadline,
+            scanned,
+        )
+        .await
+    }
+
+    async fn finish_collected_activity(
+        &self,
+        collected: CollectedActivity,
+        deadline: Instant,
+        scanned: ScannedActivity,
+    ) -> Result<
+        FifthNativeBinaryTwoConditionActivityObservation,
+        BoundedFifthNativeBinaryTwoConditionActivityError,
+    > {
+        let CollectedActivity {
+            evidence,
+            intervals,
+            policy,
+            opening,
+            block_observations,
+        } = collected;
         let boundaries = std::iter::once(&opening[0])
             .chain(block_observations.iter().map(|pair| &pair[0]))
             .collect::<Vec<_>>();
@@ -267,6 +553,8 @@ impl ChainLogVerifier {
         ensure_deadline(deadline)?;
         Ok(FifthNativeBinaryTwoConditionActivityObservation {
             evidence,
+            intervals,
+            source_policy_version: policy,
             opening,
             block_observations,
             funding: scanned.funding,
@@ -663,6 +951,109 @@ fn replay_activity(
         return Err(ChainLogAuditError::Unverified);
     }
     Ok(())
+}
+
+fn same_activity_pair_boundary(
+    left: &[FifthNativeBinaryModuleOperationBoundary; 2],
+    right: &[FifthNativeBinaryModuleOperationBoundary; 2],
+) -> bool {
+    same_activity_boundary(&left[0], &right[0])
+        && same_activity_boundary(&left[1], &right[1])
+        && super::fifth_native_two_condition_trades::same_shared_boundary(&left[0], &left[1])
+        && super::fifth_native_two_condition_trades::same_shared_boundary(&right[0], &right[1])
+}
+
+fn same_activity_boundary(
+    left: &FifthNativeBinaryModuleOperationBoundary,
+    right: &FifthNativeBinaryModuleOperationBoundary,
+) -> bool {
+    let a = left.native_context();
+    let b = right.native_context();
+    let ab = a.selected_balances();
+    let bb = b.selected_balances();
+    ModuleOperationPoint::source_identity_continues(left, right)
+        && ab.block_number() == bb.block_number()
+        && ab.block_hash() == bb.block_hash()
+        && ab.state_root() == bb.state_root()
+        && a.condition_id() == b.condition_id()
+        && a.position_ids() == b.position_ids()
+        && a.legacy_mapping_value() == b.legacy_mapping_value()
+        && ab.owner() == bb.owner()
+        && ab.pusd_balance() == bb.pusd_balance()
+        && ab.position_balance_a() == bb.position_balance_a()
+        && ab.position_balance_b() == bb.position_balance_b()
+        && left.module_position_balances() == right.module_position_balances()
+        && left.module_pusd_balance() == right.module_pusd_balance()
+        && left.module_role_bitmap() == right.module_role_bitmap()
+        && ModuleOperationPoint::result_length(left) == ModuleOperationPoint::result_length(right)
+        && ModuleOperationPoint::normalized_numerators(left)
+            == ModuleOperationPoint::normalized_numerators(right)
+}
+
+fn flatten_activity_evidence(
+    chunks: &[TwoConditionEvidence],
+    anchors: &[ValidatedActivityInterval],
+) -> Result<ChainReceiptIntervalEvidence, ChainLogAuditError> {
+    if chunks.is_empty() || chunks.len() != anchors.len() {
+        return Err(ChainLogAuditError::Unverified);
+    }
+    let first_evidence = &chunks[0].evidence;
+    let last_evidence = &chunks[chunks.len() - 1].evidence;
+    let mut blocks = Vec::new();
+    let mut expected_block = anchors[0].from_block;
+    let mut expected_parent = anchors[0].parent_hash.as_str();
+    let mut seen_locators = BTreeSet::new();
+    let mut seen_transactions = BTreeSet::new();
+    for (chunk, anchor) in chunks.iter().zip(anchors) {
+        let evidence = &chunk.evidence;
+        let expected_count = usize::try_from(anchor.through_block - anchor.from_block + 1)
+            .map_err(|_| ChainLogAuditError::Unverified)?;
+        if evidence.chain_id() != CHAIN_ID
+            || evidence.chain_id() != first_evidence.chain_id()
+            || evidence.policy_version() != first_evidence.policy_version()
+            || evidence.from_block() != anchor.from_block
+            || evidence.through_block() != anchor.through_block
+            || evidence.expected_parent_hash() != anchor.parent_hash
+            || evidence.expected_end_hash() != anchor.end_hash
+            || evidence.blocks().len() != expected_count
+        {
+            return Err(ChainLogAuditError::Unverified);
+        }
+        for block in evidence.blocks() {
+            if block.block_number() != expected_block || block.parent_hash() != expected_parent {
+                return Err(ChainLogAuditError::Unverified);
+            }
+            for transaction in block.transactions() {
+                if !seen_locators.insert((block.block_number(), transaction.transaction_index()))
+                    || !seen_transactions.insert(transaction.transaction_hash().to_owned())
+                {
+                    return Err(ChainLogAuditError::Unverified);
+                }
+            }
+            expected_block = expected_block
+                .checked_add(1)
+                .ok_or(ChainLogAuditError::Unverified)?;
+            expected_parent = block.block_hash();
+            blocks.push(block.clone());
+        }
+    }
+    if expected_block != anchors.last().unwrap().through_block.saturating_add(1)
+        || expected_parent != anchors.last().unwrap().end_hash
+        || first_evidence.expected_parent_hash() != anchors[0].parent_hash
+        || last_evidence.expected_end_hash() != anchors.last().unwrap().end_hash
+    {
+        return Err(ChainLogAuditError::Unverified);
+    }
+    Ok(ChainReceiptIntervalEvidence {
+        chain_id: CHAIN_ID,
+        from_block: anchors[0].from_block,
+        through_block: anchors.last().unwrap().through_block,
+        expected_parent_hash: anchors[0].parent_hash.clone(),
+        expected_end_hash: anchors.last().unwrap().end_hash.clone(),
+        finality_attestation: last_evidence.finality_attestation(),
+        policy_version: RECEIPT_INTERVAL_POLICY_VERSION,
+        blocks,
+    })
 }
 
 fn apply_net_leg(balance: U256, inflow: U256, outflow: U256) -> Option<U256> {

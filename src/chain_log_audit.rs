@@ -124,6 +124,7 @@ pub use fifth_native_module_operations::{
 };
 pub use fifth_native_two_condition_activity::{
     BoundedFifthNativeBinaryTwoConditionActivityError,
+    FIFTH_NATIVE_TWO_CONDITION_ACTIVITY_INTERVALS_POLICY_VERSION,
     FIFTH_NATIVE_TWO_CONDITION_ACTIVITY_POLICY_VERSION,
     FifthNativeBinaryTwoConditionActivityObservation,
 };
