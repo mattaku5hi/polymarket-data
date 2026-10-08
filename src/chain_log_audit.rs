@@ -9828,6 +9828,10 @@ mod receipt_tests {
         include!("chain_log_audit/native_activity_tests.rs");
     }
 
+    mod native_accounting_fixture_tests {
+        include!("chain_log_audit/native_accounting_fixture_tests.rs");
+    }
+
     fn movement_topic(signature: &str) -> String {
         format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())))
     }
@@ -13430,7 +13434,7 @@ mod receipt_tests {
         }
     }
 
-    async fn test_wall_timeout(duration: Duration) {
+    pub(super) async fn test_wall_timeout(duration: Duration) {
         let deadline = std::time::Instant::now() + duration;
         while std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;

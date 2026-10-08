@@ -116,9 +116,15 @@ pub struct FifthDirectModuleTransactionLocator {
     block_hash: String,
     transaction_hash: String,
     transaction_index: u64,
+    log_index: u64,
 }
 
 impl FifthDirectModuleTransactionLocator {
+    #[must_use]
+    pub const fn log_index(&self) -> u64 {
+        self.log_index
+    }
+
     #[must_use]
     pub const fn block_number(&self) -> u64 {
         self.block_number
@@ -1565,6 +1571,11 @@ fn locator(
         block_hash: block.block_hash().to_owned(),
         transaction_hash: transaction.transaction_hash().to_owned(),
         transaction_index: transaction.transaction_index(),
+        log_index: transaction
+            .logs()
+            .last()
+            .expect("exact source-matched funding or operation has a receipt log")
+            .block_log_index(),
     }
 }
 

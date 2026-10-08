@@ -95,6 +95,10 @@ consumption; every owner/module balance checkpoint must reconcile, and pending
 funds and module balances must be empty at the end. It returns its own sealed
 activity observation without opening cost basis or collateral conversion.
 
+Source trade fills and direct module transaction locators expose their exact
+receipt log indices. Repeated owner order hashes retain distinct occurrences;
+consumers can order economic actions without reparsing vendor event ABIs.
+
 Polydoghound consumes these modules through thin local trait/domain adapters.
 Polyazimuth can consume gross-depth acquisition through its observation consumer
 seam; its reconstructed book views are not silently upgraded to executable quotes.

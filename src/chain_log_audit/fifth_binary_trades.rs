@@ -53,6 +53,7 @@ pub enum FifthTradeOwnerRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FifthTradeOrderFillFact {
     order_hash: B256,
+    log_index: u64,
     maker: Address,
     signer: Address,
     side: TradeSide,
@@ -64,6 +65,11 @@ pub struct FifthTradeOrderFillFact {
 }
 
 impl FifthTradeOrderFillFact {
+    #[must_use]
+    pub const fn log_index(&self) -> u64 {
+        self.log_index
+    }
+
     #[must_use]
     pub const fn order_hash(&self) -> B256 {
         self.order_hash
@@ -542,7 +548,7 @@ pub(super) fn classify_transaction(
             FifthLegacyBinaryTradeUnavailableReason::InvalidCalldata,
         );
     };
-    let Some(settlement) = build_settlement(&call, owner, position_ids, module_address) else {
+    let Some(mut settlement) = build_settlement(&call, owner, position_ids, module_address) else {
         return TransactionClassification::Unavailable(
             FifthLegacyBinaryTradeUnavailableReason::ArithmeticUnavailable,
         );
@@ -570,6 +576,37 @@ pub(super) fn classify_transaction(
     }
     if !settlement.owner_participates {
         return TransactionClassification::Quiet;
+    }
+    let mut used = std::collections::BTreeSet::new();
+    for fill in &mut settlement.order_fills {
+        let expected_taker = match fill.owner_role {
+            FifthTradeOwnerRole::Taker => Address::from_str(EXCHANGE_ADDRESS).unwrap(),
+            FifthTradeOwnerRole::Maker => call.taker_order.maker,
+        };
+        let Some((index, _)) = settlement
+            .expected_logs
+            .iter()
+            .enumerate()
+            .find(|(index, log)| {
+                !used.contains(index)
+                    && matches!(log, ExpectedLog::Filled {
+                    hash, maker, taker, side, id, making, taking, fee, ..
+                } if *hash == fill.order_hash
+                    && *maker == fill.maker
+                    && *taker == expected_taker
+                    && *side == fill.side
+                    && *id == fill.token_id
+                    && *making == fill.maker_amount_filled
+                    && *taking == fill.taker_amount_filled
+                    && *fee == fill.fee_amount)
+            })
+        else {
+            return TransactionClassification::Unavailable(
+                FifthLegacyBinaryTradeUnavailableReason::SourceSettlementMismatch,
+            );
+        };
+        used.insert(index);
+        fill.log_index = transaction.logs()[index].block_log_index();
     }
     TransactionClassification::Fact(Box::new(FifthTradeTransactionFact {
         block_number,
@@ -854,6 +891,8 @@ fn order_fact(
 ) -> FifthTradeOrderFillFact {
     FifthTradeOrderFillFact {
         order_hash: hash,
+        // Filled from the exact matched receipt before a public fact is returned.
+        log_index: 0,
         maker: order.maker,
         signer: order.signer,
         side: if order.side == FifthOrderSide::Buy {
