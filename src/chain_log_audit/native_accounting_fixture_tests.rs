@@ -289,6 +289,121 @@ fn native_accounting_fund_split_buy_sell_fixture() -> (CtfInventoryFixture, B256
     (fixture, condition_id, owner_text)
 }
 
+fn native_contiguous_fund_quiet_sell_fixture() -> (CtfInventoryFixture, B256, String) {
+    let (mut fixture, condition_id, owner_text) = native_accounting_fund_split_buy_sell_fixture();
+    let rooted = fixture.rooted_gas_block.as_mut().unwrap();
+    let sell_transaction = rooted.transactions.pop().unwrap();
+    let sell_logs = rooted.receipt_logs.pop().unwrap();
+    rooted.transactions.truncate(3);
+    rooted.receipt_logs.truncate(3);
+    rooted.receipt_statuses.truncate(3);
+    rooted.cumulative_gas_used.truncate(3);
+    rooted.receipt_types.truncate(3);
+
+    fixture.third_direct_call_transaction = Some(sell_transaction);
+    fixture.third_inventory_logs = Some(sell_logs);
+    fixture.extra_inventory_logs = Some(Vec::new());
+
+    let owner = Address::from_str(&owner_text).unwrap();
+    let condition = condition_id;
+    let maker_buy = Address::repeat_byte(0x44);
+    let maker_sell = Address::repeat_byte(0x45);
+    let controls = native_accounting_control_words(owner, &[owner, maker_buy, maker_sell]);
+    let point = |positions: [U256; 2], cash: U256| {
+        fifth_legacy_binary_balances::test_rooted_native_module_operation_point_packet_with_exchange_storage(
+            &owner_text,
+            condition,
+            positions,
+            cash,
+            [U256::ZERO; 2],
+            U256::ZERO,
+            U256::ONE,
+            [U256::ZERO; 3],
+            &controls,
+        )
+    };
+    let (opening_root, opening_proofs) = point([U256::ZERO; 2], U256::from(1_000_u64));
+    let (acquisition_root, acquisition_proofs) = point(
+        [U256::from(110_u64), U256::from(10_u64)],
+        U256::from(939_u64),
+    );
+    let (closing_root, closing_proofs) = point(
+        [U256::from(60_u64), U256::from(10_u64)],
+        U256::from(963_u64),
+    );
+    fixture.state_root = opening_root;
+    fixture.post_state = Some((acquisition_root.clone(), Value::Null));
+    fixture.extra_post_state = Some((acquisition_root, Value::Null));
+    fixture.third_post_state = Some((closing_root, Value::Null));
+    fixture.fifth_code_proofs_by_block = Some(BTreeMap::from([
+        (99, opening_proofs),
+        (100, acquisition_proofs.clone()),
+        (101, acquisition_proofs),
+        (102, closing_proofs),
+    ]));
+    fixture.filter_fifth_code_proofs_by_requested_keys = true;
+    (fixture, condition_id, owner_text)
+}
+
+fn native_contiguous_late_unsupported_fixture() -> (CtfInventoryFixture, B256, String) {
+    let (mut fixture, condition_id, owner_text) = native_contiguous_fund_quiet_sell_fixture();
+    let (transaction, recovered_owner) =
+        signed_polygon_owner_call(MODULE, &[0xde, 0xad, 0xbe, 0xef], 3);
+    assert_eq!(recovered_owner, owner_text);
+    fixture.third_direct_call_transaction = Some(transaction);
+    fixture.third_inventory_logs = Some(Vec::new());
+
+    let owner = Address::from_str(&owner_text).unwrap();
+    let maker_buy = Address::repeat_byte(0x44);
+    let maker_sell = Address::repeat_byte(0x45);
+    let controls = native_accounting_control_words(owner, &[owner, maker_buy, maker_sell]);
+    let (closing_root, closing_proofs) =
+        fifth_legacy_binary_balances::test_rooted_native_module_operation_point_packet_with_exchange_storage(
+            &owner_text,
+            condition_id,
+            [U256::from(110_u64), U256::from(10_u64)],
+            U256::from(939_u64),
+            [U256::ZERO; 2],
+            U256::ZERO,
+            U256::ONE,
+            [U256::ZERO; 3],
+            &controls,
+        );
+    fixture.third_post_state = Some((closing_root, Value::Null));
+    fixture
+        .fifth_code_proofs_by_block
+        .as_mut()
+        .unwrap()
+        .insert(102, closing_proofs);
+    (fixture, condition_id, owner_text)
+}
+
+fn native_contiguous_anchors(
+    fixture: &CtfInventoryFixture,
+) -> Vec<super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor> {
+    let (opening, block100, block101, block102) = ctf_inventory_headers_with_102(fixture);
+    vec![
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+        super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor::new(
+            102,
+            102,
+            block101["hash"].as_str().unwrap(),
+            block102["hash"].as_str().unwrap(),
+        ),
+    ]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_native_accounting_activity(
     fixture: &CtfInventoryFixture,
@@ -417,6 +532,142 @@ fn capture_native_accounting_activity(
         .unwrap();
 }
 
+fn capture_native_contiguous_activity(
+    fixture: &CtfInventoryFixture,
+    reports: &[FifthNativeBinaryActivityObservation],
+    intervals: &[super::fifth_native_activity::FifthNativeBinaryActivityIntervalAnchor],
+    owner: &str,
+    condition_id: B256,
+) {
+    let Ok(directory) = std::env::var("POLYMARKET_DATA_CAPTURE_NATIVE_CONTIGUOUS_DIRECTORY") else {
+        return;
+    };
+    let mut unique = BTreeMap::new();
+    for row in fixture.rpc_capture.lock().unwrap().iter() {
+        let key = serde_json::to_string(&json!([row["method"], row["params"]])).unwrap();
+        if let Some(previous) = unique.insert(key, row.clone()) {
+            assert_eq!(previous["result"], row["result"]);
+        }
+    }
+    let boundary = |point: &FifthNativeBinaryModuleOperationBoundary| {
+        let balances = point.native_context().selected_balances();
+        json!({
+            "block_number":balances.block_number(),
+            "block_hash":balances.block_hash(),
+            "state_root":balances.state_root(),
+            "owner_position_balances":[format!("{:#x}",balances.position_balance_a()),format!("{:#x}",balances.position_balance_b())],
+            "owner_pusd_balance":format!("{:#x}",balances.pusd_balance()),
+            "module_position_balances":point.module_position_balances().map(|value|format!("{value:#x}")),
+            "module_pusd_balance":format!("{:#x}",point.module_pusd_balance()),
+            "module_role_bitmap":format!("{:#x}",point.module_role_bitmap()),
+            "native_condition_id":format!("{:#x}",point.native_context().condition_id()),
+            "native_position_ids":point.native_context().position_ids().map(|value|format!("{value:#x}")),
+            "native_legacy_mapping_value":format!("{:#x}",point.native_context().legacy_mapping_value()),
+            "native_result_length":format!("{:#x}",point.native_context().result_length()),
+            "native_normalized_numerators":point.native_context().normalized_numerators().map(|values|values.map(|value|format!("{value:#x}"))),
+        })
+    };
+    let locator =
+        |value: &super::fifth_direct_module_operations::FifthDirectModuleTransactionLocator| {
+            json!({
+                "block_number":value.block_number(),
+                "block_hash":value.block_hash(),
+                "transaction_hash":value.transaction_hash(),
+                "transaction_index":value.transaction_index(),
+                "log_index":value.log_index(),
+            })
+        };
+    let segments = reports
+        .iter()
+        .zip(intervals)
+        .map(|(report, interval)| {
+            json!({
+                "from_block":interval.from_block,
+                "through_block":interval.through_block,
+                "parent_hash":interval.expected_parent_hash,
+                "end_hash":interval.expected_end_hash,
+                "status":format!("{:?}",report.status()),
+                "source_policy_version":report.source_policy_version(),
+                "opening":boundary(report.opening()),
+                "block_observations":report.block_observations().iter().map(boundary).collect::<Vec<_>>(),
+                "trades":report.transactions().iter().map(|fact|json!({
+                    "block_number":fact.block_number(),
+                    "block_hash":fact.block_hash(),
+                    "transaction_hash":fact.transaction_hash(),
+                    "transaction_index":fact.transaction_index(),
+                    "branch":format!("{:?}",fact.branch()),
+                    "owner_position_inflows":fact.owner_position_inflows().map(|value|format!("{value:#x}")),
+                    "owner_position_outflows":fact.owner_position_outflows().map(|value|format!("{value:#x}")),
+                    "owner_pusd_inflow":format!("{:#x}",fact.owner_pusd_inflow()),
+                    "owner_pusd_outflow":format!("{:#x}",fact.owner_pusd_outflow()),
+                    "owner_fee_amount":format!("{:#x}",fact.owner_fee_amount()),
+                    "order_fills":fact.order_fills().iter().map(|fill|json!({
+                        "order_hash":format!("{:#x}",fill.order_hash()),
+                        "token_id":format!("{:#x}",fill.token_id()),
+                        "maker":format!("{:#x}",fill.maker()),
+                        "signer":format!("{:#x}",fill.signer()),
+                        "side":format!("{:?}",fill.side()),
+                        "owner_role":format!("{:?}",fill.owner_role()),
+                        "maker_amount_filled":format!("{:#x}",fill.maker_amount_filled()),
+                        "taker_amount_filled":format!("{:#x}",fill.taker_amount_filled()),
+                        "fee_amount":format!("{:#x}",fill.fee_amount()),
+                        "log_index":fill.log_index(),
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "module_operations":report.module_operations().iter().map(|fact|json!({
+                    "kind":format!("{:?}",fact.kind()),
+                    "condition_id":format!("{:#x}",fact.condition_id()),
+                    "position_id":fact.position_id().map(|value|format!("{value:#x}")),
+                    "amount":format!("{:#x}",fact.amount()),
+                    "payout":fact.payout().map(|value|format!("{value:#x}")),
+                    "owner_position_inflows":fact.owner_position_inflows().map(|value|format!("{value:#x}")),
+                    "owner_position_outflows":fact.owner_position_outflows().map(|value|format!("{value:#x}")),
+                    "owner_pusd_inflow":format!("{:#x}",fact.owner_pusd_inflow()),
+                    "owner_pusd_outflow":format!("{:#x}",fact.owner_pusd_outflow()),
+                    "funding_transactions":fact.funding_transactions().iter().map(|funding|json!({
+                        "transaction":locator(funding.transaction()),
+                        "asset":format!("{:?}",funding.asset()),
+                        "position_id":funding.position_id().map(|value|format!("{value:#x}")),
+                        "amount":format!("{:#x}",funding.amount()),
+                    })).collect::<Vec<_>>(),
+                    "operation_transaction":locator(fact.operation_transaction()),
+                })).collect::<Vec<_>>(),
+                "controls":report.controls().iter().map(|control|json!({
+                    "block_number":control.code_context().block_number(),
+                    "submitter":format!("{:#x}",control.submitter()),
+                    "maker":format!("{:#x}",control.maker()),
+                    "global_pause_word":format!("{:#x}",control.global_pause_word()),
+                    "global_paused":control.global_paused(),
+                    "submitter_role_bitmap":format!("{:#x}",control.submitter_role_bitmap()),
+                    "submitter_has_operator_role":control.submitter_has_operator_role(),
+                    "maker_pause_activation_block":format!("{:#x}",control.maker_pause_activation_block()),
+                    "maker_pause_active":control.maker_pause_active(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let envelope = json!({
+        "provenance":"Synthetic signed Polygon native Binary activity with root-bound owner/module proofs; no external chain observation.",
+        "case":"fund-split-buy-quiet-sell-contiguous",
+        "owner":owner,
+        "condition_id":format!("{condition_id:#x}"),
+        "segments":segments,
+        "actual_request_count":fixture.requests.load(Ordering::Relaxed),
+        "deduplicated_request_count":unique.len(),
+        "rpc_responses":unique.into_values().collect::<Vec<_>>(),
+    });
+    let path = std::path::Path::new(&directory)
+        .join("fifth-native-binary-activity-fund-quiet-sell-rpc.json");
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap()
+        .write_all(&serde_json::to_vec(&envelope).unwrap())
+        .unwrap();
+}
+
 #[tokio::test]
 async fn native_binary_activity_accounts_for_fund_split_buy_and_sell() {
     use super::fifth_native_activity::FifthNativeBinaryActivityStatus;
@@ -502,6 +753,353 @@ async fn native_binary_activity_accounts_for_fund_split_buy_and_sell() {
         "fund-split-buy-sell",
         "fifth-native-binary-activity-fund-split-buy-sell-rpc.json",
     );
+}
+
+#[tokio::test]
+async fn native_binary_activity_batches_fund_quiet_and_sell_segments_contiguously() {
+    use super::fifth_native_activity::{
+        BoundedFifthNativeBinaryActivityError, FifthNativeBinaryActivityIntervalAnchor,
+        FifthNativeBinaryActivityStatus,
+    };
+
+    let (fixture, condition_id, owner_text) = native_contiguous_fund_quiet_sell_fixture();
+    let (opening, block100, block101, block102) = ctf_inventory_headers_with_102(&fixture);
+    assert_eq!(block101["transactions"].as_array().unwrap().len(), 1);
+    assert!(fixture.extra_inventory_logs.as_ref().unwrap().is_empty());
+    let intervals = vec![
+        FifthNativeBinaryActivityIntervalAnchor::new(
+            100,
+            100,
+            opening["hash"].as_str().unwrap(),
+            block100["hash"].as_str().unwrap(),
+        ),
+        FifthNativeBinaryActivityIntervalAnchor::new(
+            101,
+            101,
+            block100["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+        ),
+        FifthNativeBinaryActivityIntervalAnchor::new(
+            102,
+            102,
+            block101["hash"].as_str().unwrap(),
+            block102["hash"].as_str().unwrap(),
+        ),
+    ];
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
+    let reports = verifier
+        .verify_fifth_native_binary_activity_intervals_bounded(
+            &owner_text,
+            &format!("{condition_id:#x}"),
+            &intervals,
+            2_000,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 3);
+    assert!(
+        reports
+            .iter()
+            .all(|report| report.status() == &FifthNativeBinaryActivityStatus::Matched)
+    );
+    assert_eq!(reports[0].transactions().len(), 1);
+    assert_eq!(reports[0].module_operations().len(), 1);
+    assert_eq!(
+        reports[0].transactions()[0].owner_pusd_outflow(),
+        U256::from(51_u64)
+    );
+    assert_eq!(
+        reports[0].module_operations()[0].amount(),
+        U256::from(10_u64)
+    );
+    assert!(reports[1].transactions().is_empty());
+    assert!(reports[1].module_operations().is_empty());
+    assert_eq!(reports[2].transactions().len(), 1);
+    assert_eq!(
+        reports[2].transactions()[0].owner_pusd_inflow(),
+        U256::from(24_u64)
+    );
+
+    let acquisition_close = reports[0].block_observations().last().unwrap();
+    let quiet_open = reports[1].opening();
+    let quiet_close = reports[1].block_observations().last().unwrap();
+    let sale_open = reports[2].opening();
+    assert_eq!(acquisition_close, quiet_open);
+    assert_eq!(quiet_close, sale_open);
+    let acquisition_balances = acquisition_close.native_context().selected_balances();
+    assert_eq!(
+        acquisition_balances.position_balance_a(),
+        U256::from(110_u64)
+    );
+    assert_eq!(
+        acquisition_balances.position_balance_b(),
+        U256::from(10_u64)
+    );
+    assert_eq!(acquisition_balances.pusd_balance(), U256::from(939_u64));
+    let closing = reports[2].block_observations().last().unwrap();
+    let closing_balances = closing.native_context().selected_balances();
+    assert_eq!(closing_balances.position_balance_a(), U256::from(60_u64));
+    assert_eq!(closing_balances.position_balance_b(), U256::from(10_u64));
+    assert_eq!(closing_balances.pusd_balance(), U256::from(963_u64));
+    assert_eq!(
+        reports[0].module_operations()[0].funding_transactions()[0]
+            .transaction()
+            .block_number(),
+        100
+    );
+    assert_eq!(
+        reports[0].module_operations()[0]
+            .operation_transaction()
+            .block_number(),
+        100
+    );
+    assert_eq!(reports[2].transactions()[0].block_number(), 102);
+    capture_native_contiguous_activity(&fixture, &reports, &intervals, &owner_text, condition_id);
+
+    let exact_request_count = fixture.requests.load(Ordering::Relaxed);
+    assert!(exact_request_count > 0);
+    let (exact_fixture, _, _) = native_contiguous_fund_quiet_sell_fixture();
+    let exact_primary = ctf_inventory_provider(exact_fixture.clone()).await;
+    let exact_secondary = ctf_inventory_provider(exact_fixture.clone()).await;
+    let exact_report = ChainLogVerifier::new(&exact_primary, &exact_secondary)
+        .unwrap()
+        .verify_fifth_native_binary_activity_intervals_bounded(
+            &owner_text,
+            &format!("{condition_id:#x}"),
+            &intervals,
+            exact_request_count,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact_report.len(), 3);
+
+    let (short_fixture, _, _) = native_contiguous_fund_quiet_sell_fixture();
+    let short_primary = ctf_inventory_provider(short_fixture.clone()).await;
+    let short_secondary = ctf_inventory_provider(short_fixture.clone()).await;
+    let short_result = ChainLogVerifier::new(&short_primary, &short_secondary)
+        .unwrap()
+        .verify_fifth_native_binary_activity_intervals_bounded(
+            &owner_text,
+            &format!("{condition_id:#x}"),
+            &intervals,
+            exact_request_count - 1,
+            Duration::from_secs(30),
+        )
+        .await;
+    assert_eq!(
+        short_result,
+        Err(BoundedFifthNativeBinaryActivityError::RequestBudgetExceeded)
+    );
+}
+
+fn rpc_requested_block_102(row: &Value) -> bool {
+    row["method"] == "eth_getBlockByNumber" && row["params"][0] == "0x66"
+        || row["method"] == "eth_getBlockReceipts" && row["params"][0] == "0x66"
+        || row["method"] == "eth_getProof" && row["params"][2] == "0x66"
+        || row["method"] == "eth_getLogs" && row["params"][0]["fromBlock"] == "0x66"
+}
+
+#[tokio::test]
+async fn native_binary_activity_batch_uses_one_absolute_deadline_across_segments() {
+    use super::fifth_native_activity::BoundedFifthNativeBinaryActivityError;
+
+    let (mut fixture, condition_id, owner_text) = native_contiguous_fund_quiet_sell_fixture();
+    fixture.initial_clock_advance_ms = Some(500);
+    let gate = std::sync::Arc::new(CtfInventoryDeadlineGate::new());
+    fixture.deadline_gate = Some(gate.clone());
+    let capture = fixture.rpc_capture.clone();
+    let intervals = native_contiguous_anchors(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
+
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let mut task = tokio::spawn(async move {
+        verifier
+            .verify_fifth_native_binary_activity_intervals_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                &intervals,
+                2_000,
+                Duration::from_secs(1),
+            )
+            .await
+    });
+    tokio::select! {
+        _ = gate.started.notified() => {}
+        _ = test_wall_timeout(Duration::from_secs(30)) => panic!("batch did not reach block101 receipt gate"),
+    }
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(start),
+        Duration::from_millis(500)
+    );
+    assert!(
+        capture
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| { row["method"] == "eth_getBlockReceipts" && row["params"][0] == "0x64" })
+    );
+
+    tokio::time::advance(Duration::from_millis(600)).await;
+    let joined = tokio::select! {
+        output = &mut task => output,
+        _ = test_wall_timeout(Duration::from_secs(30)) => panic!("batch deadline did not settle"),
+    }
+    .unwrap();
+    assert_eq!(joined, Err(BoundedFifthNativeBinaryActivityError::Timeout));
+    gate.release.send_replace(true);
+    tokio::task::yield_now().await;
+    assert!(!capture.lock().unwrap().iter().any(rpc_requested_block_102));
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn native_binary_activity_batch_cancellation_stops_after_block101_gate() {
+    let (mut fixture, condition_id, owner_text) = native_contiguous_fund_quiet_sell_fixture();
+    let gate = std::sync::Arc::new(CtfInventoryDeadlineGate::new());
+    fixture.deadline_gate = Some(gate.clone());
+    let capture = fixture.rpc_capture.clone();
+    let send_counter = fixture.requests.clone();
+    let intervals = native_contiguous_anchors(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
+    let task = tokio::spawn(async move {
+        verifier
+            .verify_fifth_native_binary_activity_intervals_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                &intervals,
+                2_000,
+                Duration::from_secs(20),
+            )
+            .await
+    });
+    tokio::select! {
+        _ = gate.started.notified() => {}
+        _ = test_wall_timeout(Duration::from_secs(30)) => panic!("batch did not reach block101 receipt gate"),
+    }
+    assert!(
+        capture
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| { row["method"] == "eth_getBlockReceipts" && row["params"][0] == "0x64" })
+    );
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    gate.release.send_replace(true);
+    test_wall_timeout(Duration::from_millis(50)).await;
+    let settled = send_counter.load(Ordering::Relaxed);
+    test_wall_timeout(Duration::from_millis(50)).await;
+    assert_eq!(send_counter.load(Ordering::Relaxed), settled);
+    assert!(!capture.lock().unwrap().iter().any(rpc_requested_block_102));
+}
+
+#[tokio::test]
+async fn native_binary_activity_batch_discards_prefix_on_late_unsupported_call() {
+    use super::fifth_native_activity::BoundedFifthNativeBinaryActivityError;
+
+    let (fixture, condition_id, owner_text) = native_contiguous_late_unsupported_fixture();
+    let intervals = native_contiguous_anchors(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let result = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .verify_fifth_native_binary_activity_intervals_bounded(
+            &owner_text,
+            &format!("{condition_id:#x}"),
+            &intervals,
+            2_000,
+            Duration::from_secs(30),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(BoundedFifthNativeBinaryActivityError::SegmentUnavailable { segment_index: 2 })
+    );
+}
+
+#[tokio::test]
+async fn native_binary_activity_batch_rejects_discontinuous_anchors_before_rpc() {
+    use super::fifth_native_activity::{
+        BoundedFifthNativeBinaryActivityError, FifthNativeBinaryActivityIntervalAnchor,
+    };
+
+    let (fixture, condition_id, owner_text) = native_contiguous_fund_quiet_sell_fixture();
+    let (_, block100, block101, block102) = ctf_inventory_headers_with_102(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
+    for intervals in [
+        vec![
+            FifthNativeBinaryActivityIntervalAnchor::new(
+                100,
+                100,
+                format!("0x{}", "88".repeat(32)),
+                block100["hash"].as_str().unwrap(),
+            ),
+            FifthNativeBinaryActivityIntervalAnchor::new(
+                102,
+                102,
+                block101["hash"].as_str().unwrap(),
+                block102["hash"].as_str().unwrap(),
+            ),
+        ],
+        vec![
+            FifthNativeBinaryActivityIntervalAnchor::new(
+                101,
+                101,
+                block100["hash"].as_str().unwrap(),
+                block101["hash"].as_str().unwrap(),
+            ),
+            FifthNativeBinaryActivityIntervalAnchor::new(
+                100,
+                100,
+                format!("0x{}", "88".repeat(32)),
+                block100["hash"].as_str().unwrap(),
+            ),
+        ],
+        vec![
+            FifthNativeBinaryActivityIntervalAnchor::new(
+                100,
+                100,
+                format!("0x{}", "88".repeat(32)),
+                block100["hash"].as_str().unwrap(),
+            ),
+            FifthNativeBinaryActivityIntervalAnchor::new(
+                101,
+                101,
+                format!("0x{}", "77".repeat(32)),
+                block101["hash"].as_str().unwrap(),
+            ),
+        ],
+    ] {
+        let result = verifier
+            .verify_fifth_native_binary_activity_intervals_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                &intervals,
+                2_000,
+                Duration::from_secs(30),
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(BoundedFifthNativeBinaryActivityError::Verification(
+                ChainLogAuditError::InvalidInput
+            ))
+        );
+    }
+    assert_eq!(fixture.requests.load(Ordering::Relaxed), 0);
 }
 
 fn native_accounting_vector_calldata(vectors: &Value, name: &str) -> (String, Vec<u8>) {

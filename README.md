@@ -94,6 +94,15 @@ Pending module funds can cross block boundaries, including a trade before their
 consumption; every owner/module balance checkpoint must reconcile, and pending
 funds and module balances must be empty at the end. It returns its own sealed
 activity observation without opening cost basis or collateral conversion.
+`verify_fifth_native_binary_activity_intervals_bounded` acquires1–16 adjacent
+intervals under one actual-send budget and one absolute deadline. It validates
+all anchors before I/O, requires complete matched segments and identical rooted
+shared boundaries, and returns no report prefix on failure. Module funding must
+be consumed within each segment; pending funding across segment boundaries is
+unsupported. Quiet segments retain authenticated nonzero owner inventory without
+adding economic facts. This evidence establishes no cost basis, collateral FX,
+complete wallet history or qualification.
+
 
 Source trade fills and direct module transaction locators expose their exact
 receipt log indices. Repeated owner order hashes retain distinct occurrences;

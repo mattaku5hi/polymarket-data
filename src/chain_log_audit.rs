@@ -97,8 +97,8 @@ pub use fifth_legacy_binary_result::{
 };
 pub use fifth_native_activity::{
     BoundedFifthNativeBinaryActivityError, FIFTH_NATIVE_BINARY_ACTIVITY_POLICY_VERSION,
-    FifthNativeBinaryActivityObservation, FifthNativeBinaryActivityStatus,
-    FifthNativeBinaryActivityUnavailableReason,
+    FifthNativeBinaryActivityIntervalAnchor, FifthNativeBinaryActivityObservation,
+    FifthNativeBinaryActivityStatus, FifthNativeBinaryActivityUnavailableReason,
 };
 pub use fifth_native_binary::{
     BoundedFifthNativeBinaryError, FIFTH_NATIVE_BINARY_POLICY_VERSION,
