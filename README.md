@@ -129,3 +129,10 @@ Tests use offline deterministic artifacts and loopback fixture servers.
 This is an independent Cargo project inside `crypto-tools`; it does not modify
 `trader-scout/`. The package remains `UNLICENSED` and is distributed through
 explicit reviewed Git revisions, not a package-registry release.
+
+`observe_native_binary_gas_for_owner` consumes one or more sealed native activity
+reports without additional RPCs. It shares the V1 signed-envelope/receipt gas
+accumulator, includes failed receipts and excludes other recovered payers. Gas
+availability is independent of trade attribution; missing gas evidence refuses
+the whole observation. Amounts are Polygon native base units, with no collateral
+conversion, wallet-wide gas-history or net-P&L claim.

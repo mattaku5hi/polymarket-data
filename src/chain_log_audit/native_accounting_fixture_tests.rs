@@ -668,6 +668,57 @@ fn capture_native_contiguous_activity(
         .unwrap();
 }
 
+fn capture_native_failed_type2_gas(
+    fixture: &CtfInventoryFixture,
+    report: &FifthNativeBinaryActivityObservation,
+    gas: &super::NativeGasOwnerIntervalObservation,
+    owner: &str,
+    condition_id: B256,
+) {
+    let Ok(directory) = std::env::var("POLYMARKET_DATA_CAPTURE_NATIVE_GAS_DIRECTORY") else {
+        return;
+    };
+    let envelope = json!({
+        "provenance":"Synthetic signed Polygon native Binary activity with root-bound owner/module proofs; no external chain observation.",
+        "case":"fund-split-buy-sell-failed-type2-gas",
+        "owner":owner,
+        "condition_id":format!("{condition_id:#x}"),
+        "activity_status":format!("{:?}",report.status()),
+        "gas_observation":{
+            "owner":gas.owner(),
+            "from_block":gas.from_block(),
+            "through_block":gas.through_block(),
+            "parent_hash":gas.parent_hash(),
+            "end_hash":gas.end_hash(),
+            "segment_count":gas.segment_count(),
+            "total_owner_paid_base_units":format!("{:#x}",gas.total_owner_paid_base_units()),
+            "transactions":gas.transactions().iter().map(|transaction|json!({
+                "block_number":transaction.block_number(),
+                "block_hash":transaction.block_hash(),
+                "transaction_hash":transaction.transaction_hash(),
+                "transaction_index":transaction.transaction_index(),
+                "receipt_status":transaction.receipt_status(),
+                "recovered_sender":transaction.recovered_sender(),
+                "gas_used":format!("{:#x}",transaction.gas_used()),
+                "effective_gas_price":format!("{:#x}",transaction.effective_gas_price()),
+                "charge_base_units":format!("{:#x}",transaction.charge_base_units()),
+                "owner_paid":transaction.owner_paid(),
+            })).collect::<Vec<_>>(),
+        },
+        "rpc_responses":fixture.rpc_capture.lock().unwrap().clone(),
+    });
+    let path = std::path::Path::new(&directory)
+        .join("fifth-native-binary-activity-failed-type2-gas-rpc.json");
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap()
+        .write_all(&serde_json::to_vec(&envelope).unwrap())
+        .unwrap();
+}
+
 #[tokio::test]
 async fn native_binary_activity_accounts_for_fund_split_buy_and_sell() {
     use super::fifth_native_activity::FifthNativeBinaryActivityStatus;
@@ -737,6 +788,30 @@ async fn native_binary_activity_accounts_for_fund_split_buy_and_sell() {
     assert_eq!(closing_balances.pusd_balance(), U256::from(963_u64));
     assert_eq!(closing.module_position_balances(), [U256::ZERO; 2]);
     assert_eq!(closing.module_pusd_balance(), U256::ZERO);
+    let native_gas = super::observe_native_binary_gas_for_owner(
+        &[&report],
+        &owner_text,
+        &format!("{condition_id:#x}"),
+    )
+    .unwrap();
+    assert_eq!(
+        native_gas.total_owner_paid_base_units(),
+        U256::from(84_000_u64)
+    );
+    assert_eq!(native_gas.transactions().len(), 5);
+    assert_eq!(
+        native_gas
+            .transactions()
+            .iter()
+            .filter(|transaction| transaction.owner_paid())
+            .count(),
+        4
+    );
+    assert!(!native_gas.transactions()[4].owner_paid());
+    assert_eq!(
+        native_gas.transactions()[4].gas_used(),
+        U256::from(21_000_u64)
+    );
     assert!(report.controls().iter().all(|control| {
         !control.global_paused()
             && control.submitter_has_operator_role()
@@ -845,6 +920,72 @@ async fn native_binary_activity_batches_fund_quiet_and_sell_segments_contiguousl
     assert_eq!(closing_balances.position_balance_a(), U256::from(60_u64));
     assert_eq!(closing_balances.position_balance_b(), U256::from(10_u64));
     assert_eq!(closing_balances.pusd_balance(), U256::from(963_u64));
+    let report_refs = reports.iter().collect::<Vec<_>>();
+    let native_gas = super::observe_native_binary_gas_for_owner(
+        &report_refs,
+        &owner_text,
+        &format!("{condition_id:#x}"),
+    )
+    .unwrap();
+    assert_eq!(
+        native_gas.total_owner_paid_base_units(),
+        U256::from(84_000_u64)
+    );
+    assert_eq!(native_gas.segment_count(), 3);
+    assert_eq!(native_gas.transactions().len(), 5);
+    assert_eq!(
+        native_gas
+            .transactions()
+            .iter()
+            .filter(|transaction| transaction.owner_paid())
+            .count(),
+        4
+    );
+
+    let mut wrong_condition = condition_id.0;
+    wrong_condition[1] ^= 1;
+    let wrong_condition = format!("{:#x}", B256::from(wrong_condition));
+    assert_eq!(
+        super::observe_native_binary_gas_for_owner(&report_refs, &owner_text, &wrong_condition)
+            .unwrap_err(),
+        "native_gas_identity_or_anchor_mismatch"
+    );
+    assert_eq!(
+        super::observe_native_binary_gas_for_owner(
+            &report_refs,
+            &format!("0x{}", "22".repeat(20)),
+            &format!("{condition_id:#x}")
+        )
+        .unwrap_err(),
+        "native_gas_identity_or_anchor_mismatch"
+    );
+    assert_eq!(
+        super::observe_native_binary_gas_for_owner(
+            &[&reports[0], &reports[2]],
+            &owner_text,
+            &format!("{condition_id:#x}")
+        )
+        .unwrap_err(),
+        "native_gas_interval_discontinuity"
+    );
+    assert_eq!(
+        super::observe_native_binary_gas_for_owner(
+            &[&reports[0], &reports[0]],
+            &owner_text,
+            &format!("{condition_id:#x}")
+        )
+        .unwrap_err(),
+        "native_gas_interval_discontinuity"
+    );
+    assert_eq!(
+        super::observe_native_binary_gas_for_owner(
+            &[&reports[2], &reports[1]],
+            &owner_text,
+            &format!("{condition_id:#x}")
+        )
+        .unwrap_err(),
+        "native_gas_interval_discontinuity"
+    );
     assert_eq!(
         reports[0].module_operations()[0].funding_transactions()[0]
             .transaction()
@@ -1025,6 +1166,154 @@ async fn native_binary_activity_batch_discards_prefix_on_late_unsupported_call()
     assert_eq!(
         result,
         Err(BoundedFifthNativeBinaryActivityError::SegmentUnavailable { segment_index: 2 })
+    );
+}
+
+#[tokio::test]
+async fn native_binary_activity_gas_counts_failed_owner_type_two_receipt() {
+    let (mut fixture, condition_id, owner_text) = native_accounting_fund_split_buy_sell_fixture();
+    let (failed_transaction, failed_owner) = super::signed_polygon_native_gas_transaction(
+        2,
+        0x42,
+        4,
+        100_000,
+        U256::ZERO,
+        U256::from(25_u64),
+        U256::from(25_u64),
+    );
+    assert_eq!(failed_owner, owner_text);
+    let rooted = fixture.rooted_gas_block.as_mut().unwrap();
+    rooted.transactions.push(failed_transaction);
+    rooted.receipt_logs.push(Vec::new());
+    rooted.receipt_statuses.push(0);
+    rooted.cumulative_gas_used.push(114_000);
+    rooted.receipt_types.push(2);
+    assert_eq!(rooted.base_fee_per_gas, U256::ZERO);
+
+    let (opening, _, block101, _) = ctf_inventory_headers_with_102(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let report = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .verify_fifth_native_binary_activity_interval_bounded(
+            &owner_text,
+            &format!("{condition_id:#x}"),
+            100,
+            101,
+            opening["hash"].as_str().unwrap(),
+            block101["hash"].as_str().unwrap(),
+            2_000,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    let gas = super::observe_native_binary_gas_for_owner(
+        &[&report],
+        &owner_text,
+        &format!("{condition_id:#x}"),
+    )
+    .unwrap();
+    assert_eq!(gas.total_owner_paid_base_units(), U256::from(834_000_u64));
+    assert_eq!(gas.transactions().len(), 6);
+    assert!(gas.transactions()[..4].iter().all(|transaction| {
+        transaction.block_number() == 100
+            && transaction.owner_paid()
+            && transaction.gas_used() == U256::from(21_000_u64)
+            && transaction.effective_gas_price() == U256::ONE
+            && transaction.charge_base_units() == U256::from(21_000_u64)
+    }));
+    let failed = gas
+        .transactions()
+        .iter()
+        .find(|transaction| {
+            transaction.block_number() == 100 && transaction.transaction_index() == 4
+        })
+        .unwrap();
+    assert_eq!(failed.receipt_status(), 0);
+    assert!(failed.owner_paid());
+    assert_eq!(failed.gas_used(), U256::from(30_000_u64));
+    assert_eq!(failed.effective_gas_price(), U256::from(25_u64));
+    assert_eq!(failed.charge_base_units(), U256::from(750_000_u64));
+    assert!(!gas.transactions()[5].owner_paid());
+    assert_eq!(gas.transactions()[5].block_number(), 101);
+    assert_eq!(
+        gas.transactions()[5].charge_base_units(),
+        U256::from(21_000_u64)
+    );
+    capture_native_failed_type2_gas(&fixture, &report, &gas, &owner_text, condition_id);
+}
+
+#[tokio::test]
+async fn native_binary_activity_gas_remains_available_when_source_attribution_is_unavailable() {
+    let (fixture, condition_id, owner_text) = native_contiguous_late_unsupported_fixture();
+    let (_, _, block101, block102) = ctf_inventory_headers_with_102(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture).await;
+    let report = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .verify_fifth_native_binary_activity_interval_bounded(
+            &owner_text,
+            &format!("{condition_id:#x}"),
+            102,
+            102,
+            block101["hash"].as_str().unwrap(),
+            block102["hash"].as_str().unwrap(),
+            2_000,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        report.status(),
+        &super::FifthNativeBinaryActivityStatus::Matched
+    );
+    let gas = super::observe_native_binary_gas_for_owner(
+        &[&report],
+        &owner_text,
+        &format!("{condition_id:#x}"),
+    )
+    .unwrap();
+    assert_eq!(gas.total_owner_paid_base_units(), U256::from(21_000_u64));
+    assert_eq!(gas.transactions().len(), 1);
+    assert!(gas.transactions()[0].owner_paid());
+}
+
+#[tokio::test]
+async fn native_binary_activity_gas_refusal_keeps_activity_evidence_matched() {
+    let (mut fixture, condition_id, owner_text) = native_contiguous_fund_quiet_sell_fixture();
+    fixture
+        .rooted_gas_block
+        .as_mut()
+        .unwrap()
+        .cumulative_gas_used[1] = 20_000;
+    let intervals = native_contiguous_anchors(&fixture);
+    let primary = ctf_inventory_provider(fixture.clone()).await;
+    let secondary = ctf_inventory_provider(fixture.clone()).await;
+    let reports = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .verify_fifth_native_binary_activity_intervals_bounded(
+            &owner_text,
+            &format!("{condition_id:#x}"),
+            &intervals,
+            2_000,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert!(
+        reports
+            .iter()
+            .all(|report| { report.status() == &super::FifthNativeBinaryActivityStatus::Matched })
+    );
+    let report_refs = reports.iter().collect::<Vec<_>>();
+    assert_eq!(
+        super::observe_native_binary_gas_for_owner(
+            &report_refs,
+            &owner_text,
+            &format!("{condition_id:#x}")
+        )
+        .unwrap_err(),
+        "native_gas_evidence_unavailable"
     );
 }
 

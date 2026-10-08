@@ -1776,57 +1776,36 @@ impl NativeGasOwnerIntervalObservation {
     }
 }
 
-/// Consumes sealed reports without depending on trade-classification success.
-/// Any ambiguous identity, discontinuity, duplicate, or missing gas proof
-/// refuses the complete requested interval set rather than skipping rows.
-pub fn observe_native_gas_for_owner(
-    reports: &[&V1TradeAttributionReport],
-    requested_owner: &str,
-) -> Result<NativeGasOwnerIntervalObservation, &'static str> {
-    if reports.is_empty() || reports.len() > 16 {
-        return Err("native_gas_invalid_segment_count");
-    }
-    let owner = validate_hex(requested_owner, 20).map_err(|_| "native_gas_invalid_owner")?;
-    let first = reports[0];
-    let first_paired = first.paired_inventory();
-    let first_interval = first.interval_evidence();
-    if first_interval.chain_id() != CHAIN_ID
-        || !first_paired.owner().eq_ignore_ascii_case(&owner)
-        || first_interval.from_block() != first_paired.from_block()
-        || first_interval.through_block() != first_paired.through_block()
-        || first_interval.expected_parent_hash() != first_paired.parent_hash()
-        || first_interval.expected_end_hash() != first_paired.end_hash()
-    {
-        return Err("native_gas_identity_or_anchor_mismatch");
-    }
+struct NativeGasEvidenceAccumulator {
+    owner: String,
+    from_block: u64,
+    parent_hash: String,
+    previous_end_block: Option<u64>,
+    previous_end_hash: Option<String>,
+    seen_transactions: BTreeSet<(u64, u64)>,
+    seen_transaction_hashes: BTreeSet<String>,
+    transactions: Vec<NativeGasIntervalTransactionObservation>,
+    owner_total: U256,
+}
 
-    let mut previous_end_block: Option<u64> = None;
-    let mut previous_end_hash: Option<String> = None;
-    let mut expected_token = first_paired.token_id();
-    let mut seen_transactions = BTreeSet::new();
-    let mut seen_transaction_hashes = BTreeSet::new();
-    let mut observations = Vec::new();
-    let mut owner_total = U256::ZERO;
-
-    for report in reports {
-        let paired = report.paired_inventory();
-        let interval = report.interval_evidence();
-        if interval.chain_id() != CHAIN_ID
-            || !paired.owner().eq_ignore_ascii_case(&owner)
-            || paired.token_id() != expected_token
-            || interval.from_block() != paired.from_block()
-            || interval.through_block() != paired.through_block()
-            || interval.expected_parent_hash() != paired.parent_hash()
-            || interval.expected_end_hash() != paired.end_hash()
-            || interval.through_block() < interval.from_block()
-            || interval.through_block() - interval.from_block() >= 16
-            || interval.blocks().len()
-                != (interval.through_block() - interval.from_block() + 1) as usize
-        {
-            return Err("native_gas_identity_or_anchor_mismatch");
+impl NativeGasEvidenceAccumulator {
+    fn new(owner: String, first: &ChainReceiptIntervalEvidence) -> Self {
+        Self {
+            owner,
+            from_block: first.from_block(),
+            parent_hash: first.expected_parent_hash().to_owned(),
+            previous_end_block: None,
+            previous_end_hash: None,
+            seen_transactions: BTreeSet::new(),
+            seen_transaction_hashes: BTreeSet::new(),
+            transactions: Vec::new(),
+            owner_total: U256::ZERO,
         }
+    }
+
+    fn append(&mut self, interval: &ChainReceiptIntervalEvidence) -> Result<(), &'static str> {
         if let (Some(previous_block), Some(previous_hash)) =
-            (previous_end_block, &previous_end_hash)
+            (self.previous_end_block, &self.previous_end_hash)
         {
             let next_block = previous_block
                 .checked_add(1)
@@ -1851,9 +1830,12 @@ pub fn observe_native_gas_for_owner(
             for (expected_index, transaction) in block.transactions().iter().enumerate() {
                 if transaction.transaction_index() != expected_index as u64
                     || !seen_block_transactions.insert(transaction.transaction_index())
-                    || !seen_transactions
+                    || !self
+                        .seen_transactions
                         .insert((block.block_number(), transaction.transaction_index()))
-                    || !seen_transaction_hashes.insert(transaction.transaction_hash())
+                    || !self
+                        .seen_transaction_hashes
+                        .insert(transaction.transaction_hash().to_owned())
                 {
                     return Err("native_gas_duplicate_or_unordered_transaction");
                 }
@@ -1862,24 +1844,26 @@ pub fn observe_native_gas_for_owner(
                     .ok_or("native_gas_evidence_unavailable")?;
                 let payer = validate_hex(gas.recovered_sender(), 20)
                     .map_err(|_| "native_gas_evidence_unavailable")?;
-                let owner_paid = payer == owner;
+                let owner_paid = payer == self.owner;
                 if owner_paid {
-                    owner_total = owner_total
+                    self.owner_total = self
+                        .owner_total
                         .checked_add(gas.charge_base_units())
                         .ok_or("native_gas_owner_total_overflow")?;
                 }
-                observations.push(NativeGasIntervalTransactionObservation {
-                    block_number: block.block_number(),
-                    block_hash: block.block_hash().to_owned(),
-                    transaction_hash: transaction.transaction_hash().to_owned(),
-                    transaction_index: transaction.transaction_index(),
-                    receipt_status: transaction.status(),
-                    recovered_sender: payer,
-                    gas_used: gas.gas_used(),
-                    effective_gas_price: gas.effective_gas_price(),
-                    charge_base_units: gas.charge_base_units(),
-                    owner_paid,
-                });
+                self.transactions
+                    .push(NativeGasIntervalTransactionObservation {
+                        block_number: block.block_number(),
+                        block_hash: block.block_hash().to_owned(),
+                        transaction_hash: transaction.transaction_hash().to_owned(),
+                        transaction_index: transaction.transaction_index(),
+                        receipt_status: transaction.status(),
+                        recovered_sender: payer,
+                        gas_used: gas.gas_used(),
+                        effective_gas_price: gas.effective_gas_price(),
+                        charge_base_units: gas.charge_base_units(),
+                        owner_paid,
+                    });
             }
             expected_number = expected_number
                 .checked_add(1)
@@ -1891,22 +1875,179 @@ pub fn observe_native_gas_for_owner(
         {
             return Err("native_gas_interval_discontinuity");
         }
-        previous_end_block = Some(interval.through_block());
-        previous_end_hash = Some(interval.expected_end_hash().to_owned());
+        self.previous_end_block = Some(interval.through_block());
+        self.previous_end_hash = Some(interval.expected_end_hash().to_owned());
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        segment_count: usize,
+        last: &ChainReceiptIntervalEvidence,
+    ) -> NativeGasOwnerIntervalObservation {
+        NativeGasOwnerIntervalObservation {
+            owner: self.owner,
+            from_block: self.from_block,
+            through_block: last.through_block(),
+            parent_hash: self.parent_hash,
+            end_hash: last.expected_end_hash().to_owned(),
+            segment_count,
+            total_owner_paid_base_units: self.owner_total,
+            transactions: self.transactions,
+        }
+    }
+}
+
+/// Consumes sealed reports without depending on trade-classification success.
+/// Any ambiguous identity, discontinuity, duplicate, or missing gas proof
+/// refuses the complete requested interval set rather than skipping rows.
+pub fn observe_native_gas_for_owner(
+    reports: &[&V1TradeAttributionReport],
+    requested_owner: &str,
+) -> Result<NativeGasOwnerIntervalObservation, &'static str> {
+    if reports.is_empty() || reports.len() > 16 {
+        return Err("native_gas_invalid_segment_count");
+    }
+    let owner = validate_hex(requested_owner, 20).map_err(|_| "native_gas_invalid_owner")?;
+    let first = reports[0];
+    let first_paired = first.paired_inventory();
+    let first_interval = first.interval_evidence();
+    if first_interval.chain_id() != CHAIN_ID
+        || !first_paired.owner().eq_ignore_ascii_case(&owner)
+        || first_interval.from_block() != first_paired.from_block()
+        || first_interval.through_block() != first_paired.through_block()
+        || first_interval.expected_parent_hash() != first_paired.parent_hash()
+        || first_interval.expected_end_hash() != first_paired.end_hash()
+    {
+        return Err("native_gas_identity_or_anchor_mismatch");
+    }
+
+    let mut gas = NativeGasEvidenceAccumulator::new(owner.clone(), first_interval);
+    let mut expected_token = first_paired.token_id();
+
+    for report in reports {
+        let paired = report.paired_inventory();
+        let interval = report.interval_evidence();
+        if interval.chain_id() != CHAIN_ID
+            || !paired.owner().eq_ignore_ascii_case(&owner)
+            || paired.token_id() != expected_token
+            || interval.from_block() != paired.from_block()
+            || interval.through_block() != paired.through_block()
+            || interval.expected_parent_hash() != paired.parent_hash()
+            || interval.expected_end_hash() != paired.end_hash()
+            || interval.through_block() < interval.from_block()
+            || interval.through_block() - interval.from_block() >= 16
+            || interval.blocks().len()
+                != (interval.through_block() - interval.from_block() + 1) as usize
+        {
+            return Err("native_gas_identity_or_anchor_mismatch");
+        }
+        gas.append(interval)?;
         expected_token = paired.token_id();
     }
 
     let last = reports.last().expect("nonempty reports checked above");
-    Ok(NativeGasOwnerIntervalObservation {
-        owner,
-        from_block: first_interval.from_block(),
-        through_block: last.interval_evidence().through_block(),
-        parent_hash: first_interval.expected_parent_hash().to_owned(),
-        end_hash: last.interval_evidence().expected_end_hash().to_owned(),
-        segment_count: reports.len(),
-        total_owner_paid_base_units: owner_total,
-        transactions: observations,
-    })
+    Ok(gas.finish(reports.len(), last.interval_evidence()))
+}
+
+/// Sums gas paid by an owner across sealed native activity reports.
+/// Gas evidence remains usable when native trade or module attribution is unavailable.
+pub fn observe_native_binary_gas_for_owner(
+    reports: &[&FifthNativeBinaryActivityObservation],
+    requested_owner: &str,
+    condition_id: &str,
+) -> Result<NativeGasOwnerIntervalObservation, &'static str> {
+    if reports.is_empty() || reports.len() > 16 {
+        return Err("native_gas_invalid_segment_count");
+    }
+    let owner = validate_hex(requested_owner, 20).map_err(|_| "native_gas_invalid_owner")?;
+    let owner_bytes = hex::decode(&owner[2..]).map_err(|_| "native_gas_invalid_owner")?;
+    let condition =
+        parse_fixed_b256(condition_id).map_err(|_| "native_gas_identity_or_anchor_mismatch")?;
+    if owner_bytes.iter().all(|byte| *byte == 0)
+        || !fifth_native_binary::is_canonical_native_binary_condition(condition)
+    {
+        return Err("native_gas_identity_or_anchor_mismatch");
+    }
+    let mut complement = condition.0;
+    complement[31] = 1;
+    let positions = [condition, B256::from(complement)];
+    let mut aggregate_blocks = 0_u64;
+    let mut gas: Option<NativeGasEvidenceAccumulator> = None;
+
+    for report in reports {
+        let evidence = report.evidence();
+        let from_block = evidence.from_block();
+        let through_block = evidence.through_block();
+        if evidence.chain_id() != CHAIN_ID
+            || from_block == 0
+            || from_block > through_block
+            || through_block - from_block >= 16
+            || evidence.blocks().len() != (through_block - from_block + 1) as usize
+            || report.block_observations().len() != evidence.blocks().len()
+        {
+            return Err("native_gas_identity_or_anchor_mismatch");
+        }
+        aggregate_blocks = aggregate_blocks
+            .checked_add(through_block - from_block + 1)
+            .ok_or("native_gas_identity_or_anchor_mismatch")?;
+        if aggregate_blocks > 256 {
+            return Err("native_gas_identity_or_anchor_mismatch");
+        }
+
+        let opening = report.opening();
+        let opening_native = opening.native_context();
+        let opening_balances = opening_native.selected_balances();
+        if !opening_balances.owner().eq_ignore_ascii_case(&owner)
+            || opening_native.condition_id() != condition
+            || opening_native.position_ids() != positions
+            || opening_balances.block_number().checked_add(1) != Some(from_block)
+            || !opening_balances
+                .block_hash()
+                .eq_ignore_ascii_case(evidence.expected_parent_hash())
+        {
+            return Err("native_gas_identity_or_anchor_mismatch");
+        }
+
+        for (point, block) in report.block_observations().iter().zip(evidence.blocks()) {
+            let native = point.native_context();
+            let balances = native.selected_balances();
+            if !balances.owner().eq_ignore_ascii_case(&owner)
+                || native.condition_id() != condition
+                || native.position_ids() != positions
+                || balances.block_number() != block.block_number()
+                || !balances
+                    .block_hash()
+                    .eq_ignore_ascii_case(block.block_hash())
+                || !balances
+                    .state_root()
+                    .eq_ignore_ascii_case(block.state_root())
+            {
+                return Err("native_gas_identity_or_anchor_mismatch");
+            }
+        }
+        let Some(closing) = report.block_observations().last() else {
+            return Err("native_gas_identity_or_anchor_mismatch");
+        };
+        let closing_balances = closing.native_context().selected_balances();
+        if closing_balances.block_number() != through_block
+            || !closing_balances
+                .block_hash()
+                .eq_ignore_ascii_case(evidence.expected_end_hash())
+        {
+            return Err("native_gas_identity_or_anchor_mismatch");
+        }
+
+        if gas.is_none() {
+            gas = Some(NativeGasEvidenceAccumulator::new(owner.clone(), evidence));
+        }
+        gas.as_mut().unwrap().append(evidence)?;
+    }
+
+    let last = reports.last().expect("nonempty reports checked above");
+    Ok(gas
+        .expect("nonempty reports checked above")
+        .finish(reports.len(), last.evidence()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
