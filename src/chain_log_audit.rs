@@ -10646,7 +10646,7 @@ mod receipt_tests {
         signed_polygon_transaction_with_key(to, input, 0x42)
     }
 
-    fn signed_polygon_transaction_with_key(
+    pub(in crate::chain_log_audit) fn signed_polygon_transaction_with_key(
         to: &str,
         input: &[u8],
         key_byte: u8,
@@ -28379,6 +28379,12 @@ mod receipt_tests {
             .unwrap()
             .write_all(&serde_json::to_vec(&envelope).unwrap())
             .unwrap();
+    }
+
+    pub(in crate::chain_log_audit) fn fifth_normal_buy_source_fixture()
+    -> (Value, String, Vec<ChainReceiptLog>) {
+        let (fixture, owner, _, logs) = fifth_normal_buy_trade_fixture();
+        (fixture.direct_call_transaction.unwrap(), owner, logs)
     }
 
     fn fifth_normal_buy_trade_fixture()

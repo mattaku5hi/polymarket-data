@@ -74,6 +74,26 @@ impl FifthNativeBinaryModuleOperationBoundary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FifthNativeModuleIntervalEvidence {
+    evidence: ChainReceiptIntervalEvidence,
+    opening: FifthNativeBinaryModuleOperationBoundary,
+    block_observations: Vec<FifthNativeBinaryModuleOperationBoundary>,
+}
+
+impl FifthNativeModuleIntervalEvidence {
+    #[must_use]
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        ChainReceiptIntervalEvidence,
+        FifthNativeBinaryModuleOperationBoundary,
+        Vec<FifthNativeBinaryModuleOperationBoundary>,
+    ) {
+        (self.evidence, self.opening, self.block_observations)
+    }
+}
+
 impl ModuleOperationPoint for FifthNativeBinaryModuleOperationBoundary {
     fn selected_balances(&self) -> &super::FifthSelectedBalancesObservation {
         self.native_context.selected_balances()
@@ -270,6 +290,88 @@ impl ChainLogVerifier {
         FifthNativeBinaryModuleOperationsObservation,
         BoundedFifthNativeBinaryModuleOperationsError,
     > {
+        let interval = self
+            .verify_fifth_native_module_interval_evidence_inner(
+                owner.clone(),
+                owner_address,
+                condition,
+                ids,
+                from_block,
+                through_block,
+                parent_hash,
+                end_hash,
+                deadline,
+            )
+            .await?;
+        let (evidence, opening, points) = interval.into_parts();
+        let status = if !module_balances_are_zero(&opening) {
+            FifthNativeBinaryModuleOperationsStatus::Unavailable {
+                block_number: Some(from_block - 1),
+                transaction_hash: None,
+                reason: FifthLegacyBinaryModuleOperationsUnavailableReason::ModuleNotEmpty,
+            }
+        } else if !fifth_direct_module_operations::has_minter_role(opening.module_role_bitmap()) {
+            FifthNativeBinaryModuleOperationsStatus::Unavailable {
+                block_number: Some(from_block - 1),
+                transaction_hash: None,
+                reason: FifthLegacyBinaryModuleOperationsUnavailableReason::MinterRoleUnavailable,
+            }
+        } else {
+            let (status, operations) = fifth_direct_module_operations::classify_module_interval(
+                &evidence, &owner, &opening, &points,
+            )?;
+            let operations = if matches!(status, FifthLegacyBinaryModuleOperationsStatus::Matched)
+                && points.last().is_some_and(module_balances_are_zero)
+            {
+                operations
+            } else if matches!(status, FifthLegacyBinaryModuleOperationsStatus::Matched) {
+                return Ok(FifthNativeBinaryModuleOperationsObservation {
+                    evidence,
+                    opening,
+                    block_observations: points,
+                    status: FifthNativeBinaryModuleOperationsStatus::Unavailable {
+                        block_number: Some(through_block),
+                        transaction_hash: None,
+                        reason: FifthLegacyBinaryModuleOperationsUnavailableReason::ModuleNotEmpty,
+                    },
+                    operations: Vec::new(),
+                });
+            } else {
+                Vec::new()
+            };
+            ensure_deadline(deadline)?;
+            return Ok(FifthNativeBinaryModuleOperationsObservation {
+                evidence,
+                opening,
+                block_observations: points,
+                status: map_classification_status(status),
+                operations,
+            });
+        };
+        ensure_deadline(deadline)?;
+        Ok(FifthNativeBinaryModuleOperationsObservation {
+            evidence,
+            opening,
+            block_observations: points,
+            status,
+            operations: Vec::new(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn verify_fifth_native_module_interval_evidence_inner(
+        &self,
+        owner: String,
+        owner_address: Address,
+        condition: B256,
+        ids: [B256; 2],
+        from_block: u64,
+        through_block: u64,
+        parent_hash: &str,
+        end_hash: &str,
+        deadline: Instant,
+    ) -> Result<FifthNativeModuleIntervalEvidence, BoundedFifthNativeBinaryModuleOperationsError>
+    {
         ensure_deadline(deadline)?;
         let opening_context = self
             .verify_fifth_native_binary_inner(
@@ -327,57 +429,10 @@ impl ChainLogVerifier {
             );
         }
         ensure_deadline(deadline)?;
-        let status = if !module_balances_are_zero(&opening) {
-            FifthNativeBinaryModuleOperationsStatus::Unavailable {
-                block_number: Some(from_block - 1),
-                transaction_hash: None,
-                reason: FifthLegacyBinaryModuleOperationsUnavailableReason::ModuleNotEmpty,
-            }
-        } else if !fifth_direct_module_operations::has_minter_role(opening.module_role_bitmap()) {
-            FifthNativeBinaryModuleOperationsStatus::Unavailable {
-                block_number: Some(from_block - 1),
-                transaction_hash: None,
-                reason: FifthLegacyBinaryModuleOperationsUnavailableReason::MinterRoleUnavailable,
-            }
-        } else {
-            let (status, operations) = fifth_direct_module_operations::classify_module_interval(
-                &evidence, &owner, &opening, &points,
-            )?;
-            let operations = if matches!(status, FifthLegacyBinaryModuleOperationsStatus::Matched)
-                && points.last().is_some_and(module_balances_are_zero)
-            {
-                operations
-            } else if matches!(status, FifthLegacyBinaryModuleOperationsStatus::Matched) {
-                return Ok(FifthNativeBinaryModuleOperationsObservation {
-                    evidence,
-                    opening,
-                    block_observations: points,
-                    status: FifthNativeBinaryModuleOperationsStatus::Unavailable {
-                        block_number: Some(through_block),
-                        transaction_hash: None,
-                        reason: FifthLegacyBinaryModuleOperationsUnavailableReason::ModuleNotEmpty,
-                    },
-                    operations: Vec::new(),
-                });
-            } else {
-                Vec::new()
-            };
-            ensure_deadline(deadline)?;
-            return Ok(FifthNativeBinaryModuleOperationsObservation {
-                evidence,
-                opening,
-                block_observations: points,
-                status: map_classification_status(status),
-                operations,
-            });
-        };
-        ensure_deadline(deadline)?;
-        Ok(FifthNativeBinaryModuleOperationsObservation {
+        Ok(FifthNativeModuleIntervalEvidence {
             evidence,
             opening,
             block_observations: points,
-            status,
-            operations: Vec::new(),
         })
     }
 }

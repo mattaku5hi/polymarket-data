@@ -400,7 +400,7 @@ fn unavailable(
     }
 }
 
-enum TransactionClassification {
+pub(super) enum TransactionClassification {
     Quiet,
     Fact(Box<FifthTradeTransactionFact>),
     Unavailable(FifthLegacyBinaryTradeUnavailableReason),
@@ -472,7 +472,7 @@ struct Settlement {
     owner_participates: bool,
 }
 
-fn classify_transaction(
+pub(super) fn classify_transaction(
     transaction: &ChainReceiptIntervalTransaction,
     block_number: u64,
     block_hash: &str,
@@ -1704,7 +1704,168 @@ fn topic_is_address(topic: &str, address: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::event_topic;
+    use super::{TransactionClassification, classify_transaction, event_topic};
+    use crate::chain_log_audit::{
+        ChainReceiptIntervalTransaction, FifthExchangeImplementationVersion,
+        encode_signed_transaction_with_sender_recovery, fifth_code_context,
+        fifth_match_orders_call, parse_fixed_b256,
+        receipt_tests::{fifth_normal_buy_source_fixture, signed_polygon_transaction_with_key},
+    };
+    use alloy_primitives::{Address, B256, U256};
+    use serde_json::Value;
+    use std::str::FromStr;
+
+    fn native_pair() -> [B256; 2] {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "artifacts/fifth-native-binary-source-vectors.json"
+        ))
+        .unwrap();
+        [
+            parse_fixed_b256(vectors["vectors"][1]["position_ids"][0].as_str().unwrap()).unwrap(),
+            parse_fixed_b256(vectors["vectors"][1]["position_ids"][1].as_str().unwrap()).unwrap(),
+        ]
+    }
+
+    fn native_pair_source_trade() -> (ChainReceiptIntervalTransaction, Address, [B256; 2]) {
+        let (source_transaction, owner, mut logs) = fifth_normal_buy_source_fixture();
+        let owner = Address::from_str(&owner).unwrap();
+        let original_input = hex::decode(
+            source_transaction["input"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("0x")
+                .unwrap(),
+        )
+        .unwrap();
+        let mut call =
+            fifth_match_orders_call::decode_fifth_match_orders_calldata(&original_input).unwrap();
+        let exchange = Address::from_str(fifth_code_context::EXCHANGE_PROXY).unwrap();
+        let old_taker_hash =
+            fifth_match_orders_call::fifth_order_eip712_hash(&call.taker_order, exchange);
+        let old_maker_hash =
+            fifth_match_orders_call::fifth_order_eip712_hash(&call.maker_orders[0], exchange);
+        let pair = native_pair();
+        call.taker_order.token_id = U256::from_be_bytes(pair[0].0);
+        call.maker_orders[0].token_id = U256::from_be_bytes(pair[0].0);
+        let input = fifth_match_orders_call::tests::encode_call(
+            &call.taker_order,
+            &call.maker_orders,
+            &call.maker_fill_amounts,
+            &call.maker_fee_amounts,
+            call.taker_amounts,
+        );
+        let new_taker_hash =
+            fifth_match_orders_call::fifth_order_eip712_hash(&call.taker_order, exchange);
+        let new_maker_hash =
+            fifth_match_orders_call::fifth_order_eip712_hash(&call.maker_orders[0], exchange);
+
+        for log in &mut logs {
+            if log.topics.first().is_some_and(|topic| {
+                topic == &event_topic("TransferSingle(address,address,address,uint256,uint256)")
+            }) {
+                let mut data = hex::decode(log.data.strip_prefix("0x").unwrap()).unwrap();
+                data[..32].copy_from_slice(&call.taker_order.token_id.to_be_bytes::<32>());
+                log.data = format!("0x{}", hex::encode(data));
+            } else if log.topics.first().is_some_and(|topic| {
+                topic == &event_topic("OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)")
+            }) {
+                let mut data = hex::decode(log.data.strip_prefix("0x").unwrap()).unwrap();
+                data[32..64].copy_from_slice(&call.taker_order.token_id.to_be_bytes::<32>());
+                log.data = format!("0x{}", hex::encode(data));
+                if log.topics[1] == format!("{old_taker_hash:#x}") {
+                    log.topics[1] = format!("{new_taker_hash:#x}");
+                } else if log.topics[1] == format!("{old_maker_hash:#x}") {
+                    log.topics[1] = format!("{new_maker_hash:#x}");
+                }
+            } else if log.topics.first().is_some_and(|topic| {
+                topic == &event_topic("OrdersMatched(bytes32,address,uint8,uint256,uint256,uint256)")
+            }) {
+                let mut data = hex::decode(log.data.strip_prefix("0x").unwrap()).unwrap();
+                data[32..64].copy_from_slice(&call.taker_order.token_id.to_be_bytes::<32>());
+                log.data = format!("0x{}", hex::encode(data));
+                log.topics[1] = format!("{new_taker_hash:#x}");
+            }
+        }
+
+        let (signed_transaction, recovered_from) =
+            signed_polygon_transaction_with_key(fifth_code_context::EXCHANGE_PROXY, &input, 0x42);
+        assert_eq!(
+            signed_transaction["from"].as_str(),
+            Some(recovered_from.as_str())
+        );
+        let encoded_transaction =
+            encode_signed_transaction_with_sender_recovery(&signed_transaction, true).unwrap();
+        assert_eq!(
+            encoded_transaction.recovered_sender,
+            Some(Address::from_str(&recovered_from).unwrap())
+        );
+        assert_eq!(
+            encoded_transaction.eip155_chain_id,
+            Some(U256::from(137_u64))
+        );
+        let transaction_hash = format!("{:#x}", encoded_transaction.hash);
+        for log in &mut logs {
+            log.transaction_hash.clone_from(&transaction_hash);
+        }
+        let transaction = ChainReceiptIntervalTransaction {
+            transaction_hash,
+            transaction_index: logs[0].transaction_index,
+            status: 1,
+            receipt_type: 0,
+            to: signed_transaction["to"].as_str().map(str::to_owned),
+            input: Some(input),
+            recovered_from: Some(recovered_from),
+            value: U256::ZERO,
+            replay_protected_sender: true,
+            native_gas: None,
+            logs,
+            movement_observations: Vec::new(),
+        };
+        (transaction, owner, pair)
+    }
+
+    #[test]
+    fn pure_trade_classifier_accepts_native_pair_and_rejects_full_width_alias() {
+        let (transaction, owner, pair) = native_pair_source_trade();
+        let block_hash = transaction.logs[0].block_hash.clone();
+        let module = Address::repeat_byte(0x33);
+        let TransactionClassification::Fact(fact) = classify_transaction(
+            &transaction,
+            100,
+            &block_hash,
+            owner,
+            pair,
+            module,
+            FifthExchangeImplementationVersion::Current641b,
+        ) else {
+            panic!("source-normal trade with the full native position ID pair must classify");
+        };
+        assert_eq!(fact.branch(), super::FifthTradeBranch::Normal);
+        assert_eq!(fact.owner_position_inflows(), [U256::from(100), U256::ZERO]);
+        assert_eq!(fact.owner_pusd_outflow(), U256::from(51));
+        assert_eq!(fact.order_fills().len(), 1);
+        assert!(fact.order_fills().iter().all(|fill| {
+            pair.iter()
+                .any(|position_id| fill.token_id() == U256::from_be_bytes(position_id.0))
+        }));
+
+        let mut alias = pair;
+        let mut bytes = alias[0].0;
+        bytes[0] ^= 1;
+        alias[0] = B256::from(bytes);
+        assert!(matches!(
+            classify_transaction(
+                &transaction,
+                100,
+                &block_hash,
+                owner,
+                alias,
+                module,
+                FifthExchangeImplementationVersion::Current641b,
+            ),
+            TransactionClassification::Unavailable(_)
+        ));
+    }
 
     #[test]
     fn module_event_abi_goldens_match_pinned_source_vectors() {
