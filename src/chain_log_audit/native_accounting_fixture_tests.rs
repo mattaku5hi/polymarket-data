@@ -159,7 +159,7 @@ fn native_accounting_fund_split_buy_sell_fixture() -> (CtfInventoryFixture, B256
         .as_array()
         .unwrap()
         .clone();
-    let buy_logs = vec![
+    let buy_logs = [
         fifth_source_position(
             super::fifth_code_context::EXCHANGE_PROXY,
             &format!("{maker_buy:#x}"),
@@ -563,7 +563,7 @@ fn native_accounting_partial_redemption_fixture() -> (CtfInventoryFixture, B256,
     assert_eq!(recovered_redeemer, owner_text);
 
     let zero = "0x0000000000000000000000000000000000000000";
-    let split_logs = vec![
+    let split_logs = [
         fifth_source_position(
             module_text,
             zero,
@@ -607,7 +607,7 @@ fn native_accounting_partial_redemption_fixture() -> (CtfInventoryFixture, B256,
     )];
     let mut redemption_event_data = movement_word(U256::from(50_u64));
     redemption_event_data.extend(movement_word(U256::from(16_u64)));
-    let redemption_logs = vec![
+    let redemption_logs = [
         fifth_source_pusd(zero, &owner_text, 16, 0),
         fifth_source_position(
             module_text,
