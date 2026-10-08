@@ -874,6 +874,55 @@ mod tests {
         late_result_started: std::sync::atomic::AtomicBool,
     }
 
+    async fn advance_paired_fixture_deadline<T: std::fmt::Debug>(
+        fixtures: [&Fixture; 2],
+        task: &mut tokio::task::JoinHandle<T>,
+        late_started: impl Fn(&Fixture) -> bool,
+    ) -> T {
+        let started_at = tokio::time::Instant::now();
+        for late in [false, true] {
+            let stages_started = async {
+                loop {
+                    let ready = fixtures.iter().all(|fixture| {
+                        if late {
+                            late_started(fixture)
+                        } else {
+                            fixture.requests.load(Ordering::Acquire) > 0
+                        }
+                    });
+                    if ready {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::select! {
+                _ = stages_started => {}
+                result = &mut *task => panic!("verifier finished before delay stage: {result:?}"),
+                _ = crate::chain_log_audit::receipt_tests::test_wall_timeout(Duration::from_secs(30)) => {
+                    panic!("paired RPC delay stage did not start before wall bound");
+                }
+            }
+            assert_eq!(
+                started_at.elapsed(),
+                Duration::from_millis(if late { 500 } else { 0 })
+            );
+            tokio::time::advance(Duration::from_millis(if late { 600 } else { 500 })).await;
+            if !late {
+                fixtures[0].early_delay_release.notify_one();
+                fixtures[1].early_delay_release.notify_one();
+            }
+        }
+        let result = tokio::select! {
+            result = &mut *task => result.unwrap(),
+            _ = crate::chain_log_audit::receipt_tests::test_wall_timeout(Duration::from_secs(30)) => {
+                panic!("verifier did not enforce the shared deadline");
+            }
+        };
+        assert_eq!(started_at.elapsed(), Duration::from_millis(1100));
+        result
+    }
+
     async fn rpc(State(fixture): State<Arc<Fixture>>, Json(request): Json<Value>) -> Json<Value> {
         fixture.requests.fetch_add(1, Ordering::Relaxed);
         let method = request["method"].as_str().unwrap_or_default();
@@ -884,11 +933,7 @@ mod tests {
                 FixtureFault::DeadlineEarlyAndLate | FixtureFault::ResultDeadlineEarlyAndLate
             )
         {
-            if fixture.fault == FixtureFault::ResultDeadlineEarlyAndLate {
-                fixture.early_delay_release.notified().await;
-            } else {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
+            fixture.early_delay_release.notified().await;
             fixture.early_delay_completed.store(true, Ordering::Release);
         }
         if method == "eth_getProof" {
@@ -2041,17 +2086,27 @@ mod tests {
             FixtureFault::DeadlineEarlyAndLate,
         )
         .await;
-        let result = pair
-            .verifier
-            .verify_fifth_legacy_binary_balances_bounded(
-                OWNER,
-                LEGACY,
-                BLOCK,
-                &pair.expected_hash,
-                28,
-                Duration::from_secs(1),
-            )
-            .await;
+        tokio::time::pause();
+        let verifier = pair.verifier;
+        let expected_hash = pair.expected_hash.clone();
+        let mut task = tokio::spawn(async move {
+            verifier
+                .verify_fifth_legacy_binary_balances_bounded(
+                    OWNER,
+                    LEGACY,
+                    BLOCK,
+                    &expected_hash,
+                    28,
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+        let result = advance_paired_fixture_deadline(
+            [&pair.primary, &pair.secondary],
+            &mut task,
+            |fixture| fixture.late_ctf_started.load(Ordering::Acquire),
+        )
+        .await;
         assert_eq!(
             result.unwrap_err(),
             BoundedFifthLegacyBinaryBalancesError::Timeout
@@ -2060,6 +2115,7 @@ mod tests {
             assert!(fixture.early_delay_completed.load(Ordering::Acquire));
             assert!(fixture.late_ctf_started.load(Ordering::Acquire));
         }
+        tokio::time::resume();
         pair.primary_task.abort();
         pair.secondary_task.abort();
     }
@@ -2544,7 +2600,6 @@ mod tests {
         // Advance only the injected delays; loopback I/O and proof work must not
         // consume the shared one-second deadline on a busy test host.
         tokio::time::pause();
-        let started_at = tokio::time::Instant::now();
         let verifier = pair.verifier;
         let expected_hash = pair.expected_hash.clone();
         let mut task = tokio::spawn(async move {
@@ -2559,50 +2614,16 @@ mod tests {
                 )
                 .await
         });
-        for late in [false, true] {
-            let stages_started = async {
-                loop {
-                    let ready = [&pair.primary, &pair.secondary].iter().all(|fixture| {
-                        if late {
-                            fixture.late_result_started.load(Ordering::Acquire)
-                        } else {
-                            fixture.requests.load(Ordering::Acquire) > 0
-                        }
-                    });
-                    if ready {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            };
-            tokio::select! {
-                _ = stages_started => {}
-                result = &mut task => panic!("verifier finished before delay stage: {result:?}"),
-                _ = crate::chain_log_audit::receipt_tests::test_wall_timeout(Duration::from_secs(30)) => {
-                    panic!("paired RPC delay stage did not start before wall bound");
-                }
-            }
-            assert_eq!(
-                started_at.elapsed(),
-                Duration::from_millis(if late { 500 } else { 0 })
-            );
-            tokio::time::advance(Duration::from_millis(if late { 600 } else { 500 })).await;
-            if !late {
-                pair.primary.early_delay_release.notify_one();
-                pair.secondary.early_delay_release.notify_one();
-            }
-        }
-        let result = tokio::select! {
-            result = &mut task => result.unwrap(),
-            _ = crate::chain_log_audit::receipt_tests::test_wall_timeout(Duration::from_secs(30)) => {
-                panic!("verifier did not enforce the shared deadline");
-            }
-        };
+        let result = advance_paired_fixture_deadline(
+            [&pair.primary, &pair.secondary],
+            &mut task,
+            |fixture| fixture.late_result_started.load(Ordering::Acquire),
+        )
+        .await;
         assert_eq!(
             result.unwrap_err(),
             BoundedFifthLegacyBinaryResultError::Timeout
         );
-        assert_eq!(started_at.elapsed(), Duration::from_millis(1100));
         for fixture in [&pair.primary, &pair.secondary] {
             assert!(fixture.early_delay_completed.load(Ordering::Acquire));
             assert!(fixture.late_result_started.load(Ordering::Acquire));

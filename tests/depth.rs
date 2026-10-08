@@ -133,7 +133,7 @@ async fn fetch_rejects_identity_and_provenance_before_quotes() {
         },
         {
             let mut raw = book();
-            raw["timestamp"] = json!("1700000000");
+            raw["timestamp"] = json!("170000000000000000000");
             raw
         },
     ] {

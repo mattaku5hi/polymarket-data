@@ -1,5 +1,6 @@
 //! Public CLOB book reads, not executable quotes, simulated fills or fees.
 pub mod depth;
+pub mod execution_context;
 
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -13,8 +14,9 @@ pub struct BookLevel {
     pub size: String,
 }
 
-/// Vendor order and decimal text are preserved. Timestamp is epoch milliseconds;
-/// its presence does not establish freshness or a continuous WebSocket history.
+/// Vendor order, decimal text, and timestamp text are preserved. The timestamp
+/// unit is undocumented and its presence does not establish freshness or a
+/// continuous WebSocket history.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BookObservation {
     pub asset_id: String,
@@ -107,13 +109,20 @@ pub async fn fetch_book(
         body.extend_from_slice(&chunk);
     }
     let raw: Value = serde_json::from_slice(&body).map_err(|_| BookError::MalformedBook)?;
+    parse_book(raw, token_id)
+}
+
+pub(super) fn parse_book(raw: Value, token_id: &str) -> Result<BookObservation, BookError> {
     let asset_id = text(&raw, "asset_id")?;
     if asset_id != token_id {
         return Err(BookError::MalformedBook);
     }
     let hash = text(&raw, "hash")?;
     let timestamp = text(&raw, "timestamp")?;
-    if timestamp.len() != 13 || !timestamp.bytes().all(|b| b.is_ascii_digit()) {
+    if timestamp.is_empty()
+        || timestamp.len() > 20
+        || !timestamp.bytes().all(|b| b.is_ascii_digit())
+    {
         return Err(BookError::MalformedBook);
     }
     Ok(BookObservation {

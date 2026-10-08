@@ -864,16 +864,17 @@ async fn native_binary_activity_batches_fund_quiet_and_sell_segments_contiguousl
     let primary = ctf_inventory_provider(fixture.clone()).await;
     let secondary = ctf_inventory_provider(fixture.clone()).await;
     let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
-    let reports = verifier
-        .verify_fifth_native_binary_activity_intervals_bounded(
+    let reports = super::await_loopback_without_virtual_time_advance(
+        verifier.verify_fifth_native_binary_activity_intervals_bounded(
             &owner_text,
             &format!("{condition_id:#x}"),
             &intervals,
             2_000,
             Duration::from_secs(30),
-        )
-        .await
-        .unwrap();
+        ),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(reports.len(), 3);
     assert!(
@@ -1006,32 +1007,36 @@ async fn native_binary_activity_batches_fund_quiet_and_sell_segments_contiguousl
     let (exact_fixture, _, _) = native_contiguous_fund_quiet_sell_fixture();
     let exact_primary = ctf_inventory_provider(exact_fixture.clone()).await;
     let exact_secondary = ctf_inventory_provider(exact_fixture.clone()).await;
-    let exact_report = ChainLogVerifier::new(&exact_primary, &exact_secondary)
-        .unwrap()
-        .verify_fifth_native_binary_activity_intervals_bounded(
-            &owner_text,
-            &format!("{condition_id:#x}"),
-            &intervals,
-            exact_request_count,
-            Duration::from_secs(30),
-        )
-        .await
-        .unwrap();
+    let exact_report = super::await_loopback_without_virtual_time_advance(
+        ChainLogVerifier::new(&exact_primary, &exact_secondary)
+            .unwrap()
+            .verify_fifth_native_binary_activity_intervals_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                &intervals,
+                exact_request_count,
+                Duration::from_secs(30),
+            ),
+    )
+    .await
+    .unwrap();
     assert_eq!(exact_report.len(), 3);
 
     let (short_fixture, _, _) = native_contiguous_fund_quiet_sell_fixture();
     let short_primary = ctf_inventory_provider(short_fixture.clone()).await;
     let short_secondary = ctf_inventory_provider(short_fixture.clone()).await;
-    let short_result = ChainLogVerifier::new(&short_primary, &short_secondary)
-        .unwrap()
-        .verify_fifth_native_binary_activity_intervals_bounded(
-            &owner_text,
-            &format!("{condition_id:#x}"),
-            &intervals,
-            exact_request_count - 1,
-            Duration::from_secs(30),
-        )
-        .await;
+    let short_result = super::await_loopback_without_virtual_time_advance(
+        ChainLogVerifier::new(&short_primary, &short_secondary)
+            .unwrap()
+            .verify_fifth_native_binary_activity_intervals_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                &intervals,
+                exact_request_count - 1,
+                Duration::from_secs(30),
+            ),
+    )
+    .await;
     assert_eq!(
         short_result,
         Err(BoundedFifthNativeBinaryActivityError::RequestBudgetExceeded)
@@ -1153,16 +1158,18 @@ async fn native_binary_activity_batch_discards_prefix_on_late_unsupported_call()
     let intervals = native_contiguous_anchors(&fixture);
     let primary = ctf_inventory_provider(fixture.clone()).await;
     let secondary = ctf_inventory_provider(fixture.clone()).await;
-    let result = ChainLogVerifier::new(&primary, &secondary)
-        .unwrap()
-        .verify_fifth_native_binary_activity_intervals_bounded(
-            &owner_text,
-            &format!("{condition_id:#x}"),
-            &intervals,
-            2_000,
-            Duration::from_secs(30),
-        )
-        .await;
+    let result = super::await_loopback_without_virtual_time_advance(
+        ChainLogVerifier::new(&primary, &secondary)
+            .unwrap()
+            .verify_fifth_native_binary_activity_intervals_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                &intervals,
+                2_000,
+                Duration::from_secs(30),
+            ),
+    )
+    .await;
     assert_eq!(
         result,
         Err(BoundedFifthNativeBinaryActivityError::SegmentUnavailable { segment_index: 2 })

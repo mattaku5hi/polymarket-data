@@ -75,6 +75,11 @@ async fn rejects_wrong_token_and_malformed_levels_without_partial_book() {
         },
         {
             let mut b = book();
+            b["timestamp"] = json!("123456789012345678901");
+            b
+        },
+        {
+            let mut b = book();
             b["bids"][0]["price"] = json!("0.123456789012345678901234567891");
             b
         },
@@ -86,6 +91,20 @@ async fn rejects_wrong_token_and_malformed_levels_without_partial_book() {
                 .unwrap_err(),
             BookError::MalformedBook
         );
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn preserves_supported_timestamp_text_without_assigning_a_unit() {
+    for timestamp in ["1700000000", "1700000000123", "12345678901234567890"] {
+        let mut raw = book();
+        raw["timestamp"] = json!(timestamp);
+        let (base, task) = serve(raw).await;
+        let observed = fetch_book(&reqwest::Client::new(), &base, "123")
+            .await
+            .unwrap();
+        assert_eq!(observed.timestamp, timestamp);
         task.abort();
     }
 }

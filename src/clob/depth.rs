@@ -1,6 +1,6 @@
 //! Deterministic gross depth calculations over one validated CLOB book.
 //!
-//! Quotes retain the selected book identity and raw millisecond timestamp. They
+//! Quotes retain the selected book identity and raw vendor timestamp text. They
 //! contain no fee, currency conversion, freshness or execution inference.
 
 use rust_decimal::Decimal;

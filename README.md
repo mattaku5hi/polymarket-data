@@ -136,3 +136,14 @@ accumulator, includes failed receipts and excludes other recovered payers. Gas
 availability is independent of trade attribution; missing gas evidence refuses
 the whole observation. Amounts are Polygon native base units, with no collateral
 conversion, wallet-wide gas-history or net-P&L claim.
+
+`clob::execution_context::ClobExecutionContextReader` acquires Gamma market
+metadata, compact CLOB market info and a selected book as three bounded reads.
+Explicit Gamma version selects outcome asset IDs; token/label/condition and
+known market-state/constraint disagreement refuse the complete context. It
+preserves exact raw responses, fee-number lexemes and local acquisition timing,
+with unknown fees left unknown. Its caller-configured client builder has redirects
+and retries disabled, and one request budget/deadline covers all bodies. This is
+quote input provenance; it provides no canonical native-ID binding, fee/currency
+calculation, exchange-guaranteed freshness/expiry or order interface. Raw book
+timestamps have no inferred seconds/milliseconds unit. Core supports Rust1.85.

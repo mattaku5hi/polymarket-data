@@ -13576,10 +13576,13 @@ mod receipt_tests {
     }
 
     pub(super) async fn test_wall_timeout(duration: Duration) {
-        let deadline = std::time::Instant::now() + duration;
-        while std::time::Instant::now() < deadline {
-            tokio::task::yield_now().await;
-        }
+        // A pending blocking task inhibits paused-clock auto-advance without
+        // consuming a CPU core. Dropping this future closes the channel so the
+        // blocking task exits immediately instead of delaying runtime shutdown.
+        let (cancel, receiver) = std::sync::mpsc::channel::<()>();
+        let guard = tokio::task::spawn_blocking(move || receiver.recv_timeout(duration));
+        let _ = guard.await;
+        drop(cancel);
     }
 
     async fn await_loopback_without_virtual_time_advance<F: std::future::Future>(
@@ -15581,17 +15584,19 @@ mod receipt_tests {
         let intervals = intervals_from_headers(&opening, &closing, &quiet);
         let primary = ctf_inventory_provider(fixture.clone()).await;
         let secondary = ctf_inventory_provider(fixture.clone()).await;
-        ChainLogVerifier::new(&primary, &secondary)
-            .unwrap()
-            .verify_v1_trade_attribution_intervals_with_complementary_inventory_bounded(
-                &format!("{:#x}", test_owner()),
-                token_id,
-                condition_id.0,
-                &intervals,
-                request_limit,
-                timeout,
-            )
-            .await
+        await_loopback_without_virtual_time_advance(
+            ChainLogVerifier::new(&primary, &secondary)
+                .unwrap()
+                .verify_v1_trade_attribution_intervals_with_complementary_inventory_bounded(
+                    &format!("{:#x}", test_owner()),
+                    token_id,
+                    condition_id.0,
+                    &intervals,
+                    request_limit,
+                    timeout,
+                ),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -26638,19 +26643,21 @@ mod receipt_tests {
         let (opening, _, closing, _) = ctf_inventory_headers_with_102(fixture);
         let (primary, primary_task) = serve_direct_module_fixture(fixture.clone()).await;
         let (secondary, secondary_task) = serve_direct_module_fixture(fixture.clone()).await;
-        let result = ChainLogVerifier::new(&primary, &secondary)
-            .unwrap()
-            .verify_fifth_legacy_binary_module_operations_interval_bounded(
-                "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
-                DIRECT_MODULE_LEGACY,
-                100,
-                101,
-                opening["hash"].as_str().unwrap(),
-                closing["hash"].as_str().unwrap(),
-                request_budget,
-                timeout,
-            )
-            .await;
+        let result = await_loopback_without_virtual_time_advance(
+            ChainLogVerifier::new(&primary, &secondary)
+                .unwrap()
+                .verify_fifth_legacy_binary_module_operations_interval_bounded(
+                    "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+                    DIRECT_MODULE_LEGACY,
+                    100,
+                    101,
+                    opening["hash"].as_str().unwrap(),
+                    closing["hash"].as_str().unwrap(),
+                    request_budget,
+                    timeout,
+                ),
+        )
+        .await;
         primary_task.abort();
         secondary_task.abort();
         result
@@ -27637,19 +27644,21 @@ mod receipt_tests {
         let (opening, _, closing, _) = ctf_inventory_headers_with_102(&fixture);
         let primary = ctf_inventory_provider(fixture.clone()).await;
         let secondary = ctf_inventory_provider(fixture).await;
-        ChainLogVerifier::new(&primary, &secondary)
-            .unwrap()
-            .verify_fifth_direct_legacy_migration_interval_bounded(
-                owner,
-                legacy,
-                100,
-                101,
-                opening["hash"].as_str().unwrap(),
-                closing["hash"].as_str().unwrap(),
-                request_budget,
-                Duration::from_secs(10),
-            )
-            .await
+        await_loopback_without_virtual_time_advance(
+            ChainLogVerifier::new(&primary, &secondary)
+                .unwrap()
+                .verify_fifth_direct_legacy_migration_interval_bounded(
+                    owner,
+                    legacy,
+                    100,
+                    101,
+                    opening["hash"].as_str().unwrap(),
+                    closing["hash"].as_str().unwrap(),
+                    request_budget,
+                    Duration::from_secs(10),
+                ),
+        )
+        .await
     }
 
     fn capture_fifth_direct_migration_case(
@@ -29748,20 +29757,22 @@ mod receipt_tests {
             let (opening_header, _, end_header, _) = ctf_inventory_headers_with_102(&fixture);
             let primary = ctf_inventory_provider(fixture.clone()).await;
             let secondary = ctf_inventory_provider(fixture).await;
-            let report = ChainLogVerifier::new(&primary, &secondary)
-                .unwrap()
-                .verify_fifth_native_binary_trade_interval_bounded(
-                    &owner_text,
-                    &format!("{condition_id:#x}"),
-                    100,
-                    101,
-                    opening_header["hash"].as_str().unwrap(),
-                    end_header["hash"].as_str().unwrap(),
-                    2_000,
-                    Duration::from_secs(20),
-                )
-                .await
-                .unwrap();
+            let report = await_loopback_without_virtual_time_advance(
+                ChainLogVerifier::new(&primary, &secondary)
+                    .unwrap()
+                    .verify_fifth_native_binary_trade_interval_bounded(
+                        &owner_text,
+                        &format!("{condition_id:#x}"),
+                        100,
+                        101,
+                        opening_header["hash"].as_str().unwrap(),
+                        end_header["hash"].as_str().unwrap(),
+                        2_000,
+                        Duration::from_secs(20),
+                    ),
+            )
+            .await
+            .unwrap();
 
             assert!(report.transactions().is_empty());
             assert!(matches!(
@@ -29919,20 +29930,22 @@ mod receipt_tests {
             let (opening_header, _, end_header, _) = ctf_inventory_headers_with_102(&fixture);
             let primary = ctf_inventory_provider(fixture.clone()).await;
             let secondary = ctf_inventory_provider(fixture).await;
-            let report = ChainLogVerifier::new(&primary, &secondary)
-                .unwrap()
-                .verify_fifth_native_binary_trade_interval_bounded(
-                    &owner_text,
-                    &format!("{condition_id:#x}"),
-                    100,
-                    101,
-                    opening_header["hash"].as_str().unwrap(),
-                    end_header["hash"].as_str().unwrap(),
-                    2_000,
-                    Duration::from_secs(20),
-                )
-                .await
-                .unwrap();
+            let report = await_loopback_without_virtual_time_advance(
+                ChainLogVerifier::new(&primary, &secondary)
+                    .unwrap()
+                    .verify_fifth_native_binary_trade_interval_bounded(
+                        &owner_text,
+                        &format!("{condition_id:#x}"),
+                        100,
+                        101,
+                        opening_header["hash"].as_str().unwrap(),
+                        end_header["hash"].as_str().unwrap(),
+                        2_000,
+                        Duration::from_secs(20),
+                    ),
+            )
+            .await
+            .unwrap();
 
             assert!(report.transactions().is_empty());
             assert_ne!(report.status(), &FifthNativeBinaryTradeStatus::Matched);
@@ -31525,19 +31538,21 @@ mod receipt_tests {
                 let (opening, _, end, _) = ctf_inventory_headers_with_102(&fixture);
                 let primary = ctf_inventory_provider(fixture.clone()).await;
                 let secondary = ctf_inventory_provider(fixture).await;
-                let result = ChainLogVerifier::new(&primary, &secondary)
-                    .unwrap()
-                    .verify_fifth_legacy_binary_inventory_interval_bounded(
-                        &owner,
-                        &legacy,
-                        100,
-                        101,
-                        opening["hash"].as_str().unwrap(),
-                        end["hash"].as_str().unwrap(),
-                        1000,
-                        Duration::from_secs(10),
-                    )
-                    .await;
+                let result = await_loopback_without_virtual_time_advance(
+                    ChainLogVerifier::new(&primary, &secondary)
+                        .unwrap()
+                        .verify_fifth_legacy_binary_inventory_interval_bounded(
+                            &owner,
+                            &legacy,
+                            100,
+                            101,
+                            opening["hash"].as_str().unwrap(),
+                            end["hash"].as_str().unwrap(),
+                            1000,
+                            Duration::from_secs(10),
+                        ),
+                )
+                .await;
                 assert_eq!(
                     result,
                     Err(BoundedFifthLegacyBinaryInventoryError::Verification(
