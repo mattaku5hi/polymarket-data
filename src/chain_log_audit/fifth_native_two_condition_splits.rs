@@ -8,7 +8,8 @@ use super::fifth_native_binary::is_canonical_native_binary_condition;
 use super::fifth_native_binary_trades::transaction_has_control_or_upgrade_event;
 use super::fifth_native_module_operations::FifthNativeBinaryModuleOperationBoundary;
 use super::fifth_native_two_condition_trades::{
-    BoundedFifthNativeBinaryTwoConditionTradeError, pair_boundary, same_shared_boundary,
+    BoundedFifthNativeBinaryTwoConditionTradeError, TwoConditionAnchor, TwoConditionEvidence,
+    collect_two_condition_evidence,
 };
 use super::{
     ChainLogAuditError, ChainLogVerifier, ChainReceiptIntervalEvidence, MAX_BLOCKS,
@@ -63,6 +64,20 @@ impl FifthNativeTwoConditionSplitFact {
         &self,
     ) -> &super::fifth_direct_module_operations::FifthDirectModuleTransactionLocator {
         &self.operation_transaction
+    }
+}
+
+pub(super) fn split_fact(
+    condition_index: usize,
+    condition_id: B256,
+    amount: U256,
+    operation_transaction: FifthDirectModuleTransactionLocator,
+) -> FifthNativeTwoConditionSplitFact {
+    FifthNativeTwoConditionSplitFact {
+        condition_index,
+        condition_id,
+        amount,
+        operation_transaction,
     }
 }
 
@@ -158,7 +173,6 @@ impl ChainLogVerifier {
         let scoped = self.with_request_budget(budget.inner());
         let verification = scoped.verify_two_condition_splits_inner(
             owner,
-            condition_ids,
             ids,
             from_block,
             through_block,
@@ -197,7 +211,6 @@ impl ChainLogVerifier {
     async fn verify_two_condition_splits_inner(
         &self,
         owner: Address,
-        conditions: [B256; 2],
         ids: [[B256; 2]; 2],
         from_block: u64,
         through_block: u64,
@@ -208,91 +221,55 @@ impl ChainLogVerifier {
         FifthNativeBinaryTwoConditionSplitObservation,
         BoundedFifthNativeBinaryTwoConditionSplitError,
     > {
-        ensure_deadline(deadline)?;
-        let opening = [
-            pair_boundary(
-                self,
-                owner,
-                conditions[0],
-                ids[0],
-                from_block - 1,
+        let collected = collect_two_condition_evidence(
+            self,
+            owner,
+            ids,
+            TwoConditionAnchor {
+                from_block,
+                through_block,
                 parent_hash,
+                end_hash,
                 deadline,
-            )
-            .await
-            .map_err(map_pair_error)?,
-            pair_boundary(
-                self,
-                owner,
-                conditions[1],
-                ids[1],
-                from_block - 1,
-                parent_hash,
-                deadline,
-            )
-            .await
-            .map_err(map_pair_error)?,
-        ];
-        if !same_shared_boundary(&opening[0], &opening[1])
-            || opening.iter().any(|point| {
-                point.module_position_balances() != [U256::ZERO; 2]
-                    || !point.module_pusd_balance().is_zero()
-                    || !source::has_minter_role(point.module_role_bitmap())
-            })
-        {
-            return Err(ChainLogAuditError::Unverified.into());
-        }
-        let module = opening[0].native_context().module_proxy();
-        let scoped = self.with_fifth_module_call_targets(module);
-        let evidence = scoped
-            .verify_receipt_interval_inner(from_block, through_block, parent_hash, end_hash)
-            .await?;
-        let mut points = Vec::with_capacity(evidence.blocks().len());
-        for block in evidence.blocks() {
-            ensure_deadline(deadline)?;
-            let pair = [
-                pair_boundary(
-                    &scoped,
-                    owner,
-                    conditions[0],
-                    ids[0],
-                    block.block_number(),
-                    block.block_hash(),
-                    deadline,
-                )
-                .await
-                .map_err(map_pair_error)?,
-                pair_boundary(
-                    &scoped,
-                    owner,
-                    conditions[1],
-                    ids[1],
-                    block.block_number(),
-                    block.block_hash(),
-                    deadline,
-                )
-                .await
-                .map_err(map_pair_error)?,
-            ];
-            if pair.iter().any(|point| {
-                point.native_context().selected_balances().state_root() != block.state_root()
-                    || point.native_context().legacy_mapping_value() != U256::ZERO
-                    || !source::has_minter_role(point.module_role_bitmap())
-            }) || !same_shared_boundary(&pair[0], &pair[1])
-            {
-                return Err(ChainLogAuditError::Unverified.into());
-            }
-            let previous = points.last().unwrap_or(&opening);
-            for index in 0..2 {
-                if !ModuleOperationPoint::source_identity_continues(&previous[index], &pair[index])
-                    || pair[index].module_role_bitmap() != opening[index].module_role_bitmap()
-                {
-                    return Err(ChainLogAuditError::Unverified.into());
+            },
+            |opening| {
+                if opening.iter().any(|point| {
+                    point.module_position_balances() != [U256::ZERO; 2]
+                        || !point.module_pusd_balance().is_zero()
+                        || !source::has_minter_role(point.module_role_bitmap())
+                }) {
+                    return Err(ChainLogAuditError::Unverified);
                 }
-            }
-            points.push(pair);
-        }
+                Ok(())
+            },
+            |opening, previous, pair, _block| {
+                if pair.iter().any(|point| {
+                    point.native_context().legacy_mapping_value() != U256::ZERO
+                        || !source::has_minter_role(point.module_role_bitmap())
+                }) {
+                    return Err(ChainLogAuditError::Unverified);
+                }
+                for index in 0..2 {
+                    if !ModuleOperationPoint::source_identity_continues(
+                        &previous[index],
+                        &pair[index],
+                    ) || pair[index].module_role_bitmap() != opening[index].module_role_bitmap()
+                    {
+                        return Err(ChainLogAuditError::Unverified);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
+        .map_err(map_pair_error)?;
+        let TwoConditionEvidence {
+            evidence,
+            opening,
+            block_observations: points,
+        } = collected;
         ensure_deadline(deadline)?;
+        let module = opening[0].native_context().module_proxy();
         let (funding, splits) =
             scan_and_replay(&evidence, &opening, &points, owner, ids, module, deadline)?;
         ensure_deadline(deadline)?;
@@ -466,12 +443,12 @@ fn scan_and_replay(
                     .ok_or(ChainLogAuditError::Unverified)?;
                 let operation_transaction =
                     source::locator(block.block_number(), block, transaction);
-                split_facts.push(FifthNativeTwoConditionSplitFact {
+                split_facts.push(split_fact(
                     condition_index,
-                    condition_id: ids[condition_index][0],
+                    ids[condition_index][0],
                     amount,
                     operation_transaction,
-                });
+                ));
                 seen_conditions[condition_index] = true;
                 true
             } else {
@@ -542,7 +519,7 @@ fn scan_and_replay(
     Ok((funding, split_facts))
 }
 
-fn validate_owner_source(
+pub(super) fn validate_owner_source(
     transaction: &super::ChainReceiptIntervalTransaction,
     owner: &str,
 ) -> Result<(), ChainLogAuditError> {
@@ -558,7 +535,7 @@ fn validate_owner_source(
     Ok(())
 }
 
-fn relevant_unclassified_movement(
+pub(super) fn relevant_unclassified_movement(
     transaction: &super::ChainReceiptIntervalTransaction,
     owner: Address,
     module: Address,

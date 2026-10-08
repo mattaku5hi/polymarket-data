@@ -45,6 +45,7 @@ mod fifth_native_activity;
 mod fifth_native_binary;
 mod fifth_native_binary_trades;
 mod fifth_native_module_operations;
+mod fifth_native_two_condition_activity;
 mod fifth_native_two_condition_splits;
 mod fifth_native_two_condition_trades;
 mod fifth_receipt_maker_window;
@@ -120,6 +121,11 @@ pub use fifth_native_module_operations::{
     BoundedFifthNativeBinaryModuleOperationsError,
     FIFTH_NATIVE_BINARY_MODULE_OPERATIONS_POLICY_VERSION, FifthNativeBinaryModuleOperationBoundary,
     FifthNativeBinaryModuleOperationsObservation, FifthNativeBinaryModuleOperationsStatus,
+};
+pub use fifth_native_two_condition_activity::{
+    BoundedFifthNativeBinaryTwoConditionActivityError,
+    FIFTH_NATIVE_TWO_CONDITION_ACTIVITY_POLICY_VERSION,
+    FifthNativeBinaryTwoConditionActivityObservation,
 };
 pub use fifth_native_two_condition_splits::{
     BoundedFifthNativeBinaryTwoConditionSplitError,

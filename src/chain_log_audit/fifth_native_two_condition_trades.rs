@@ -60,6 +60,16 @@ impl FifthNativeTwoConditionTradeTransaction {
     }
 }
 
+pub(super) fn tag_trade_fact(
+    condition_index: usize,
+    transaction: FifthTradeTransactionFact,
+) -> FifthNativeTwoConditionTradeTransaction {
+    FifthNativeTwoConditionTradeTransaction {
+        condition_index,
+        transaction,
+    }
+}
+
 /// Complete rooted evidence for one shared owner/cash interval across two conditions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FifthNativeBinaryTwoConditionTradeObservation {
@@ -152,7 +162,6 @@ impl ChainLogVerifier {
         let scoped = self.with_request_budget(budget.inner());
         let verification = scoped.verify_two_condition_trade_inner(
             owner_address,
-            condition_ids,
             ids,
             from_block,
             through_block,
@@ -191,7 +200,6 @@ impl ChainLogVerifier {
     async fn verify_two_condition_trade_inner(
         &self,
         owner_address: Address,
-        conditions: [B256; 2],
         ids: [[B256; 2]; 2],
         from_block: u64,
         through_block: u64,
@@ -202,71 +210,27 @@ impl ChainLogVerifier {
         FifthNativeBinaryTwoConditionTradeObservation,
         BoundedFifthNativeBinaryTwoConditionTradeError,
     > {
-        ensure_deadline(deadline)?;
-        let opening = [
-            pair_boundary(
-                self,
-                owner_address,
-                conditions[0],
-                ids[0],
-                from_block - 1,
+        let collected = collect_two_condition_evidence(
+            self,
+            owner_address,
+            ids,
+            TwoConditionAnchor {
+                from_block,
+                through_block,
                 parent_hash,
+                end_hash,
                 deadline,
-            )
-            .await?,
-            pair_boundary(
-                self,
-                owner_address,
-                conditions[1],
-                ids[1],
-                from_block - 1,
-                parent_hash,
-                deadline,
-            )
-            .await?,
-        ];
-        if !same_shared_boundary(&opening[0], &opening[1]) {
-            return Err(ChainLogAuditError::Unverified.into());
-        }
+            },
+            |_| Ok(()),
+            |_, _, _, _| Ok(()),
+        )
+        .await?;
+        let TwoConditionEvidence {
+            evidence,
+            opening,
+            block_observations: points,
+        } = collected;
         let module = opening[0].native_context().module_proxy();
-        if opening[1].native_context().module_proxy() != module {
-            return Err(ChainLogAuditError::Unverified.into());
-        }
-        let scoped = self.with_fifth_module_call_targets(module);
-        let evidence = scoped
-            .verify_receipt_interval_inner(from_block, through_block, parent_hash, end_hash)
-            .await?;
-        let mut points = Vec::with_capacity(evidence.blocks().len());
-        for block in evidence.blocks() {
-            ensure_deadline(deadline)?;
-            let pair_a = pair_boundary(
-                &scoped,
-                owner_address,
-                conditions[0],
-                ids[0],
-                block.block_number(),
-                block.block_hash(),
-                deadline,
-            )
-            .await?;
-            let pair_b = pair_boundary(
-                &scoped,
-                owner_address,
-                conditions[1],
-                ids[1],
-                block.block_number(),
-                block.block_hash(),
-                deadline,
-            )
-            .await?;
-            if pair_a.native_context().selected_balances().state_root() != block.state_root()
-                || pair_b.native_context().selected_balances().state_root() != block.state_root()
-                || !same_shared_boundary(&pair_a, &pair_b)
-            {
-                return Err(ChainLogAuditError::Unverified.into());
-            }
-            points.push([pair_a, pair_b]);
-        }
         ensure_deadline(deadline)?;
         validate_boundaries(&opening, &points, &evidence, ids)?;
         let ScannedTwoConditionTransactions {
@@ -303,7 +267,121 @@ impl ChainLogVerifier {
     }
 }
 
-fn native_position_ids(condition: B256) -> [B256; 2] {
+pub(super) struct TwoConditionEvidence {
+    pub(super) evidence: ChainReceiptIntervalEvidence,
+    pub(super) opening: [FifthNativeBinaryModuleOperationBoundary; 2],
+    pub(super) block_observations: Vec<[FifthNativeBinaryModuleOperationBoundary; 2]>,
+}
+
+pub(super) struct TwoConditionAnchor<'a> {
+    pub(super) from_block: u64,
+    pub(super) through_block: u64,
+    pub(super) parent_hash: &'a str,
+    pub(super) end_hash: &'a str,
+    pub(super) deadline: Instant,
+}
+
+pub(super) async fn collect_two_condition_evidence<OpeningCheck, BlockCheck>(
+    verifier: &ChainLogVerifier,
+    owner: Address,
+    ids: [[B256; 2]; 2],
+    anchor: TwoConditionAnchor<'_>,
+    check_opening: OpeningCheck,
+    mut check_block: BlockCheck,
+) -> Result<TwoConditionEvidence, BoundedFifthNativeBinaryTwoConditionTradeError>
+where
+    OpeningCheck:
+        FnOnce(&[FifthNativeBinaryModuleOperationBoundary; 2]) -> Result<(), ChainLogAuditError>,
+    BlockCheck: FnMut(
+        &[FifthNativeBinaryModuleOperationBoundary; 2],
+        &[FifthNativeBinaryModuleOperationBoundary; 2],
+        &[FifthNativeBinaryModuleOperationBoundary; 2],
+        &super::ChainReceiptIntervalBlock,
+    ) -> Result<(), ChainLogAuditError>,
+{
+    let TwoConditionAnchor {
+        from_block,
+        through_block,
+        parent_hash,
+        end_hash,
+        deadline,
+    } = anchor;
+    ensure_deadline(deadline)?;
+    let opening = [
+        pair_boundary(
+            verifier,
+            owner,
+            ids[0][0],
+            ids[0],
+            from_block - 1,
+            parent_hash,
+            deadline,
+        )
+        .await?,
+        pair_boundary(
+            verifier,
+            owner,
+            ids[1][0],
+            ids[1],
+            from_block - 1,
+            parent_hash,
+            deadline,
+        )
+        .await?,
+    ];
+    if !same_shared_boundary(&opening[0], &opening[1]) {
+        return Err(ChainLogAuditError::Unverified.into());
+    }
+    check_opening(&opening)?;
+
+    let module = opening[0].native_context().module_proxy();
+    let scoped = verifier.with_fifth_module_call_targets(module);
+    let evidence = scoped
+        .verify_receipt_interval_inner(from_block, through_block, parent_hash, end_hash)
+        .await?;
+    let mut block_observations = Vec::with_capacity(evidence.blocks().len());
+    for block in evidence.blocks() {
+        ensure_deadline(deadline)?;
+        let pair = [
+            pair_boundary(
+                &scoped,
+                owner,
+                ids[0][0],
+                ids[0],
+                block.block_number(),
+                block.block_hash(),
+                deadline,
+            )
+            .await?,
+            pair_boundary(
+                &scoped,
+                owner,
+                ids[1][0],
+                ids[1],
+                block.block_number(),
+                block.block_hash(),
+                deadline,
+            )
+            .await?,
+        ];
+        if pair.iter().any(|boundary| {
+            boundary.native_context().selected_balances().state_root() != block.state_root()
+        }) || !same_shared_boundary(&pair[0], &pair[1])
+        {
+            return Err(ChainLogAuditError::Unverified.into());
+        }
+        let previous = block_observations.last().unwrap_or(&opening);
+        check_block(&opening, previous, &pair, block)?;
+        block_observations.push(pair);
+    }
+    Ok(TwoConditionEvidence {
+        evidence,
+        opening,
+        block_observations,
+    })
+}
+
+pub(super) fn native_position_ids(condition: B256) -> [B256; 2] {
     let mut second = condition.0;
     second[31] = 1;
     [condition, B256::from(second)]
@@ -434,6 +512,78 @@ struct ScannedTwoConditionTransactions {
     candidates: Vec<(usize, usize, Address, Vec<Address>)>,
 }
 
+pub(super) struct RoutedTwoConditionExchangeTransaction {
+    pub(super) condition_index: usize,
+    pub(super) fact: Option<FifthTradeTransactionFact>,
+    pub(super) submitter: Address,
+    pub(super) makers: Vec<Address>,
+}
+
+pub(super) fn classify_two_condition_exchange_transaction(
+    transaction: &super::ChainReceiptIntervalTransaction,
+    block_number: u64,
+    block_hash: &str,
+    owner: Address,
+    ids: [[B256; 2]; 2],
+    module: Address,
+    versions: [super::fifth_code_context::FifthExchangeImplementationVersion; 2],
+) -> Result<RoutedTwoConditionExchangeTransaction, ChainLogAuditError> {
+    let input = transaction
+        .input
+        .as_deref()
+        .filter(|input| input.starts_with(&FIFTH_MATCH_ORDERS_SELECTOR))
+        .ok_or(ChainLogAuditError::Unverified)?;
+    let call = decode_fifth_match_orders_calldata(input).ok_or(ChainLogAuditError::Unverified)?;
+    let token_ids = std::iter::once(call.taker_order.token_id)
+        .chain(call.maker_orders.iter().map(|order| order.token_id))
+        .collect::<Vec<_>>();
+    let matching = (0..2)
+        .filter(|index| {
+            token_ids.iter().all(|token| {
+                ids[*index]
+                    .iter()
+                    .any(|id| U256::from_be_bytes(id.0) == *token)
+            })
+        })
+        .collect::<Vec<_>>();
+    let [condition_index] = matching.as_slice() else {
+        return Err(ChainLogAuditError::Unverified);
+    };
+    let condition_index = *condition_index;
+    let fact = match classify_transaction(
+        transaction,
+        block_number,
+        block_hash,
+        owner,
+        ids[condition_index],
+        module,
+        versions[condition_index],
+    ) {
+        TransactionClassification::Fact(fact) => Some(*fact),
+        TransactionClassification::Unavailable(_) => {
+            return Err(ChainLogAuditError::Unverified);
+        }
+        TransactionClassification::Quiet => None,
+    };
+    let submitter = Address::from_str(
+        transaction
+            .recovered_from
+            .as_deref()
+            .ok_or(ChainLogAuditError::Unverified)?,
+    )
+    .map_err(|_| ChainLogAuditError::Unverified)?;
+    let mut makers = vec![call.taker_order.maker];
+    makers.extend(call.maker_orders.iter().map(|order| order.maker));
+    makers.sort_unstable();
+    makers.dedup();
+    Ok(RoutedTwoConditionExchangeTransaction {
+        condition_index,
+        fact,
+        submitter,
+        makers,
+    })
+}
+
 fn scan_transactions(
     evidence: &ChainReceiptIntervalEvidence,
     points: &[[FifthNativeBinaryModuleOperationBoundary; 2]],
@@ -480,63 +630,35 @@ fn scan_transactions(
                 return Err(ChainLogAuditError::Unverified.into());
             }
             let class = if exchange_call {
-                let input = transaction
-                    .input
-                    .as_deref()
-                    .ok_or(ChainLogAuditError::Unverified)?;
-                let call = decode_fifth_match_orders_calldata(input)
-                    .ok_or(ChainLogAuditError::Unverified)?;
-                let token_ids = std::iter::once(call.taker_order.token_id)
-                    .chain(call.maker_orders.iter().map(|order| order.token_id))
-                    .collect::<Vec<_>>();
-                let selected = (0..2)
-                    .find(|index| {
-                        token_ids.iter().all(|token| {
-                            ids[*index]
-                                .iter()
-                                .any(|id| U256::from_be_bytes(id.0) == *token)
-                        })
-                    })
-                    .ok_or(ChainLogAuditError::Unverified)?;
-                let version = points[block_index][selected]
-                    .native_context()
-                    .selected_balances()
-                    .code_context()
-                    .exchange_implementation_version();
-                let classified = classify_transaction(
+                let versions = [0, 1].map(|index| {
+                    points[block_index][index]
+                        .native_context()
+                        .selected_balances()
+                        .code_context()
+                        .exchange_implementation_version()
+                });
+                let routed = classify_two_condition_exchange_transaction(
                     transaction,
                     block.block_number(),
                     block.block_hash(),
                     owner,
-                    ids[selected],
+                    ids,
                     module,
-                    version,
-                );
-                let fact = match classified {
-                    TransactionClassification::Fact(fact) => Some((selected, *fact)),
-                    TransactionClassification::Unavailable(_) => {
-                        return Err(ChainLogAuditError::Unverified.into());
-                    }
-                    TransactionClassification::Quiet => None,
-                };
-                let submitter = Address::from_str(
-                    transaction
-                        .recovered_from
-                        .as_deref()
-                        .ok_or(ChainLogAuditError::Unverified)?,
-                )
-                .map_err(|_| ChainLogAuditError::Unverified)?;
-                let mut makers = vec![call.taker_order.maker];
-                makers.extend(call.maker_orders.iter().map(|order| order.maker));
-                makers.sort_unstable();
-                makers.dedup();
-                for maker in &makers {
+                    versions,
+                )?;
+                for maker in &routed.makers {
+                    let submitter = routed.submitter;
                     if !actors.contains(&(submitter, *maker)) {
                         actors.push((submitter, *maker));
                     }
                 }
-                candidates.push((block_index, transaction_index, submitter, makers));
-                fact
+                candidates.push((
+                    block_index,
+                    transaction_index,
+                    routed.submitter,
+                    routed.makers,
+                ));
+                routed.fact.map(|fact| (routed.condition_index, fact))
             } else {
                 if has_owner_position_or_cash_movement(transaction, owner) {
                     return Err(ChainLogAuditError::Unverified.into());
@@ -572,10 +694,7 @@ fn scan_transactions(
                 return Err(ChainLogAuditError::Unverified.into());
             }
             if let Some((condition_index, transaction)) = class {
-                facts.push(FifthNativeTwoConditionTradeTransaction {
-                    condition_index,
-                    transaction,
-                });
+                facts.push(tag_trade_fact(condition_index, transaction));
             }
         }
     }
@@ -586,7 +705,7 @@ fn scan_transactions(
     })
 }
 
-fn has_owner_position_or_cash_movement(
+pub(super) fn has_owner_position_or_cash_movement(
     transaction: &super::ChainReceiptIntervalTransaction,
     owner: Address,
 ) -> bool {

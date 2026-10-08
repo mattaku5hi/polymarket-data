@@ -192,6 +192,13 @@ ordered full-width provider asset IDs exactly equal the native pair. It keeps
 the API condition selector separate from native condition identity and makes no
 claim about outcome semantics, fees, currency, freshness, or execution safety.
 
+`verify_fifth_native_binary_two_condition_activity_bounded` verifies one
+rooted interval containing a direct pUSD funding call, one exact native split
+for each selected condition, and supported Exchange trades across the shared
+owner/module cash and position state. It acquires one receipt interval and
+applies one request budget and deadline; the sealed report is complete-or-error
+and does not combine independently verified per-condition reports.
+
 Context minimum sizes retain endpoint-specific units: Gamma `orderMinSize` is
 labelled USDC notional by its documentation, book `min_order_size` is shares,
 and compact CLOB `mos` has an unspecified unit. Typed unit getters describe those
