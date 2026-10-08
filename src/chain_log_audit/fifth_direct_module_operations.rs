@@ -18,7 +18,7 @@ use std::{collections::BTreeMap, time::Duration};
 use thiserror::Error;
 use tokio::time::Instant;
 
-const PUSD_PROXY: &str = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+pub(super) const PUSD_PROXY: &str = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
 const PUSD_ROLE_SEED: [u8; 4] = [0x8b, 0x78, 0xc6, 0xd8];
 const PUSD_BALANCE_SEED: [u8; 4] = [0x87, 0xa2, 0x11, 0xa2];
 const POSITION_BALANCE_SEED: u64 = 0x9a31110384e0b0c9;
@@ -1087,20 +1087,20 @@ pub(super) fn classify_module_interval_with_trades<P: ModuleOperationPoint>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FundingCall {
+pub(super) enum FundingCall {
     Pusd(U256),
     Position { id: B256, amount: U256 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModuleCall {
+pub(super) enum ModuleCall {
     Split { amount: U256 },
     Merge { amount: U256 },
     Redeem { position_id: B256, amount: U256 },
 }
 
 #[derive(Debug, Clone)]
-struct ExpectedLog {
+pub(super) struct ExpectedLog {
     address: String,
     topics: Vec<String>,
     data: String,
@@ -1186,7 +1186,7 @@ fn owner_balances<P: ModuleOperationPoint>(point: &P) -> OwnerBalances {
     }
 }
 
-fn parse_module_call(
+pub(super) fn parse_module_call(
     input: &[u8],
     owner: Address,
     condition_id: B256,
@@ -1241,7 +1241,7 @@ fn parse_module_call(
     }
 }
 
-fn parse_pusd_funding(input: &[u8], module: Address) -> Option<FundingCall> {
+pub(super) fn parse_pusd_funding(input: &[u8], module: Address) -> Option<FundingCall> {
     if input.len() != 68 || input.get(..4)? != PUSD_TRANSFER {
         return None;
     }
@@ -1336,7 +1336,11 @@ fn checked_sum(mut values: impl Iterator<Item = U256>) -> Option<U256> {
     values.try_fold(U256::ZERO, U256::checked_add)
 }
 
-fn expected_funding_logs(call: &FundingCall, owner: Address, module: Address) -> Vec<ExpectedLog> {
+pub(super) fn expected_funding_logs(
+    call: &FundingCall,
+    owner: Address,
+    module: Address,
+) -> Vec<ExpectedLog> {
     match call {
         FundingCall::Pusd(amount) => vec![erc20_log(PUSD_PROXY, owner, module, *amount)],
         FundingCall::Position { id, amount } => vec![erc1155_log(
@@ -1350,7 +1354,7 @@ fn expected_funding_logs(call: &FundingCall, owner: Address, module: Address) ->
     }
 }
 
-fn expected_operation_logs(
+pub(super) fn expected_operation_logs(
     call: &ModuleCall,
     payout: Option<U256>,
     owner: Address,
@@ -1520,7 +1524,7 @@ fn word_u256_data(value: U256) -> String {
     format!("0x{}", hex::encode(value.to_be_bytes::<32>()))
 }
 
-fn exact_logs(actual: &[super::ChainReceiptLog], expected: &[ExpectedLog]) -> bool {
+pub(super) fn exact_logs(actual: &[super::ChainReceiptLog], expected: &[ExpectedLog]) -> bool {
     actual.len() == expected.len()
         && actual.iter().zip(expected).all(|(actual, expected)| {
             actual.address().eq_ignore_ascii_case(&expected.address)
@@ -1534,7 +1538,7 @@ fn exact_logs(actual: &[super::ChainReceiptLog], expected: &[ExpectedLog]) -> bo
         })
 }
 
-fn funding_fact(
+pub(super) fn funding_fact(
     block_number: u64,
     block: &ChainReceiptIntervalBlock,
     transaction: &super::ChainReceiptIntervalTransaction,
@@ -1561,7 +1565,7 @@ fn funding_fact(
     }
 }
 
-fn locator(
+pub(super) fn locator(
     block_number: u64,
     block: &ChainReceiptIntervalBlock,
     transaction: &super::ChainReceiptIntervalTransaction,
@@ -1842,7 +1846,10 @@ fn result_state_continues<P: ModuleOperationPoint>(
         && previous.source_identity_continues(current)
 }
 
-fn has_relevant_upgrade_or_role_update(block: &ChainReceiptIntervalBlock, module: &str) -> bool {
+pub(super) fn has_relevant_upgrade_or_role_update(
+    block: &ChainReceiptIntervalBlock,
+    module: &str,
+) -> bool {
     let upgraded = format!("0x{}", hex::encode(Keccak256::digest(b"Upgraded(address)")));
     let condition_resolution = "0xb44d84d3289691f71497564b85d4233648d9dbae8cbdbb4329f301c3a0185894";
     block.transactions().iter().any(|transaction| {

@@ -111,6 +111,18 @@ across both pairs in one block and a later sale with shared cash checkpoints.
 This source evidence does not establish complete wallet history, cost basis or
 P&L.
 
+`verify_fifth_native_binary_two_condition_splits_bounded` verifies one owner
+deposit followed by one source-matched split for each of two canonical native
+conditions, using one receipt interval and shared owner/module cash replay.
+The funding transaction is reported once with the two split facts tagged by
+condition index; every anchored root checks all four selected positions and
+the shared module cash, including intermediate residual cash. It refuses
+additional cash effects, other module operations, Exchange calls, unknown
+owner/module movements and control or code transitions. The immutable loopback
+packet at `tests/fixtures/fifth-native-two-condition-splits-rpc.json` covers a
+10-unit deposit split as 4 and 6. It does not infer opening basis or make a
+complete-history claim.
+
 `verify_fifth_native_binary_activity_interval_bounded` combines those trade
 facts with exact owner-funded native module operations in one rooted replay.
 Pending module funds can cross block boundaries, including a trade before their

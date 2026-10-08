@@ -309,7 +309,7 @@ fn native_position_ids(condition: B256) -> [B256; 2] {
     [condition, B256::from(second)]
 }
 
-async fn pair_boundary(
+pub(super) async fn pair_boundary(
     verifier: &ChainLogVerifier,
     owner_address: Address,
     condition: B256,
@@ -354,7 +354,7 @@ async fn pair_boundary(
     )
 }
 
-fn same_shared_boundary(
+pub(super) fn same_shared_boundary(
     left: &FifthNativeBinaryModuleOperationBoundary,
     right: &FifthNativeBinaryModuleOperationBoundary,
 ) -> bool {
