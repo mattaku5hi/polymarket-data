@@ -425,7 +425,38 @@ pub(super) async fn verify_native_trade_sources_and_controls(
     let boundaries = std::iter::once(opening)
         .chain(points.iter())
         .collect::<Vec<_>>();
+    let control_assessment = verify_native_trade_controls(
+        verifier,
+        evidence,
+        &boundaries,
+        &actors,
+        &candidates,
+        deadline,
+    )
+    .await?;
+    let controls = control_assessment.controls;
+    let refusal = control_assessment.refusal;
+    ensure_deadline(deadline)?;
+    Ok(NativeTradeSourceAssessment {
+        facts: if refusal.is_some() { Vec::new() } else { facts },
+        controls,
+        refusal,
+    })
+}
 
+pub(super) struct NativeTradeControlAssessment {
+    pub(super) controls: Vec<FifthExchangeControlsObservation>,
+    pub(super) refusal: Option<NativeTradeSourceFailure>,
+}
+
+pub(super) async fn verify_native_trade_controls(
+    verifier: &ChainLogVerifier,
+    evidence: &ChainReceiptIntervalEvidence,
+    boundaries: &[&FifthNativeBinaryModuleOperationBoundary],
+    actors: &[(Address, Address)],
+    candidates: &[(usize, usize, Address, Vec<Address>)],
+    deadline: Instant,
+) -> Result<NativeTradeControlAssessment, BoundedFifthNativeBinaryTradeError> {
     let mut controls = Vec::new();
     let mut control_failure = None;
     'boundaries: for (boundary_index, point) in boundaries.iter().enumerate() {
@@ -435,7 +466,7 @@ pub(super) async fn verify_native_trade_sources_and_controls(
             .selected_balances()
             .code_context()
             .clone();
-        for (submitter, maker) in &actors {
+        for (submitter, maker) in actors {
             ensure_deadline(deadline)?;
             let control = verifier
                 .verify_fifth_exchange_controls_from_code_context_inner(
@@ -477,7 +508,7 @@ pub(super) async fn verify_native_trade_sources_and_controls(
         })
     } else {
         let mut refusal = None;
-        'candidates: for (block_index, transaction_index, submitter, makers) in &candidates {
+        'candidates: for (block_index, transaction_index, submitter, makers) in candidates {
             let block_number = evidence.blocks()[*block_index].block_number();
             let transaction_hash = evidence.blocks()[*block_index].transactions()
                 [*transaction_index]
@@ -510,11 +541,7 @@ pub(super) async fn verify_native_trade_sources_and_controls(
         refusal
     };
     ensure_deadline(deadline)?;
-    Ok(NativeTradeSourceAssessment {
-        facts: if refusal.is_some() { Vec::new() } else { facts },
-        controls,
-        refusal,
-    })
+    Ok(NativeTradeControlAssessment { controls, refusal })
 }
 
 struct ScannedNativeTransactions {
@@ -747,7 +774,7 @@ fn input_has_match_orders_selector(input: &[u8]) -> bool {
     input.starts_with(&FIFTH_MATCH_ORDERS_SELECTOR)
 }
 
-fn controls_stable(controls: &[FifthExchangeControlsObservation]) -> bool {
+pub(super) fn controls_stable(controls: &[FifthExchangeControlsObservation]) -> bool {
     let mut exchange_state = None;
     let mut submitter_roles = BTreeMap::new();
     let mut maker_states = BTreeMap::new();
@@ -776,7 +803,7 @@ fn controls_stable(controls: &[FifthExchangeControlsObservation]) -> bool {
     true
 }
 
-fn transaction_has_control_or_upgrade_event(
+pub(super) fn transaction_has_control_or_upgrade_event(
     transaction: &super::ChainReceiptIntervalTransaction,
     module: Address,
 ) -> bool {
@@ -850,7 +877,7 @@ fn derive_position_id(condition: B256) -> B256 {
     B256::from(bytes)
 }
 
-fn map_trade_reason(
+pub(super) fn map_trade_reason(
     reason: FifthLegacyBinaryTradeUnavailableReason,
 ) -> FifthNativeBinaryTradeUnavailableReason {
     match reason {

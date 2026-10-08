@@ -72,6 +72,20 @@ impl FifthNativeBinaryModuleOperationBoundary {
     pub const fn module_role_bitmap(&self) -> U256 {
         self.module_role_bitmap
     }
+
+    pub(super) fn from_verified_parts(
+        native_context: FifthNativeBinaryObservation,
+        module_position_balances: [U256; 2],
+        module_pusd_balance: U256,
+        module_role_bitmap: U256,
+    ) -> Self {
+        Self {
+            native_context,
+            module_position_balances,
+            module_pusd_balance,
+            module_role_bitmap,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,7 +537,7 @@ fn map_native_error(
     }
 }
 
-fn map_module_error(
+pub(super) fn map_module_error(
     error: BoundedFifthLegacyBinaryModuleOperationsError,
 ) -> BoundedFifthNativeBinaryModuleOperationsError {
     match error {

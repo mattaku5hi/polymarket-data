@@ -211,6 +211,45 @@ pub(super) fn test_rooted_native_module_operation_point_packet_with_exchange_sto
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn test_rooted_native_two_condition_point_packet(
+    owner: &str,
+    condition_a: B256,
+    owner_a: [U256; 2],
+    condition_b: B256,
+    owner_b: [U256; 2],
+    owner_cash: U256,
+    module_positions_a: [U256; 2],
+    module_positions_b: [U256; 2],
+    module_cash: U256,
+    module_roles: U256,
+    exchange_storage_words: &[(B256, U256)],
+) -> (String, std::collections::BTreeMap<String, Value>) {
+    tests::rooted_native_two_condition_point_packet(
+        owner,
+        condition_a,
+        owner_a,
+        condition_b,
+        owner_b,
+        owner_cash,
+        module_positions_a,
+        module_positions_b,
+        module_cash,
+        module_roles,
+        exchange_storage_words,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn test_tamper_native_position_proof(
+    proofs: &mut std::collections::BTreeMap<String, Value>,
+    owner: &str,
+    position_id: B256,
+) {
+    tests::tamper_native_position_proof(proofs, owner, position_id);
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BoundedFifthLegacyBinaryBalancesError {
     #[error("fifth legacy binary balances RPC request budget exhausted")]
@@ -1263,6 +1302,7 @@ mod tests {
             None,
             condition_override,
             exchange_storage_words,
+            &[],
         )
     }
 
@@ -1293,6 +1333,7 @@ mod tests {
             migration_state,
             condition_override,
             &[],
+            &[],
         )
     }
 
@@ -1310,6 +1351,7 @@ mod tests {
         migration_state: Option<MigrationFixtureState>,
         condition_override: Option<B256>,
         exchange_storage_words: &[(B256, U256)],
+        additional_conditions: &[(B256, [U256; 2], [U256; 2])],
     ) -> Arc<Fixture> {
         let owner = parse_address(owner_text).unwrap();
         let legacy = parse_fixed_b256(LEGACY).unwrap();
@@ -1333,6 +1375,15 @@ mod tests {
                 },
             ),
         ];
+        for (condition, _, _) in additional_conditions {
+            module_storage.push((
+                mapping_key_bytes31(*condition, MODULE_MAPPING_SLOT),
+                U256::ZERO,
+            ));
+            let keys =
+                super::super::fifth_legacy_binary_result::result_storage_keys(*condition).unwrap();
+            module_storage.extend(keys.into_iter().map(|key| (key, U256::ZERO)));
+        }
         if let Some(values) = module_result {
             let keys = super::super::fifth_legacy_binary_result::result_storage_keys(v2).unwrap();
             module_storage.extend(keys.into_iter().zip(values));
@@ -1389,6 +1440,24 @@ mod tests {
                 address_word(MODULE_PROXY).unwrap(),
             ),
         ];
+        for (condition, owner_pair, module_pair) in additional_conditions {
+            let condition_ids = [
+                derive_v2_position_id(*condition, 0),
+                derive_v2_position_id(*condition, 1),
+            ];
+            position_storage.extend([
+                (position_balance_key(owner, condition_ids[0]), owner_pair[0]),
+                (position_balance_key(owner, condition_ids[1]), owner_pair[1]),
+                (
+                    position_balance_key(module, condition_ids[0]),
+                    module_pair[0],
+                ),
+                (
+                    position_balance_key(module, condition_ids[1]),
+                    module_pair[1],
+                ),
+            ]);
+        }
         let mut pusd_storage = vec![
             (slot, address_word(TEST_PUSD_IMPLEMENTATION).unwrap()),
             (pusd_balance_key(owner), pusd_balance),
@@ -1680,6 +1749,62 @@ mod tests {
                 .to_owned(),
             fixture.proofs.clone(),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rooted_native_two_condition_point_packet(
+        owner: &str,
+        condition_a: B256,
+        owner_a: [U256; 2],
+        condition_b: B256,
+        owner_b: [U256; 2],
+        owner_cash: U256,
+        module_positions_a: [U256; 2],
+        module_positions_b: [U256; 2],
+        module_cash: U256,
+        module_roles: U256,
+        exchange_storage_words: &[(B256, U256)],
+    ) -> (String, BTreeMap<String, Value>) {
+        let fixture = rooted_fixture_with_migration_state_and_exchange_storage(
+            false,
+            FixtureFault::NativeBinary,
+            owner_a,
+            owner_cash,
+            MODULE_IMPL,
+            Some([U256::ZERO; 4]),
+            Some([U256::ZERO; 3]),
+            owner,
+            Some((module_positions_a, module_cash, module_roles)),
+            None,
+            Some(condition_a),
+            exchange_storage_words,
+            &[(condition_b, owner_b, module_positions_b)],
+        );
+        (
+            fixture.block_header["stateRoot"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            fixture.proofs.clone(),
+        )
+    }
+
+    pub(super) fn tamper_native_position_proof(
+        proofs: &mut BTreeMap<String, Value>,
+        owner: &str,
+        position_id: B256,
+    ) {
+        let key = position_balance_key(parse_address(owner).unwrap(), position_id);
+        let proof = proofs
+            .get_mut(super::super::fifth_code_context::POSITION_MANAGER_PROXY)
+            .unwrap();
+        let entry = proof["storageProof"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["key"] == format!("{key:#x}"))
+            .unwrap();
+        entry["value"] = json!("0x05");
     }
 
     #[allow(clippy::too_many_arguments)]

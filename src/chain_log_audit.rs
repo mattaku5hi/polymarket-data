@@ -45,6 +45,7 @@ mod fifth_native_activity;
 mod fifth_native_binary;
 mod fifth_native_binary_trades;
 mod fifth_native_module_operations;
+mod fifth_native_two_condition_trades;
 mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
 mod v1_binary_trades;
@@ -118,6 +119,11 @@ pub use fifth_native_module_operations::{
     BoundedFifthNativeBinaryModuleOperationsError,
     FIFTH_NATIVE_BINARY_MODULE_OPERATIONS_POLICY_VERSION, FifthNativeBinaryModuleOperationBoundary,
     FifthNativeBinaryModuleOperationsObservation, FifthNativeBinaryModuleOperationsStatus,
+};
+pub use fifth_native_two_condition_trades::{
+    BoundedFifthNativeBinaryTwoConditionTradeError,
+    FIFTH_NATIVE_TWO_CONDITION_TRADE_POLICY_VERSION, FifthNativeBinaryTwoConditionTradeObservation,
+    FifthNativeTwoConditionTradeTransaction,
 };
 pub use fifth_receipt_maker_window::{
     BoundedFifthReceiptMakerWindowError, FIFTH_RECEIPT_MAKER_WINDOW_POLICY_VERSION,
@@ -13516,6 +13522,7 @@ mod receipt_tests {
         third_inventory_logs: Option<Vec<Value>>,
         third_direct_call_transaction: Option<Value>,
         finalized_block: u64,
+        finalized_height_reads: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
         delay_ms: u64,
         initial_clock_advance_ms: Option<u64>,
         initial_clock_advance_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -13916,7 +13923,12 @@ mod receipt_tests {
                 .or(fixture.extra_post_state.as_ref())
                 .or(fixture.post_state.as_ref())
                 .map_or(&fixture.state_root, |state| &state.0),
-            _ => unreachable!("inventory fixture serves blocks 99 through 102"),
+            _ => fixture
+                .third_post_state
+                .as_ref()
+                .or(fixture.extra_post_state.as_ref())
+                .or(fixture.post_state.as_ref())
+                .map_or(&fixture.state_root, |state| &state.0),
         };
         let empty_root = format!("{EMPTY_ROOT_HASH:#x}");
         let has_primary = number == 100 && fixture.inventory_logs.is_some();
@@ -14384,6 +14396,10 @@ mod receipt_tests {
                 let value = request["params"][0].as_str().unwrap();
                 if value == "finalized" {
                     fixture.finalized_block
+                        + fixture
+                            .finalized_height_reads
+                            .as_ref()
+                            .map_or(0, |reads| reads.fetch_add(1, Ordering::Relaxed) as u64)
                 } else {
                     u64::from_str_radix(value.trim_start_matches("0x"), 16).unwrap()
                 }
@@ -14406,7 +14422,7 @@ mod receipt_tests {
             .unwrap(),
             _ => 100,
         };
-        let (opening, closing, quiet, finalized) = if fixture.finalized_block == 102 {
+        let (opening, closing, quiet, finalized) = if fixture.finalized_block >= 102 {
             ctf_inventory_headers_with_102(&fixture)
         } else {
             let (opening, closing, finalized) = ctf_inventory_headers(&fixture);
@@ -14451,6 +14467,14 @@ mod receipt_tests {
                         ctf_inventory_header(102, quiet["hash"].as_str().unwrap(), &fixture, true)
                     }
                     102 => finalized,
+                    n if n > 102 => {
+                        let mut header = finalized.clone();
+                        for height in 103..=n {
+                            let parent = header["hash"].as_str().unwrap().to_owned();
+                            header = ctf_inventory_header(height, &parent, &fixture, false);
+                        }
+                        header
+                    }
                     _ => panic!("unexpected CTF inventory block {number}"),
                 }
             }
@@ -14856,6 +14880,7 @@ mod receipt_tests {
             third_inventory_logs: None,
             third_direct_call_transaction: None,
             finalized_block: 101,
+            finalized_height_reads: None,
             delay_ms,
             initial_clock_advance_ms: None,
             initial_clock_advance_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(

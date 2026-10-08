@@ -98,6 +98,19 @@ interval and clear transaction facts. Successful observations establish bounded
 source correspondence; they do not independently validate order signatures,
 execute an EVM trace or establish native creation, opening cost basis or P&L.
 
+`verify_fifth_native_binary_two_condition_trades_bounded` verifies two distinct
+canonical native conditions at the same authenticated opening and per-block
+roots. It acquires the receipt interval once, tags each source trade with its
+condition index, and replays four owner position balances against one shared
+pUSD balance stream under one actual-send budget and absolute deadline. Every
+successful Exchange match must route wholly to one selected pair; mixed or
+unselected pairs and direct module/funding activity refuse the complete result.
+The immutable loopback packet at
+`tests/fixtures/fifth-native-two-condition-trade-rpc.json` exercises two buys
+across both pairs in one block and a later sale with shared cash checkpoints.
+This source evidence does not establish complete wallet history, cost basis or
+P&L.
+
 `verify_fifth_native_binary_activity_interval_bounded` combines those trade
 facts with exact owner-funded native module operations in one rooted replay.
 Pending module funds can cross block boundaries, including a trade before their
