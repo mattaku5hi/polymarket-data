@@ -88,6 +88,13 @@ interval and clear transaction facts. Successful observations establish bounded
 source correspondence; they do not independently validate order signatures,
 execute an EVM trace or establish native creation, opening cost basis or P&L.
 
+`verify_fifth_native_binary_activity_interval_bounded` combines those trade
+facts with exact owner-funded native module operations in one rooted replay.
+Pending module funds can cross block boundaries, including a trade before their
+consumption; every owner/module balance checkpoint must reconcile, and pending
+funds and module balances must be empty at the end. It returns its own sealed
+activity observation without opening cost basis or collateral conversion.
+
 Polydoghound consumes these modules through thin local trait/domain adapters.
 Polyazimuth can consume gross-depth acquisition through its observation consumer
 seam; its reconstructed book views are not silently upgraded to executable quotes.

@@ -14,7 +14,7 @@ use super::{
 use alloy_primitives::{Address, B256, U256};
 use serde_json::json;
 use sha3::{Digest, Keccak256};
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 use thiserror::Error;
 use tokio::time::Instant;
 
@@ -783,6 +783,22 @@ pub(super) fn classify_module_interval<P: ModuleOperationPoint>(
     ),
     ChainLogAuditError,
 > {
+    classify_module_interval_with_trades(evidence, owner, opening, points, &[])
+}
+
+pub(super) fn classify_module_interval_with_trades<P: ModuleOperationPoint>(
+    evidence: &ChainReceiptIntervalEvidence,
+    owner: &str,
+    opening: &P,
+    points: &[P],
+    trade_facts: &[super::fifth_binary_trades::FifthTradeTransactionFact],
+) -> Result<
+    (
+        FifthLegacyBinaryModuleOperationsStatus,
+        Vec<FifthDirectModuleOperationFact>,
+    ),
+    ChainLogAuditError,
+> {
     if points.len() != evidence.blocks().len() {
         return Err(ChainLogAuditError::Unverified);
     }
@@ -797,8 +813,40 @@ pub(super) fn classify_module_interval<P: ModuleOperationPoint>(
     let mut module_balances = ModuleBalances::default();
     let mut pending = Vec::<FifthDirectModuleFundingFact>::new();
     let mut operations = Vec::<FifthDirectModuleOperationFact>::new();
+    let mut remaining_trades = BTreeMap::new();
+    for fact in trade_facts {
+        let Some(block) = evidence
+            .blocks()
+            .iter()
+            .find(|block| block.block_number() == fact.block_number())
+        else {
+            return Ok(unavailable_trade_fact(fact));
+        };
+        let Ok(index) = usize::try_from(fact.transaction_index()) else {
+            return Ok(unavailable_trade_fact(fact));
+        };
+        let Some(transaction) = block.transactions().get(index) else {
+            return Ok(unavailable_trade_fact(fact));
+        };
+        if !block.block_hash().eq_ignore_ascii_case(fact.block_hash())
+            || transaction.transaction_index() != fact.transaction_index()
+            || !transaction
+                .transaction_hash()
+                .eq_ignore_ascii_case(fact.transaction_hash())
+            || remaining_trades
+                .insert((fact.block_number(), fact.transaction_index()), fact)
+                .is_some()
+        {
+            return Ok(unavailable_trade_fact(fact));
+        }
+    }
     for (block, point) in evidence.blocks().iter().zip(points) {
         for transaction in block.transactions() {
+            let trade_locator = (block.block_number(), transaction.transaction_index());
+            if let Some(fact) = remaining_trades.remove(&trade_locator) {
+                apply_trade_fact(&mut owner_balances, fact)?;
+                continue;
+            }
             let transaction_status = transaction.status();
             let to = transaction.to.as_deref();
             let is_module_call = to.is_some_and(|to| to.eq_ignore_ascii_case(&module));
@@ -1016,6 +1064,9 @@ pub(super) fn classify_module_interval<P: ModuleOperationPoint>(
             Vec::new(),
         ));
     }
+    if let Some((_, fact)) = remaining_trades.first_key_value() {
+        return Ok(unavailable_trade_fact(fact));
+    }
     if !module_balances.is_zero() {
         return Ok((
             FifthLegacyBinaryModuleOperationsStatus::Unavailable {
@@ -1083,6 +1134,42 @@ fn unavailable(
         },
         Vec::new(),
     )
+}
+
+fn unavailable_trade_fact(
+    fact: &super::fifth_binary_trades::FifthTradeTransactionFact,
+) -> (
+    FifthLegacyBinaryModuleOperationsStatus,
+    Vec<FifthDirectModuleOperationFact>,
+) {
+    (
+        FifthLegacyBinaryModuleOperationsStatus::Unavailable {
+            block_number: Some(fact.block_number()),
+            transaction_hash: Some(fact.transaction_hash().to_owned()),
+            reason: FifthLegacyBinaryModuleOperationsUnavailableReason::SourceSettlementMismatch,
+        },
+        Vec::new(),
+    )
+}
+
+fn apply_trade_fact(
+    owner: &mut OwnerBalances,
+    fact: &super::fifth_binary_trades::FifthTradeTransactionFact,
+) -> Result<(), ChainLogAuditError> {
+    let inflows = fact.owner_position_inflows();
+    let outflows = fact.owner_position_outflows();
+    for index in 0..2 {
+        owner.positions[index] = owner.positions[index]
+            .checked_add(inflows[index])
+            .and_then(|balance| balance.checked_sub(outflows[index]))
+            .ok_or(ChainLogAuditError::Unverified)?;
+    }
+    owner.cash = owner
+        .cash
+        .checked_add(fact.owner_pusd_inflow())
+        .and_then(|balance| balance.checked_sub(fact.owner_pusd_outflow()))
+        .ok_or(ChainLogAuditError::Unverified)?;
+    Ok(())
 }
 
 fn owner_balances<P: ModuleOperationPoint>(point: &P) -> OwnerBalances {

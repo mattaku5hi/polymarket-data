@@ -40,6 +40,7 @@ mod fifth_legacy_binary_balances;
 mod fifth_legacy_binary_inventory;
 mod fifth_legacy_binary_result;
 mod fifth_match_orders_call;
+mod fifth_native_activity;
 mod fifth_native_binary;
 mod fifth_native_binary_trades;
 mod fifth_native_module_operations;
@@ -93,6 +94,11 @@ pub use fifth_legacy_binary_inventory::{
 pub use fifth_legacy_binary_result::{
     BoundedFifthLegacyBinaryResultError, FIFTH_LEGACY_BINARY_RESULT_POLICY_VERSION,
     FifthLegacyBinaryResultObservation, FifthLegacyBinaryResultStatus,
+};
+pub use fifth_native_activity::{
+    BoundedFifthNativeBinaryActivityError, FIFTH_NATIVE_BINARY_ACTIVITY_POLICY_VERSION,
+    FifthNativeBinaryActivityObservation, FifthNativeBinaryActivityStatus,
+    FifthNativeBinaryActivityUnavailableReason,
 };
 pub use fifth_native_binary::{
     BoundedFifthNativeBinaryError, FIFTH_NATIVE_BINARY_POLICY_VERSION,
@@ -9816,6 +9822,10 @@ mod receipt_tests {
 
     mod native_trade_branches {
         include!("chain_log_audit/native_trade_branch_tests.rs");
+    }
+
+    mod native_activity_tests {
+        include!("chain_log_audit/native_activity_tests.rs");
     }
 
     fn movement_topic(signature: &str) -> String {

@@ -258,7 +258,6 @@ async fn classify_native_interval(
     deadline: Instant,
 ) -> Result<FifthNativeBinaryTradeObservation, BoundedFifthNativeBinaryTradeError> {
     ensure_deadline(deadline)?;
-    let module = opening.native_context().module_proxy();
     let boundaries = std::iter::once(&opening)
         .chain(points.iter())
         .collect::<Vec<_>>();
@@ -305,123 +304,30 @@ async fn classify_native_interval(
         ));
     }
 
-    let scan =
-        match scan_native_transactions(&evidence, &points, owner_address, ids, module, deadline) {
-            Ok(scan) => scan,
-            Err(NativeTransactionScanError::Unavailable(failure)) => {
-                return Ok(unavailable(
-                    evidence,
-                    opening,
-                    points,
-                    Vec::new(),
-                    Some(failure.block_number),
-                    Some(failure.transaction_hash),
-                    failure.reason,
-                ));
-            }
-            Err(NativeTransactionScanError::Bounded(error)) => return Err(error),
-        };
-    let ScannedNativeTransactions {
-        facts,
-        actors,
-        candidates,
-    } = scan;
-
-    let mut controls = Vec::new();
-    let mut control_failure = None;
-    'boundaries: for (boundary_index, point) in boundaries.iter().enumerate() {
-        ensure_deadline(deadline)?;
-        let context = point
-            .native_context()
-            .selected_balances()
-            .code_context()
-            .clone();
-        for (submitter, maker) in &actors {
-            ensure_deadline(deadline)?;
-            let control = verifier
-                .verify_fifth_exchange_controls_from_code_context_inner(
-                    context.clone(),
-                    *submitter,
-                    *maker,
-                    deadline,
-                )
-                .await
-                .map_err(map_controls_error)?;
-            if control.global_paused() {
-                control_failure = Some((
-                    point_block_number(boundary_index, &evidence),
-                    FifthNativeBinaryTradeUnavailableReason::ExchangePaused,
-                ));
-                break 'boundaries;
-            }
-            if !control.submitter_has_operator_role() {
-                control_failure = Some((
-                    point_block_number(boundary_index, &evidence),
-                    FifthNativeBinaryTradeUnavailableReason::SubmitterNotOperator,
-                ));
-                break 'boundaries;
-            }
-            controls.push(control);
-        }
-    }
-    if let Some((block_number, reason)) = control_failure {
+    let assessment = verify_native_trade_sources_and_controls(
+        verifier,
+        &evidence,
+        &opening,
+        &points,
+        owner_address,
+        ids,
+        false,
+        deadline,
+    )
+    .await?;
+    if let Some(failure) = assessment.refusal {
         return Ok(unavailable(
             evidence,
             opening,
             points,
-            controls,
-            Some(block_number),
-            None,
-            reason,
+            assessment.controls,
+            failure.block_number,
+            failure.transaction_hash,
+            failure.reason,
         ));
     }
-    if !controls_stable(&controls) {
-        return Ok(unavailable(
-            evidence,
-            opening,
-            points,
-            controls,
-            None,
-            None,
-            FifthNativeBinaryTradeUnavailableReason::ExchangeControlTransition,
-        ));
-    }
-    for (block_index, transaction_index, submitter, makers) in &candidates {
-        let block_number = evidence.blocks()[*block_index].block_number();
-        let transaction_hash = evidence.blocks()[*block_index].transactions()[*transaction_index]
-            .transaction_hash()
-            .to_owned();
-        for maker in makers {
-            let Some(control) = controls.iter().find(|control| {
-                control.code_context().block_number() == block_number
-                    && control.submitter() == *submitter
-                    && control.maker() == *maker
-            }) else {
-                return Ok(unavailable(
-                    evidence,
-                    opening,
-                    points,
-                    controls,
-                    Some(block_number),
-                    Some(transaction_hash.clone()),
-                    FifthNativeBinaryTradeUnavailableReason::ExchangeControlUnavailable,
-                ));
-            };
-            let activation = control.maker_pause_activation_block();
-            if !activation.is_zero() && U256::from(block_number) >= activation {
-                return Ok(unavailable(
-                    evidence,
-                    opening,
-                    points,
-                    controls,
-                    Some(block_number),
-                    Some(transaction_hash.clone()),
-                    FifthNativeBinaryTradeUnavailableReason::MakerPaused,
-                ));
-            }
-        }
-    }
-    ensure_deadline(deadline)?;
+    let facts = assessment.facts;
+    let controls = assessment.controls;
 
     match replay_owner_balances(&evidence, &opening, &points, &facts) {
         Err(()) => {
@@ -463,6 +369,154 @@ async fn classify_native_interval(
     })
 }
 
+pub(super) struct NativeTradeSourceAssessment {
+    pub(super) facts: Vec<FifthTradeTransactionFact>,
+    pub(super) controls: Vec<FifthExchangeControlsObservation>,
+    pub(super) refusal: Option<NativeTradeSourceFailure>,
+}
+
+pub(super) struct NativeTradeSourceFailure {
+    pub(super) block_number: Option<u64>,
+    pub(super) transaction_hash: Option<String>,
+    pub(super) reason: FifthNativeBinaryTradeUnavailableReason,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn verify_native_trade_sources_and_controls(
+    verifier: &ChainLogVerifier,
+    evidence: &ChainReceiptIntervalEvidence,
+    opening: &FifthNativeBinaryModuleOperationBoundary,
+    points: &[FifthNativeBinaryModuleOperationBoundary],
+    owner: Address,
+    ids: [B256; 2],
+    allow_module_operations: bool,
+    deadline: Instant,
+) -> Result<NativeTradeSourceAssessment, BoundedFifthNativeBinaryTradeError> {
+    ensure_deadline(deadline)?;
+    let module = opening.native_context().module_proxy();
+    let scan = match scan_native_transactions(
+        evidence,
+        points,
+        owner,
+        ids,
+        module,
+        allow_module_operations,
+        deadline,
+    ) {
+        Ok(scan) => scan,
+        Err(NativeTransactionScanError::Unavailable(failure)) => {
+            return Ok(NativeTradeSourceAssessment {
+                facts: Vec::new(),
+                controls: Vec::new(),
+                refusal: Some(NativeTradeSourceFailure {
+                    block_number: Some(failure.block_number),
+                    transaction_hash: Some(failure.transaction_hash),
+                    reason: failure.reason,
+                }),
+            });
+        }
+        Err(NativeTransactionScanError::Bounded(error)) => return Err(error),
+    };
+    let ScannedNativeTransactions {
+        facts,
+        actors,
+        candidates,
+    } = scan;
+    let boundaries = std::iter::once(opening)
+        .chain(points.iter())
+        .collect::<Vec<_>>();
+
+    let mut controls = Vec::new();
+    let mut control_failure = None;
+    'boundaries: for (boundary_index, point) in boundaries.iter().enumerate() {
+        ensure_deadline(deadline)?;
+        let context = point
+            .native_context()
+            .selected_balances()
+            .code_context()
+            .clone();
+        for (submitter, maker) in &actors {
+            ensure_deadline(deadline)?;
+            let control = verifier
+                .verify_fifth_exchange_controls_from_code_context_inner(
+                    context.clone(),
+                    *submitter,
+                    *maker,
+                    deadline,
+                )
+                .await
+                .map_err(map_controls_error)?;
+            if control.global_paused() {
+                control_failure = Some((
+                    point_block_number(boundary_index, evidence),
+                    FifthNativeBinaryTradeUnavailableReason::ExchangePaused,
+                ));
+                break 'boundaries;
+            }
+            if !control.submitter_has_operator_role() {
+                control_failure = Some((
+                    point_block_number(boundary_index, evidence),
+                    FifthNativeBinaryTradeUnavailableReason::SubmitterNotOperator,
+                ));
+                break 'boundaries;
+            }
+            controls.push(control);
+        }
+    }
+    let refusal = if let Some((block_number, reason)) = control_failure {
+        Some(NativeTradeSourceFailure {
+            block_number: Some(block_number),
+            transaction_hash: None,
+            reason,
+        })
+    } else if !controls_stable(&controls) {
+        Some(NativeTradeSourceFailure {
+            block_number: None,
+            transaction_hash: None,
+            reason: FifthNativeBinaryTradeUnavailableReason::ExchangeControlTransition,
+        })
+    } else {
+        let mut refusal = None;
+        'candidates: for (block_index, transaction_index, submitter, makers) in &candidates {
+            let block_number = evidence.blocks()[*block_index].block_number();
+            let transaction_hash = evidence.blocks()[*block_index].transactions()
+                [*transaction_index]
+                .transaction_hash()
+                .to_owned();
+            for maker in makers {
+                let Some(control) = controls.iter().find(|control| {
+                    control.code_context().block_number() == block_number
+                        && control.submitter() == *submitter
+                        && control.maker() == *maker
+                }) else {
+                    refusal = Some(NativeTradeSourceFailure {
+                        block_number: Some(block_number),
+                        transaction_hash: Some(transaction_hash.clone()),
+                        reason: FifthNativeBinaryTradeUnavailableReason::ExchangeControlUnavailable,
+                    });
+                    break 'candidates;
+                };
+                let activation = control.maker_pause_activation_block();
+                if !activation.is_zero() && U256::from(block_number) >= activation {
+                    refusal = Some(NativeTradeSourceFailure {
+                        block_number: Some(block_number),
+                        transaction_hash: Some(transaction_hash.clone()),
+                        reason: FifthNativeBinaryTradeUnavailableReason::MakerPaused,
+                    });
+                    break 'candidates;
+                }
+            }
+        }
+        refusal
+    };
+    ensure_deadline(deadline)?;
+    Ok(NativeTradeSourceAssessment {
+        facts: if refusal.is_some() { Vec::new() } else { facts },
+        controls,
+        refusal,
+    })
+}
+
 struct ScannedNativeTransactions {
     facts: Vec<FifthTradeTransactionFact>,
     actors: Vec<(Address, Address)>,
@@ -486,6 +540,7 @@ fn scan_native_transactions(
     owner: Address,
     ids: [B256; 2],
     module: Address,
+    allow_module_operations: bool,
     deadline: Instant,
 ) -> Result<ScannedNativeTransactions, NativeTransactionScanError> {
     let mut facts = Vec::new();
@@ -512,6 +567,16 @@ fn scan_native_transactions(
                 return Err(failure(
                     FifthNativeBinaryTradeUnavailableReason::ExchangeControlTransition,
                 ));
+            }
+            let is_module_operation_target = allow_module_operations
+                && transaction.to.as_deref().is_some_and(|to| {
+                    to.eq_ignore_ascii_case(&format!("{module:#x}"))
+                        || to
+                            .eq_ignore_ascii_case(super::fifth_code_context::POSITION_MANAGER_PROXY)
+                        || to.eq_ignore_ascii_case(PUSD_PROXY)
+                });
+            if is_module_operation_target {
+                continue;
             }
             let exchange_call = transaction
                 .to
@@ -658,7 +723,7 @@ fn replay_owner_balances(
     Ok(None)
 }
 
-fn module_identity_continues(
+pub(super) fn module_identity_continues(
     opening: &FifthNativeBinaryModuleOperationBoundary,
     points: &[FifthNativeBinaryModuleOperationBoundary],
 ) -> bool {
