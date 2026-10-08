@@ -16,7 +16,8 @@ use axum::{
 };
 use polymarket_data::clob::execution_context::{
     ClobExecutionContextReader, ExecutionContextError, ExecutionContextRequest,
-    ExecutionContextStage, ObservedMarketVersion, ObservedMinimumOrderSizeUnit,
+    ExecutionContextStage, ExecutionContextValidityError, ObservedMarketVersion,
+    ObservedMinimumOrderSizeUnit,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc, watch};
@@ -179,6 +180,68 @@ async fn reads_v1_context_and_preserves_raw_numeric_fee_lexemes() {
     assert_eq!(observed.request_count(), 3);
     assert_eq!(sends.load(Ordering::Relaxed), 3);
     assert!(observed.completed_at() >= observed.started_at());
+    task.abort();
+}
+
+#[tokio::test]
+async fn local_validity_rejects_invalid_ages_and_counts_acquisition_latency() {
+    let (base, task, _) = serve(gamma("v1", true), clob_market(), book(YES_V1, "1700000000")).await;
+    let observed = reader(&base)
+        .read_context(&request(YES_V1, 3, Duration::from_secs(2)))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        observed.local_valid_until(Duration::ZERO),
+        Err(ExecutionContextValidityError::InvalidMaxAge)
+    );
+    assert_eq!(
+        observed.local_valid_until(Duration::MAX),
+        Err(ExecutionContextValidityError::InvalidMaxAge)
+    );
+    assert_eq!(
+        observed.local_valid_until(Duration::from_nanos(1)),
+        Err(ExecutionContextValidityError::Expired)
+    );
+    assert_eq!(observed.book().timestamp, "1700000000");
+    task.abort();
+}
+
+#[tokio::test]
+async fn local_validity_deadline_is_stable_across_checks_and_clones() {
+    let mut clob = clob_market();
+    clob["t"] = json!([{"t":"890","o":"No"},{"t":"789","o":"Yes"}]);
+    let (base, task, _) = serve(gamma("v2", true), clob, book("789", "1700000000123")).await;
+    let observed = reader(&base)
+        .read_context(&request("789", 3, Duration::from_secs(2)))
+        .await
+        .unwrap();
+    assert_eq!(observed.book().timestamp, "1700000000123");
+    let clone = observed.clone();
+    let max_age = Duration::from_secs(30);
+    let deadline = observed.local_valid_until(max_age).unwrap();
+    assert_eq!(observed.local_valid_until(max_age), Ok(deadline));
+    assert_eq!(clone.local_valid_until(max_age), Ok(deadline));
+
+    tokio::time::pause();
+    let remaining = deadline.duration_since(tokio::time::Instant::now());
+    assert!(remaining > Duration::from_nanos(1));
+    tokio::time::advance(remaining - Duration::from_nanos(1)).await;
+    assert_eq!(observed.local_valid_until(max_age), Ok(deadline));
+    tokio::time::advance(Duration::from_nanos(1)).await;
+    assert_eq!(
+        observed.local_valid_until(max_age),
+        Err(ExecutionContextValidityError::Expired)
+    );
+    assert_eq!(
+        clone.local_valid_until(max_age),
+        Err(ExecutionContextValidityError::Expired)
+    );
+    tokio::time::advance(Duration::from_nanos(1)).await;
+    assert_eq!(
+        observed.local_valid_until(max_age),
+        Err(ExecutionContextValidityError::Expired)
+    );
     task.abort();
 }
 

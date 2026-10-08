@@ -55,6 +55,14 @@ pub enum ExecutionContextError {
     MarketUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ExecutionContextValidityError {
+    #[error("execution context max age is invalid")]
+    InvalidMaxAge,
+    #[error("execution context has expired under the caller max age")]
+    Expired,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservedMarketVersion {
     V1,
@@ -122,6 +130,7 @@ pub struct ExecutionContextObservation {
     book_raw_body: String,
     book: BookObservation,
     started_at: DateTime<Utc>,
+    started_monotonic: tokio::time::Instant,
     completed_at: DateTime<Utc>,
     elapsed: Duration,
     request_count: usize,
@@ -222,6 +231,24 @@ impl ExecutionContextObservation {
     #[must_use]
     pub fn book(&self) -> &BookObservation {
         &self.book
+    }
+    /// Returns the original local-acquisition deadline for this caller age.
+    /// No vendor timestamp or later call changes the stored monotonic origin.
+    pub fn local_valid_until(
+        &self,
+        max_age: Duration,
+    ) -> Result<tokio::time::Instant, ExecutionContextValidityError> {
+        if max_age.is_zero() {
+            return Err(ExecutionContextValidityError::InvalidMaxAge);
+        }
+        let deadline = self
+            .started_monotonic
+            .checked_add(max_age)
+            .ok_or(ExecutionContextValidityError::InvalidMaxAge)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ExecutionContextValidityError::Expired);
+        }
+        Ok(deadline)
     }
     #[must_use]
     pub fn started_at(&self) -> DateTime<Utc> {
@@ -394,6 +421,7 @@ impl ClobExecutionContextReader {
             book_raw_body: raw_book_body,
             book,
             started_at,
+            started_monotonic,
             completed_at,
             elapsed: tokio::time::Instant::now() - started_monotonic,
             request_count,

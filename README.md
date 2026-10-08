@@ -157,6 +157,9 @@ and retries disabled, and one request budget/deadline covers all bodies. This is
 quote input provenance; it provides no canonical native-ID binding, fee/currency
 calculation, exchange-guaranteed freshness/expiry or order interface. Raw book
 timestamps have no inferred seconds/milliseconds unit. Core supports Rust1.85.
+Callers may supply a positive maximum age to `local_valid_until`; the returned
+monotonic deadline is anchored to the original acquisition start and expires at
+the exact boundary. It does not infer upstream freshness or a venue TTL.
 
 `chain_log_audit::bind_fifth_native_execution_assets` joins a sealed rooted
 native Binary observation with a sealed HTTP V2 execution context only when the
