@@ -36,6 +36,7 @@ mod fifth_code_context;
 mod fifth_direct_legacy_migration;
 mod fifth_direct_module_operations;
 mod fifth_exchange_controls;
+mod fifth_execution_context;
 mod fifth_legacy_binary_balances;
 mod fifth_legacy_binary_inventory;
 mod fifth_legacy_binary_result;
@@ -81,6 +82,10 @@ pub use fifth_direct_module_operations::{
 pub use fifth_exchange_controls::{
     BoundedFifthExchangeControlsError, FIFTH_EXCHANGE_CONTROLS_POLICY_VERSION,
     FifthExchangeControlsObservation,
+};
+pub use fifth_execution_context::{
+    FIFTH_NATIVE_EXECUTION_ASSET_BINDING_POLICY_VERSION, FifthNativeExecutionAssetBinding,
+    FifthNativeExecutionAssetBindingError, bind_fifth_native_execution_assets,
 };
 pub use fifth_legacy_binary_balances::{
     BoundedFifthLegacyBinaryBalancesError, FIFTH_LEGACY_BINARY_BALANCES_POLICY_VERSION,
@@ -9971,6 +9976,10 @@ mod receipt_tests {
 
     mod native_accounting_fixture_tests {
         include!("chain_log_audit/native_accounting_fixture_tests.rs");
+
+        mod fifth_execution_context_tests {
+            include!("chain_log_audit/fifth_execution_context_tests.rs");
+        }
     }
 
     fn movement_topic(signature: &str) -> String {

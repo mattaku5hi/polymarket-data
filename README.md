@@ -158,6 +158,12 @@ quote input provenance; it provides no canonical native-ID binding, fee/currency
 calculation, exchange-guaranteed freshness/expiry or order interface. Raw book
 timestamps have no inferred seconds/milliseconds unit. Core supports Rust1.85.
 
+`chain_log_audit::bind_fifth_native_execution_assets` joins a sealed rooted
+native Binary observation with a sealed HTTP V2 execution context only when the
+ordered full-width provider asset IDs exactly equal the native pair. It keeps
+the API condition selector separate from native condition identity and makes no
+claim about outcome semantics, fees, currency, freshness, or execution safety.
+
 Context minimum sizes retain endpoint-specific units: Gamma `orderMinSize` is
 labelled USDC notional by its documentation, book `min_order_size` is shares,
 and compact CLOB `mos` has an unspecified unit. Typed unit getters describe those
