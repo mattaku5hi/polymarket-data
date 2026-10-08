@@ -61,6 +61,14 @@ pub enum ObservedMarketVersion {
     V2,
 }
 
+/// Endpoint-documented minimum-size units; no collateral-token or FX binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedMinimumOrderSizeUnit {
+    DocumentedUsdcNotional,
+    Shares,
+    Unspecified,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionContextRequest {
     pub api_condition_id: String,
@@ -143,6 +151,21 @@ impl ExecutionContextObservation {
     #[must_use]
     pub fn min_order_size(&self) -> &str {
         &self.min_order_size
+    }
+    /// Compact CLOB `mos` has no documented unit.
+    #[must_use]
+    pub const fn min_order_size_unit(&self) -> ObservedMinimumOrderSizeUnit {
+        ObservedMinimumOrderSizeUnit::Unspecified
+    }
+    /// Gamma documentation labels `orderMinSize` as USDC notional.
+    #[must_use]
+    pub const fn gamma_min_order_size_unit(&self) -> ObservedMinimumOrderSizeUnit {
+        ObservedMinimumOrderSizeUnit::DocumentedUsdcNotional
+    }
+    /// Book documentation labels `min_order_size` as a share quantity.
+    #[must_use]
+    pub const fn book_min_order_size_unit(&self) -> ObservedMinimumOrderSizeUnit {
+        ObservedMinimumOrderSizeUnit::Shares
     }
     #[must_use]
     pub fn min_tick_size(&self) -> &str {
@@ -299,7 +322,6 @@ impl ClobExecutionContextReader {
             clob_text,
             request,
             &outcomes,
-            gamma_min_order_size.as_deref(),
             gamma_min_tick_size.as_deref(),
         )?;
 
@@ -337,10 +359,7 @@ impl ClobExecutionContextReader {
         )?;
         let book_min_tick_size =
             optional_decimal_text(book.vendor_book(), "tick_size", ExecutionContextStage::Book)?;
-        if book_min_order_size.as_deref().is_some_and(|value| {
-            Decimal::from_str_exact(value).ok()
-                != Decimal::from_str_exact(&clob.min_order_size).ok()
-        }) || book_min_tick_size.as_deref().is_some_and(|value| {
+        if book_min_tick_size.as_deref().is_some_and(|value| {
             Decimal::from_str_exact(value).ok() != Decimal::from_str_exact(&clob.min_tick_size).ok()
         }) {
             return Err(ExecutionContextError::IdentityMismatch(
@@ -746,7 +765,6 @@ fn parse_clob_market(
     raw: &str,
     request: &ExecutionContextRequest,
     outcomes: &[ExecutionContextOutcome; 2],
-    gamma_min_order_size: Option<&str>,
     gamma_min_tick_size: Option<&str>,
 ) -> Result<ParsedClobMarket, ExecutionContextError> {
     let market: Value = serde_json::from_str(raw)
@@ -790,13 +808,6 @@ fn parse_clob_market(
     }
     let min_order_size = decimal_field(&market, "mos", false)?;
     let min_tick_size = decimal_field(&market, "mts", true)?;
-    if let Some(gamma) = gamma_min_order_size {
-        if Decimal::from_str_exact(gamma).ok() != Decimal::from_str_exact(&min_order_size).ok() {
-            return Err(ExecutionContextError::IdentityMismatch(
-                ExecutionContextStage::ClobMarket,
-            ));
-        }
-    }
     if let Some(gamma) = gamma_min_tick_size {
         if Decimal::from_str_exact(gamma).ok() != Decimal::from_str_exact(&min_tick_size).ok() {
             return Err(ExecutionContextError::IdentityMismatch(

@@ -16,7 +16,7 @@ use axum::{
 };
 use polymarket_data::clob::execution_context::{
     ClobExecutionContextReader, ExecutionContextError, ExecutionContextRequest,
-    ExecutionContextStage, ObservedMarketVersion,
+    ExecutionContextStage, ObservedMarketVersion, ObservedMinimumOrderSizeUnit,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc, watch};
@@ -313,6 +313,35 @@ async fn absent_curve_fields_remain_unknown() {
     assert_eq!(observed.fee_curve_rate_lexeme(), Some("0.02"));
     assert_eq!(observed.fee_curve_exponent_lexeme(), None);
     assert_eq!(observed.fee_curve_taker_only(), None);
+    task.abort();
+}
+
+#[tokio::test]
+async fn minimum_sizes_with_distinct_source_units_are_not_compared_as_one_constraint() {
+    let mut market = clob_market();
+    market["mos"] = json!("7");
+    let mut selected_book = book(YES_V1, "1700000000");
+    selected_book["min_order_size"] = json!("3");
+    let (base, task, _) = serve(gamma("v1", true), market, selected_book).await;
+    let observed = reader(&base)
+        .read_context(&request(YES_V1, 3, Duration::from_secs(2)))
+        .await
+        .unwrap();
+    assert_eq!(observed.gamma_min_order_size(), Some("5"));
+    assert_eq!(observed.min_order_size(), "7");
+    assert_eq!(observed.book_min_order_size(), Some("3"));
+    assert_eq!(
+        observed.gamma_min_order_size_unit(),
+        ObservedMinimumOrderSizeUnit::DocumentedUsdcNotional
+    );
+    assert_eq!(
+        observed.min_order_size_unit(),
+        ObservedMinimumOrderSizeUnit::Unspecified
+    );
+    assert_eq!(
+        observed.book_min_order_size_unit(),
+        ObservedMinimumOrderSizeUnit::Shares
+    );
     task.abort();
 }
 

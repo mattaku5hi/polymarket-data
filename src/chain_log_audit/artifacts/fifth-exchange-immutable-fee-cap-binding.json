@@ -1,0 +1,129 @@
+{
+  "schema": "polymarket-data-fifth-exchange-immutable-fee-cap-binding/1",
+  "binding_policy_version": "fifth-exchange-max-fee-rate-source-immutable-binding/1",
+  "scope": "Source/build binding applied only after the sealed rooted code-context proof matches the exact full runtime hash.",
+  "immutable": {
+    "name": "MAX_FEE_RATE",
+    "type": "uint256",
+    "unit": "basis_points",
+    "value_bps": 1000,
+    "canonical_constructor_word": "0x00000000000000000000000000000000000000000000000000000000000003e8",
+    "runtime_site_count": 5,
+    "runtime_site_length_bytes": 32
+  },
+  "unknown_runtime_hash_policy": "reject",
+  "source_packet_hashes": {
+    "acceptance_sha256": "7f76b1b47139fd70f7f9656a9e1e31aa75d11e8db59e66795044d4836f155af0",
+    "compiler_artifact_manifest_sha256": "8682fa2b2f2f979f3471b07b4e996b7f7cf8cb3740bf8d429219c7b140dd3037",
+    "immutable_map_sha256": "9b84994bce02b9f317b6ca003cff658edfd14a80a8175589fb013c144ac23937",
+    "immutable_bind_sha256": "e52d61589bdbbff6d42dd594cc5998c4f598f260d6ba442ea6ea693586d59298",
+    "independent_bind_oracle_sha256": "87c942c93d39beb24863e60c2adbc93df1fcb661d01ec547782b0596539123ff"
+  },
+  "compiler": {
+    "version": "0.8.34+commit.80d5c536",
+    "binary_sha256": "d40adc6f9fdbb22a97d32a02fa05688bf2ee7886affc48c9851b0afd4a726b39",
+    "optimizer_enabled": true,
+    "optimizer_runs": 1000000,
+    "evm_version": "cancun",
+    "via_ir": false
+  },
+  "bindings": [
+    {
+      "implementation_version": "Current641b",
+      "implementation_address": "0x641b40ec414a076b9e79e703fc7bf4ebec248bb7",
+      "runtime_keccak256": "0x42b8522e8b56d0587bc02e66a37e43614911580ded1c676a925f5373c7f2fcd6",
+      "runtime_sha256": "2dfc1d2e867a7fa851cb195cc7887b614442f4f2de04d3081155a99bd502c6d6",
+      "runtime_bytes": 22256,
+      "source_provenance": "pinned commit 741f8bbe88c3f29a1c55d1248a3dd411f622f111 and captured explorer source agree",
+      "source": {
+        "path": "src/exchange/Exchange.sol",
+        "sha256": "698f29ff5c659e7f54cb98bfe206bddd19d62e7dfbe9bddfe3f06e6d5cfadcd0",
+        "json_pointer": "$.sources['src/exchange/Exchange.sol'].content",
+        "pinned_commit": "741f8bbe88c3f29a1c55d1248a3dd411f622f111"
+      },
+      "compiler_packet_hashes": {
+        "input_sha256": "db922660bdf8b0b9abf6d4b3ee261426b1deb43e60b9146552eeadfa0a108c1c",
+        "diagnostic_input_sha256": "5ed0ac27b5943be319d7955b5a7438293dd49e554b102a70e4bd0a5b8de12b71",
+        "output_sha256": "4a423b0e69b7db14e97a88fb7d2d812ff70ddde4ca2d5bd7ca10605bca400a1b"
+      },
+      "compiler_metadata": {
+        "use_literal_content": false,
+        "bytecode_hash": "none",
+        "append_cbor": false
+      },
+      "immutable": {
+        "name": "MAX_FEE_RATE",
+        "type": "uint256",
+        "ast_id": 7084,
+        "declaration_source_span": "10830:37:15",
+        "assignment_source_span": "13285:26:15",
+        "rhs_ast_id": 7179,
+        "rhs_referenced_declaration": 7140,
+        "runtime_sites": [
+          {"start": 2319, "length": 32},
+          {"start": 3445, "length": 32},
+          {"start": 9408, "length": 32},
+          {"start": 10165, "length": 32},
+          {"start": 17036, "length": 32}
+        ]
+      },
+      "cap": {
+        "constructor_parameter": "_maxFeeRate",
+        "type": "uint256",
+        "value_bps": 1000,
+        "canonical_constructor_word": "0x00000000000000000000000000000000000000000000000000000000000003e8"
+      }
+    },
+    {
+      "implementation_version": "Prior7345",
+      "implementation_address": "0x7345c6842b244926125ed4054905cac49620b5dc",
+      "runtime_keccak256": "0x90209de686581e9c69d3a0454ee89e770652c51aa874a7edd0e9b4cdc3541f95",
+      "runtime_sha256": "dda5fcc0be82f96ae766bf269b5c8f87871cf458fac18423b265ac57123901fb",
+      "runtime_bytes": 22204,
+      "source_provenance": "captured prior Polygonscan source snapshot; not current pinned commit",
+      "source": {
+        "path": "src/exchange/Exchange.sol",
+        "sha256": "2a5b07912e338f9729bc319eaa494dc1bdce087a1bc4d5eec6c357b44048dc81",
+        "json_pointer": "$.sources['src/exchange/Exchange.sol'].content",
+        "pinned_commit": null
+      },
+      "compiler_packet_hashes": {
+        "input_sha256": "97be68371ed1eca4955925f337e2d89fdf49fe4c799b664db6dcf808b874763d",
+        "diagnostic_input_sha256": "d22999eada395aeab67433cf8c787d28ce06f4b843b28107338f182934737b28",
+        "output_sha256": "ead3c268442929531bf5dbbf4be9676e49bf722c78865c75667674dc0d9cdea0"
+      },
+      "compiler_metadata": {
+        "use_literal_content": false,
+        "bytecode_hash": "ipfs",
+        "append_cbor": true
+      },
+      "immutable": {
+        "name": "MAX_FEE_RATE",
+        "type": "uint256",
+        "ast_id": 6877,
+        "declaration_source_span": "10423:37:15",
+        "assignment_source_span": "12878:26:15",
+        "rhs_ast_id": 6972,
+        "rhs_referenced_declaration": 6933,
+        "runtime_sites": [
+          {"start": 2319, "length": 32},
+          {"start": 3445, "length": 32},
+          {"start": 9336, "length": 32},
+          {"start": 10103, "length": 32},
+          {"start": 16977, "length": 32}
+        ]
+      },
+      "cap": {
+        "constructor_parameter": "_maxFeeRate",
+        "type": "uint256",
+        "value_bps": 1000,
+        "canonical_constructor_word": "0x00000000000000000000000000000000000000000000000000000000000003e8"
+      }
+    }
+  ],
+  "limitations": [
+    "This source/build binding does not prove chain inclusion, implementation deployment identity, or proxy activation history.",
+    "The prior implementation is tied to a captured explorer source snapshot, not the current pinned source commit.",
+    "The immutable value is an operator-supplied per-order fee cap, not a market commission, expected fee, builder fee, all-in execution cost, or wallet-net ceiling."
+  ]
+}

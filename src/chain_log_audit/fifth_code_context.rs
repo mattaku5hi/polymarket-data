@@ -32,6 +32,8 @@ pub(super) const POSITION_MANAGER_CODE_HASH: &str =
 
 pub const FIFTH_CODE_CONTEXT_POLICY_VERSION: &str =
     "fifth-exchange-proxy-implementation-source-codehash-root-proof/1";
+const FIFTH_EXCHANGE_FEE_CAP_BINDING_POLICY_VERSION: &str =
+    "fifth-exchange-max-fee-rate-source-immutable-binding/1";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BoundedFifthCodeContextError {
@@ -146,6 +148,33 @@ impl FifthCodeContextObservation {
         match self.exchange_implementation_version {
             FifthExchangeImplementationVersion::Prior7345 => PRIOR_EXCHANGE_CODE_HASH,
             FifthExchangeImplementationVersion::Current641b => CURRENT_EXCHANGE_CODE_HASH,
+        }
+    }
+
+    /// Source-bound immutable operator-supplied per-order fee limit, in bps.
+    /// This is not a market fee quote or an expected fee.
+    #[must_use]
+    pub const fn exchange_max_fee_rate_bps(&self) -> u16 {
+        match self.exchange_implementation_version {
+            FifthExchangeImplementationVersion::Prior7345
+            | FifthExchangeImplementationVersion::Current641b => 1_000,
+        }
+    }
+
+    #[must_use]
+    pub const fn exchange_fee_cap_binding_policy_version(&self) -> &'static str {
+        FIFTH_EXCHANGE_FEE_CAP_BINDING_POLICY_VERSION
+    }
+
+    #[must_use]
+    pub const fn exchange_fee_cap_source_provenance(&self) -> &'static str {
+        match self.exchange_implementation_version {
+            FifthExchangeImplementationVersion::Current641b => {
+                "pinned commit 741f8bbe88c3f29a1c55d1248a3dd411f622f111 and captured explorer source agree"
+            }
+            FifthExchangeImplementationVersion::Prior7345 => {
+                "captured prior Polygonscan source snapshot; not current pinned commit"
+            }
         }
     }
 
@@ -982,6 +1011,22 @@ pub(super) mod tests {
             assert_eq!(observation.state_root(), expected_root);
             assert_eq!(observation.chain_id(), CHAIN_ID);
             assert_eq!(observation.exchange_implementation_version(), version);
+            assert_eq!(observation.exchange_max_fee_rate_bps(), 1_000);
+            assert_eq!(
+                observation.exchange_fee_cap_binding_policy_version(),
+                FIFTH_EXCHANGE_FEE_CAP_BINDING_POLICY_VERSION
+            );
+            assert_eq!(
+                observation.exchange_fee_cap_source_provenance(),
+                match version {
+                    FifthExchangeImplementationVersion::Current641b => {
+                        "pinned commit 741f8bbe88c3f29a1c55d1248a3dd411f622f111 and captured explorer source agree"
+                    }
+                    FifthExchangeImplementationVersion::Prior7345 => {
+                        "captured prior Polygonscan source snapshot; not current pinned commit"
+                    }
+                }
+            );
             let (expected_implementation, expected_code_hash) = exchange_source_binding(version);
             assert_eq!(observation.exchange_proxy(), EXCHANGE_PROXY);
             assert_eq!(
@@ -1055,6 +1100,144 @@ pub(super) mod tests {
             capture_fixture(case, &observation, rpc_rows(&responses));
             primary_server.abort();
             secondary_server.abort();
+        }
+    }
+
+    #[test]
+    fn immutable_fee_cap_artifact_matches_the_two_root_bound_implementations() {
+        let artifact: Value = serde_json::from_str(include_str!(
+            "artifacts/fifth-exchange-immutable-fee-cap-binding.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            artifact["schema"],
+            "polymarket-data-fifth-exchange-immutable-fee-cap-binding/1"
+        );
+        assert_eq!(
+            artifact["binding_policy_version"],
+            FIFTH_EXCHANGE_FEE_CAP_BINDING_POLICY_VERSION
+        );
+        assert_eq!(artifact["compiler"]["version"], "0.8.34+commit.80d5c536");
+        assert_eq!(
+            artifact["compiler"]["binary_sha256"],
+            "d40adc6f9fdbb22a97d32a02fa05688bf2ee7886affc48c9851b0afd4a726b39"
+        );
+        assert_eq!(
+            artifact["source_packet_hashes"]["acceptance_sha256"],
+            "7f76b1b47139fd70f7f9656a9e1e31aa75d11e8db59e66795044d4836f155af0"
+        );
+        assert_eq!(
+            artifact["source_packet_hashes"]["compiler_artifact_manifest_sha256"],
+            "8682fa2b2f2f979f3471b07b4e996b7f7cf8cb3740bf8d429219c7b140dd3037"
+        );
+        assert_eq!(
+            artifact["source_packet_hashes"]["immutable_map_sha256"],
+            "9b84994bce02b9f317b6ca003cff658edfd14a80a8175589fb013c144ac23937"
+        );
+        assert_eq!(
+            artifact["source_packet_hashes"]["immutable_bind_sha256"],
+            "e52d61589bdbbff6d42dd594cc5998c4f598f260d6ba442ea6ea693586d59298"
+        );
+        assert_eq!(
+            artifact["source_packet_hashes"]["independent_bind_oracle_sha256"],
+            "87c942c93d39beb24863e60c2adbc93df1fcb661d01ec547782b0596539123ff"
+        );
+        assert_eq!(artifact["unknown_runtime_hash_policy"], "reject");
+        assert_eq!(artifact["bindings"].as_array().unwrap().len(), 2);
+        assert!(
+            !include_str!("artifacts/fifth-exchange-immutable-fee-cap-binding.json")
+                .contains("/home/")
+        );
+
+        for (
+            version,
+            address,
+            runtime_hash,
+            runtime_sha,
+            runtime_bytes,
+            ast_id,
+            sites,
+            source_sha,
+            compiler_input_sha,
+            compiler_output_sha,
+            provenance,
+        ) in [
+            (
+                "Current641b",
+                CURRENT_EXCHANGE_IMPLEMENTATION,
+                CURRENT_EXCHANGE_CODE_HASH,
+                "2dfc1d2e867a7fa851cb195cc7887b614442f4f2de04d3081155a99bd502c6d6",
+                22_256,
+                7084,
+                [2319, 3445, 9408, 10165, 17036],
+                "698f29ff5c659e7f54cb98bfe206bddd19d62e7dfbe9bddfe3f06e6d5cfadcd0",
+                "db922660bdf8b0b9abf6d4b3ee261426b1deb43e60b9146552eeadfa0a108c1c",
+                "4a423b0e69b7db14e97a88fb7d2d812ff70ddde4ca2d5bd7ca10605bca400a1b",
+                "pinned commit 741f8bbe88c3f29a1c55d1248a3dd411f622f111 and captured explorer source agree",
+            ),
+            (
+                "Prior7345",
+                PRIOR_EXCHANGE_IMPLEMENTATION,
+                PRIOR_EXCHANGE_CODE_HASH,
+                "dda5fcc0be82f96ae766bf269b5c8f87871cf458fac18423b265ac57123901fb",
+                22_204,
+                6877,
+                [2319, 3445, 9336, 10103, 16977],
+                "2a5b07912e338f9729bc319eaa494dc1bdce087a1bc4d5eec6c357b44048dc81",
+                "97be68371ed1eca4955925f337e2d89fdf49fe4c799b664db6dcf808b874763d",
+                "ead3c268442929531bf5dbbf4be9676e49bf722c78865c75667674dc0d9cdea0",
+                "captured prior Polygonscan source snapshot; not current pinned commit",
+            ),
+        ] {
+            let binding = artifact["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|binding| binding["implementation_version"] == version)
+                .unwrap();
+            assert_eq!(binding["implementation_address"], address);
+            assert_eq!(binding["runtime_keccak256"], runtime_hash);
+            assert_eq!(binding["runtime_sha256"], runtime_sha);
+            assert_eq!(binding["runtime_bytes"], runtime_bytes);
+            assert_eq!(binding["source_provenance"], provenance);
+            assert_eq!(binding["source"]["sha256"], source_sha);
+            assert_eq!(
+                binding["compiler_packet_hashes"]["input_sha256"],
+                compiler_input_sha
+            );
+            assert_eq!(
+                binding["compiler_packet_hashes"]["output_sha256"],
+                compiler_output_sha
+            );
+            assert_eq!(binding["immutable"]["name"], "MAX_FEE_RATE");
+            assert_eq!(binding["immutable"]["ast_id"], ast_id);
+            assert_eq!(binding["immutable"]["type"], "uint256");
+            assert_eq!(binding["cap"]["value_bps"], 1_000);
+            assert_eq!(
+                binding["cap"]["canonical_constructor_word"],
+                "0x00000000000000000000000000000000000000000000000000000000000003e8"
+            );
+            let actual_sites = binding["immutable"]["runtime_sites"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|site| site["start"].as_u64().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual_sites, sites);
+            assert!(
+                binding["immutable"]["runtime_sites"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|site| site["length"] == 32)
+            );
+            assert_eq!(
+                binding["immutable"]["runtime_sites"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                5
+            );
         }
     }
 

@@ -79,6 +79,16 @@ a shared budget and deadline. Its sealed context can be reused internally;
 rooted current/prior fixtures cover exact limits, cancellation and malformed
 proofs. Current point state does not establish control state at a trade call.
 
+The sealed fifth Exchange code-context observation also binds the source/build
+`MAX_FEE_RATE` immutable for the exact Current641b and Prior7345 runtime hashes.
+Both verified source packets bind the constructor value to 1,000 basis points;
+the prior implementation is from a captured explorer source snapshot, while
+Current641b matches its pinned source commit. This is the contract's operator-
+supplied per-order fee cap, not a market commission, expected fee, builder fee,
+all-in execution cost, or wallet-net ceiling. Unknown runtime hashes are not
+mapped to a cap. This source binding proves neither chain inclusion nor proxy
+activation history; see `src/chain_log_audit/artifacts/fifth-exchange-immutable-fee-cap-binding.json`.
+
 `ChainLogVerifier::verify_fifth_native_binary_trade_interval_bounded` attributes
 direct native Binary `matchOrders` receipts to the selected owner and reconciles
 both position balances and pUSD at every block boundary. One request budget and
@@ -147,3 +157,9 @@ and retries disabled, and one request budget/deadline covers all bodies. This is
 quote input provenance; it provides no canonical native-ID binding, fee/currency
 calculation, exchange-guaranteed freshness/expiry or order interface. Raw book
 timestamps have no inferred seconds/milliseconds unit. Core supports Rust1.85.
+
+Context minimum sizes retain endpoint-specific units: Gamma `orderMinSize` is
+labelled USDC notional by its documentation, book `min_order_size` is shares,
+and compact CLOB `mos` has an unspecified unit. Typed unit getters describe those
+source claims; these separate numbers are never compared as one constraint or
+converted to collateral. Tick-size disagreement still refuses context.
