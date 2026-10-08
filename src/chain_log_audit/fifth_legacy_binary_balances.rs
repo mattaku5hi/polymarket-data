@@ -185,6 +185,32 @@ pub(super) fn test_rooted_native_module_operation_point_packet(
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn test_rooted_native_module_operation_point_packet_with_exchange_storage(
+    owner: &str,
+    condition_id: B256,
+    owner_positions: [U256; 2],
+    owner_cash: U256,
+    module_positions: [U256; 2],
+    module_cash: U256,
+    module_roles: U256,
+    result_values: [U256; 3],
+    exchange_storage_words: &[(B256, U256)],
+) -> (String, std::collections::BTreeMap<String, Value>) {
+    tests::rooted_native_module_operation_point_packet_with_exchange_storage(
+        owner,
+        condition_id,
+        owner_positions,
+        owner_cash,
+        module_positions,
+        module_cash,
+        module_roles,
+        result_values,
+        exchange_storage_words,
+    )
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BoundedFifthLegacyBinaryBalancesError {
     #[error("fifth legacy binary balances RPC request budget exhausted")]
@@ -1145,7 +1171,36 @@ mod tests {
         module_state: Option<([U256; 2], U256, U256)>,
         condition_override: Option<B256>,
     ) -> Arc<Fixture> {
-        rooted_fixture_with_migration_state(
+        rooted_fixture_with_owner_module_state_and_exchange_storage(
+            resolved,
+            fault,
+            position_balances,
+            pusd_balance,
+            module_impl_address,
+            ctf_values_override,
+            module_result,
+            owner_text,
+            module_state,
+            condition_override,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rooted_fixture_with_owner_module_state_and_exchange_storage(
+        resolved: bool,
+        fault: FixtureFault,
+        position_balances: [U256; 2],
+        pusd_balance: U256,
+        module_impl_address: &str,
+        ctf_values_override: Option<[U256; 4]>,
+        module_result: Option<[U256; 3]>,
+        owner_text: &str,
+        module_state: Option<([U256; 2], U256, U256)>,
+        condition_override: Option<B256>,
+        exchange_storage_words: &[(B256, U256)],
+    ) -> Arc<Fixture> {
+        rooted_fixture_with_migration_state_and_exchange_storage(
             resolved,
             fault,
             position_balances,
@@ -1157,6 +1212,7 @@ mod tests {
             module_state,
             None,
             condition_override,
+            exchange_storage_words,
         )
     }
 
@@ -1173,6 +1229,37 @@ mod tests {
         module_state: Option<([U256; 2], U256, U256)>,
         migration_state: Option<MigrationFixtureState>,
         condition_override: Option<B256>,
+    ) -> Arc<Fixture> {
+        rooted_fixture_with_migration_state_and_exchange_storage(
+            resolved,
+            fault,
+            position_balances,
+            pusd_balance,
+            module_impl_address,
+            ctf_values_override,
+            module_result,
+            owner_text,
+            module_state,
+            migration_state,
+            condition_override,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rooted_fixture_with_migration_state_and_exchange_storage(
+        resolved: bool,
+        fault: FixtureFault,
+        position_balances: [U256; 2],
+        pusd_balance: U256,
+        module_impl_address: &str,
+        ctf_values_override: Option<[U256; 4]>,
+        module_result: Option<[U256; 3]>,
+        owner_text: &str,
+        module_state: Option<([U256; 2], U256, U256)>,
+        migration_state: Option<MigrationFixtureState>,
+        condition_override: Option<B256>,
+        exchange_storage_words: &[(B256, U256)],
     ) -> Arc<Fixture> {
         let owner = parse_address(owner_text).unwrap();
         let legacy = parse_fixed_b256(LEGACY).unwrap();
@@ -1266,11 +1353,24 @@ mod tests {
                 (roles_storage_key(module), module_roles),
             ]);
         }
+        let mut exchange_storage =
+            vec![(slot, address_word(CURRENT_EXCHANGE_IMPLEMENTATION).unwrap())];
+        for (key, value) in exchange_storage_words {
+            assert_ne!(
+                *key, slot,
+                "additional Exchange key must not replace the implementation slot"
+            );
+            assert!(
+                exchange_storage.iter().all(|(existing, _)| existing != key),
+                "additional Exchange storage keys must be unique"
+            );
+            exchange_storage.push((*key, *value));
+        }
         let mut accounts = vec![
             account_with_storage(
                 EXCHANGE_PROXY,
                 parse_fixed_b256(ERC1967_PROXY_CODE_HASH).unwrap(),
-                vec![(slot, address_word(CURRENT_EXCHANGE_IMPLEMENTATION).unwrap())],
+                exchange_storage,
             ),
             account_without_storage(
                 CURRENT_EXCHANGE_IMPLEMENTATION,
@@ -1484,7 +1584,32 @@ mod tests {
         module_roles: U256,
         result_values: [U256; 3],
     ) -> (String, BTreeMap<String, Value>) {
-        let fixture = rooted_fixture_with_owner_module_state(
+        rooted_native_module_operation_point_packet_with_exchange_storage(
+            owner,
+            condition_id,
+            owner_positions,
+            owner_cash,
+            module_positions,
+            module_cash,
+            module_roles,
+            result_values,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rooted_native_module_operation_point_packet_with_exchange_storage(
+        owner: &str,
+        condition_id: B256,
+        owner_positions: [U256; 2],
+        owner_cash: U256,
+        module_positions: [U256; 2],
+        module_cash: U256,
+        module_roles: U256,
+        result_values: [U256; 3],
+        exchange_storage_words: &[(B256, U256)],
+    ) -> (String, BTreeMap<String, Value>) {
+        let fixture = rooted_fixture_with_owner_module_state_and_exchange_storage(
             false,
             FixtureFault::NativeBinary,
             owner_positions,
@@ -1495,6 +1620,7 @@ mod tests {
             owner,
             Some((module_positions, module_cash, module_roles)),
             Some(condition_id),
+            exchange_storage_words,
         );
         (
             fixture.block_header["stateRoot"]

@@ -41,6 +41,7 @@ mod fifth_legacy_binary_inventory;
 mod fifth_legacy_binary_result;
 mod fifth_match_orders_call;
 mod fifth_native_binary;
+mod fifth_native_binary_trades;
 mod fifth_native_module_operations;
 mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
@@ -96,6 +97,11 @@ pub use fifth_legacy_binary_result::{
 pub use fifth_native_binary::{
     BoundedFifthNativeBinaryError, FIFTH_NATIVE_BINARY_POLICY_VERSION,
     FifthNativeBinaryObservation, FifthNativeBinaryResultStatus,
+};
+pub use fifth_native_binary_trades::{
+    BoundedFifthNativeBinaryTradeError, FIFTH_NATIVE_BINARY_TRADE_POLICY_VERSION,
+    FifthNativeBinaryTradeAsset, FifthNativeBinaryTradeObservation, FifthNativeBinaryTradeStatus,
+    FifthNativeBinaryTradeUnavailableReason,
 };
 pub use fifth_native_module_operations::{
     BoundedFifthNativeBinaryModuleOperationsError,
@@ -9807,6 +9813,10 @@ mod receipt_tests {
     use alloy_trie::{EMPTY_ROOT_HASH, HashBuilder, proof::ProofRetainer};
     use axum::{Json, Router, extract::State, routing::post};
     use k256::ecdsa::SigningKey;
+
+    mod native_trade_branches {
+        include!("chain_log_audit/native_trade_branch_tests.rs");
+    }
 
     fn movement_topic(signature: &str) -> String {
         format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())))
@@ -28833,6 +28843,347 @@ mod receipt_tests {
         fixture
     }
 
+    fn native_exchange_control_storage_words(
+        submitter: Address,
+        makers: &[Address],
+        global_pause_word: U256,
+        user_pause_block_interval: U256,
+        submitter_role_bitmap: U256,
+        maker_pause_activation_block: U256,
+    ) -> Vec<(B256, U256)> {
+        const ROLE_SEED: [u8; 4] = [0x8b, 0x78, 0xc6, 0xd8];
+
+        let mut words = vec![
+            (B256::ZERO, global_pause_word),
+            (B256::with_last_byte(1), user_pause_block_interval),
+        ];
+        let mut role_preimage = [0_u8; 32];
+        role_preimage[..20].copy_from_slice(submitter.as_slice());
+        role_preimage[28..].copy_from_slice(&ROLE_SEED);
+        words.push((
+            B256::from_slice(&Keccak256::digest(role_preimage)),
+            submitter_role_bitmap,
+        ));
+        for maker in makers {
+            let mut pause_preimage = [0_u8; 64];
+            pause_preimage[12..32].copy_from_slice(maker.as_slice());
+            pause_preimage[63] = 3;
+            let key = B256::from_slice(&Keccak256::digest(pause_preimage));
+            if words.iter().all(|(existing, _)| *existing != key) {
+                words.push((key, maker_pause_activation_block));
+            }
+        }
+        words
+    }
+
+    fn fifth_native_trade_fixture_with_ending_balances(
+        source: ChainReceiptIntervalTransaction,
+        owner: Address,
+        condition_id: B256,
+        ending_positions: [U256; 2],
+        ending_cash: U256,
+    ) -> CtfInventoryFixture {
+        fifth_native_trade_fixture_with_controls(
+            source,
+            owner,
+            condition_id,
+            ending_positions,
+            ending_cash,
+            U256::ZERO,
+            U256::from(2_u64),
+            U256::ZERO,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fifth_native_trade_fixture_with_controls(
+        source: ChainReceiptIntervalTransaction,
+        owner: Address,
+        condition_id: B256,
+        ending_positions: [U256; 2],
+        ending_cash: U256,
+        global_pause_word: U256,
+        submitter_role_bitmap: U256,
+        maker_pause_activation_block: U256,
+    ) -> CtfInventoryFixture {
+        let controls = [(
+            global_pause_word,
+            U256::from(7_u64),
+            submitter_role_bitmap,
+            maker_pause_activation_block,
+        ); 3];
+        fifth_native_trade_fixture_with_states_and_controls(
+            source,
+            owner,
+            condition_id,
+            ending_positions,
+            ending_cash,
+            ending_positions,
+            ending_cash,
+            controls,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fifth_native_trade_fixture_with_states_and_controls(
+        source: ChainReceiptIntervalTransaction,
+        owner: Address,
+        condition_id: B256,
+        middle_positions: [U256; 2],
+        middle_cash: U256,
+        ending_positions: [U256; 2],
+        ending_cash: U256,
+        control_points: [(U256, U256, U256, U256); 3],
+    ) -> CtfInventoryFixture {
+        use std::str::FromStr;
+
+        let input = source.input.as_deref().unwrap();
+        let (transaction, recovered_from) = signed_polygon_transaction_with_key(
+            super::fifth_code_context::EXCHANGE_PROXY,
+            input,
+            0x42,
+        );
+        let encoded = encode_signed_transaction_with_sender_recovery(&transaction, true).unwrap();
+        assert_eq!(encoded.eip155_chain_id, Some(U256::from(137_u64)));
+        assert_eq!(
+            encoded.hash,
+            parse_fixed_b256(source.transaction_hash()).unwrap()
+        );
+        assert_eq!(
+            encoded.recovered_sender,
+            Some(Address::from_str(&recovered_from).unwrap())
+        );
+        let decoded =
+            super::fifth_match_orders_call::decode_fifth_match_orders_calldata(input).unwrap();
+        let mut makers = vec![decoded.taker_order.maker];
+        for order in &decoded.maker_orders {
+            if !makers.contains(&order.maker) {
+                makers.push(order.maker);
+            }
+        }
+        let owner_text = format!("{owner:#x}");
+        let proof_packet = |owner_positions, owner_cash, control_point| {
+            let (
+                global_pause_word,
+                user_pause_block_interval,
+                submitter_role_bitmap,
+                maker_pause_activation_block,
+            ) = control_point;
+            let exchange_storage = native_exchange_control_storage_words(
+                encoded.recovered_sender.unwrap(),
+                &makers,
+                global_pause_word,
+                user_pause_block_interval,
+                submitter_role_bitmap,
+                maker_pause_activation_block,
+            );
+            fifth_legacy_binary_balances::test_rooted_native_module_operation_point_packet_with_exchange_storage(
+                &owner_text,
+                condition_id,
+                owner_positions,
+                owner_cash,
+                [U256::ZERO; 2],
+                U256::ZERO,
+                U256::ONE,
+                [U256::ZERO; 3],
+                &exchange_storage,
+            )
+        };
+        let (root99, proofs99) = proof_packet(
+            [U256::from(100), U256::from(200)],
+            U256::from(1_000),
+            control_points[0],
+        );
+        let (root100, proofs100) = proof_packet(middle_positions, middle_cash, control_points[1]);
+        let (root101, proofs101) = proof_packet(ending_positions, ending_cash, control_points[2]);
+
+        let mut fixture = ctf_inventory_fixture(U256::ZERO, 0);
+        fixture.state_root = root99;
+        fixture.post_state = Some((root100, Value::Null));
+        fixture.extra_post_state = Some((root101, Value::Null));
+        fixture.finalized_block = 102;
+        fixture.filter_fifth_code_proofs_by_requested_keys = true;
+        fixture.fifth_code_proofs_by_block = Some(BTreeMap::from([
+            (99, proofs99),
+            (100, proofs100),
+            (101, proofs101),
+        ]));
+        let receipt_logs = source
+            .logs()
+            .iter()
+            .map(|log| {
+                json!({
+                    "address": log.address,
+                    "topics": log.topics,
+                    "data": log.data,
+                })
+            })
+            .collect::<Vec<_>>();
+        fixture.inventory_logs = Some(receipt_logs.clone());
+        fixture.extra_inventory_logs = Some(Vec::new());
+        fixture.direct_call_transaction = Some(transaction.clone());
+        fixture.rooted_gas_block = Some(RootedGasBlockFixture {
+            transactions: vec![transaction],
+            receipt_logs: vec![receipt_logs],
+            receipt_statuses: vec![1],
+            cumulative_gas_used: vec![100_000],
+            receipt_types: vec![0],
+            gas_limit: 1_000_000,
+            base_fee_per_gas: U256::ZERO,
+            header_gas_used_override: None,
+            tamper_header_gas_used: false,
+            tamper_cumulative_index: None,
+        });
+        let (quiet_transaction, quiet_sender) = signed_polygon_transaction_with_key(
+            "0x3535353535353535353535353535353535353535",
+            &[],
+            0x43,
+        );
+        let quiet_encoded =
+            encode_signed_transaction_with_sender_recovery(&quiet_transaction, true).unwrap();
+        assert_eq!(quiet_encoded.eip155_chain_id, Some(U256::from(137_u64)));
+        assert_eq!(
+            quiet_encoded.recovered_sender,
+            Some(Address::from_str(&quiet_sender).unwrap())
+        );
+        fixture.extra_direct_call_transaction = Some(quiet_transaction);
+        fixture.extra_inventory_logs = Some(Vec::new());
+        fixture
+    }
+
+    fn capture_fifth_native_trade_case(
+        case: &str,
+        fixture: &CtfInventoryFixture,
+        report: &FifthNativeBinaryTradeObservation,
+        owner: &str,
+        condition_id: B256,
+        parent_hash: &Value,
+        end_hash: &Value,
+    ) {
+        let Ok(directory) = std::env::var("POLYMARKET_DATA_CAPTURE_NATIVE_TRADES_DIRECTORY") else {
+            return;
+        };
+        let mut unique = BTreeMap::new();
+        for row in fixture.rpc_capture.lock().unwrap().iter() {
+            let key = serde_json::to_string(&json!([row["method"], row["params"]])).unwrap();
+            if let Some(previous) = unique.insert(key, row.clone()) {
+                assert_eq!(previous["result"], row["result"]);
+            }
+        }
+        let deduplicated_request_count = unique.len();
+        let opening = report.opening().native_context().selected_balances();
+        let closing = report
+            .block_observations()
+            .last()
+            .expect("native interval has a closing block")
+            .native_context()
+            .selected_balances();
+        let boundary_json = |boundary: &FifthNativeBinaryModuleOperationBoundary| {
+            let point = boundary.native_context();
+            let selected = point.selected_balances();
+            json!({
+                "block_number":selected.block_number(),
+                "block_hash":selected.block_hash(),
+                "state_root":selected.state_root(),
+                "owner_position_balances":[format!("{:#x}",selected.position_balance_a()),format!("{:#x}",selected.position_balance_b())],
+                "owner_pusd_balance":format!("{:#x}",selected.pusd_balance()),
+                "module_position_balances":boundary.module_position_balances().map(|value| format!("{value:#x}")),
+                "module_pusd_balance":format!("{:#x}",boundary.module_pusd_balance()),
+                "module_role_bitmap":format!("{:#x}",boundary.module_role_bitmap()),
+                "native_condition_id":format!("{:#x}",point.condition_id()),
+                "native_position_ids":point.position_ids().map(|id| format!("{id:#x}")),
+                "native_legacy_mapping_value":format!("{:#x}",point.legacy_mapping_value()),
+                "native_result_status":format!("{:?}",point.result_status()),
+                "native_result_length":format!("{:#x}",point.result_length()),
+                "native_normalized_numerators":point.normalized_numerators().map(|values| values.map(|value| format!("{value:#x}"))),
+            })
+        };
+        let transactions = report
+            .transactions()
+            .iter()
+            .map(|fact| {
+                json!({
+                    "block_number":fact.block_number(),
+                    "block_hash":fact.block_hash(),
+                    "transaction_hash":fact.transaction_hash(),
+                    "transaction_index":fact.transaction_index(),
+                    "branch":format!("{:?}",fact.branch()),
+                    "owner_position_inflows":fact.owner_position_inflows().map(|value| format!("{value:#x}")),
+                    "owner_position_outflows":fact.owner_position_outflows().map(|value| format!("{value:#x}")),
+                    "owner_pusd_inflow":format!("{:#x}",fact.owner_pusd_inflow()),
+                    "owner_pusd_outflow":format!("{:#x}",fact.owner_pusd_outflow()),
+                    "owner_fee_amount":format!("{:#x}",fact.owner_fee_amount()),
+                    "owner_refund_amount":format!("{:#x}",fact.owner_refund_amount()),
+                    "order_fills":fact.order_fills().iter().map(|fill| json!({
+                        "order_hash":format!("{:#x}",fill.order_hash()),
+                        "maker":format!("{:#x}",fill.maker()),
+                        "signer":format!("{:#x}",fill.signer()),
+                        "token_id":format!("{:#x}",fill.token_id()),
+                        "maker_amount_filled":format!("{:#x}",fill.maker_amount_filled()),
+                        "taker_amount_filled":format!("{:#x}",fill.taker_amount_filled()),
+                        "fee_amount":format!("{:#x}",fill.fee_amount()),
+                        "owner_role":format!("{:?}",fill.owner_role()),
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let controls = report
+            .controls()
+            .iter()
+            .map(|control| {
+                json!({
+                    "block_number":control.code_context().block_number(),
+                    "submitter":format!("{:#x}",control.submitter()),
+                    "maker":format!("{:#x}",control.maker()),
+                    "global_pause_word":format!("{:#x}",control.global_pause_word()),
+                    "global_paused":control.global_paused(),
+                    "user_pause_block_interval":format!("{:#x}",control.user_pause_block_interval()),
+                    "submitter_role_bitmap":format!("{:#x}",control.submitter_role_bitmap()),
+                    "submitter_has_operator_role":control.submitter_has_operator_role(),
+                    "maker_pause_activation_block":format!("{:#x}",control.maker_pause_activation_block()),
+                    "maker_pause_active":control.maker_pause_active(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let envelope = json!({
+            "provenance":"Synthetic signed Polygon matchOrders receipt and root-consistent native owner/module/control proofs; no external chain observation.",
+            "case":case,
+            "owner":owner,
+            "condition_id":format!("{condition_id:#x}"),
+            "from_block":100,
+            "through_block":101,
+            "parent_hash":parent_hash,
+            "end_hash":end_hash,
+            "status":format!("{:?}",report.status()),
+            "source_policy_version":report.source_policy_version(),
+            "expected_owner_opening":{
+                "position_balances":[format!("{:#x}",opening.position_balance_a()),format!("{:#x}",opening.position_balance_b())],
+                "pusd_balance":format!("{:#x}",opening.pusd_balance()),
+            },
+            "expected_owner_closing":{
+                "position_balances":[format!("{:#x}",closing.position_balance_a()),format!("{:#x}",closing.position_balance_b())],
+                "pusd_balance":format!("{:#x}",closing.pusd_balance()),
+            },
+            "opening":boundary_json(report.opening()),
+            "block_observations":report.block_observations().iter().map(boundary_json).collect::<Vec<_>>(),
+            "transactions":transactions,
+            "controls":controls,
+            "actual_request_count":fixture.requests.load(Ordering::Relaxed),
+            "deduplicated_request_count":deduplicated_request_count,
+            "rpc_responses":unique.into_values().collect::<Vec<_>>(),
+        });
+        let path = std::path::Path::new(&directory)
+            .join(format!("fifth-native-binary-trades-{case}-rpc.json"));
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap()
+            .write_all(&serde_json::to_vec(&envelope).unwrap())
+            .unwrap();
+    }
+
     fn fifth_v2_pair(legacy: &str) -> (B256, [U256; 2]) {
         let legacy = parse_fixed_b256(legacy).unwrap();
         let condition =
@@ -29062,6 +29413,512 @@ mod receipt_tests {
             &opening["hash"],
             &end["hash"],
         );
+    }
+
+    #[tokio::test]
+    async fn fifth_native_binary_normal_buy_reconciles_native_source_and_controls() {
+        use super::fifth_native_binary_trades::FifthNativeBinaryTradeStatus;
+
+        let (source, owner, position_ids) = fifth_binary_trades::tests::native_pair_source_trade();
+        let condition_id = position_ids[0];
+        let owner_text = format!("{owner:#x}");
+        let fixture = fifth_native_trade_fixture_with_ending_balances(
+            source,
+            owner,
+            condition_id,
+            [U256::from(200_u64), U256::from(200_u64)],
+            U256::from(949_u64),
+        );
+        let (opening_header, _, end_header, _) = ctf_inventory_headers_with_102(&fixture);
+        let primary = ctf_inventory_provider(fixture.clone()).await;
+        let secondary = ctf_inventory_provider(fixture.clone()).await;
+        let report = ChainLogVerifier::new(&primary, &secondary)
+            .unwrap()
+            .verify_fifth_native_binary_trade_interval_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                100,
+                101,
+                opening_header["hash"].as_str().unwrap(),
+                end_header["hash"].as_str().unwrap(),
+                130,
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.status(), &FifthNativeBinaryTradeStatus::Matched);
+        assert_eq!(
+            report.opening().native_context().condition_id(),
+            condition_id
+        );
+        assert_eq!(report.transactions().len(), 1);
+        let fact = &report.transactions()[0];
+        assert_eq!(fact.branch(), FifthTradeBranch::Normal);
+        assert_eq!(
+            fact.owner_position_inflows(),
+            [U256::from(100_u64), U256::ZERO]
+        );
+        assert_eq!(fact.owner_position_outflows(), [U256::ZERO; 2]);
+        assert_eq!(fact.owner_pusd_outflow(), U256::from(51_u64));
+        assert_eq!(fact.order_fills().len(), 1);
+        assert_eq!(
+            fact.order_fills()[0].token_id(),
+            U256::from_be_bytes(position_ids[0].0)
+        );
+        assert_eq!(
+            report
+                .opening()
+                .native_context()
+                .selected_balances()
+                .position_balance_a(),
+            U256::from(100_u64)
+        );
+        assert_eq!(
+            report
+                .opening()
+                .native_context()
+                .selected_balances()
+                .pusd_balance(),
+            U256::from(1_000_u64)
+        );
+        let closing = report.block_observations().last().unwrap();
+        assert_eq!(closing.module_position_balances(), [U256::ZERO; 2]);
+        assert_eq!(closing.module_pusd_balance(), U256::ZERO);
+        assert_eq!(report.controls().len(), 6);
+        assert!(report.controls().iter().all(|control| {
+            !control.global_paused()
+                && control.submitter_has_operator_role()
+                && !control.maker_pause_active()
+        }));
+        assert!(fixture.requests.load(Ordering::Relaxed) > 0);
+        capture_fifth_native_trade_case(
+            "normal-buy",
+            &fixture,
+            &report,
+            &owner_text,
+            condition_id,
+            &opening_header["hash"],
+            &end_header["hash"],
+        );
+    }
+
+    #[tokio::test]
+    async fn fifth_native_binary_trade_budget_one_below_full_replay_fails_closed() {
+        use super::fifth_native_binary_trades::BoundedFifthNativeBinaryTradeError;
+
+        let (source, owner, position_ids) = fifth_binary_trades::tests::native_pair_source_trade();
+        let condition_id = position_ids[0];
+        let owner_text = format!("{owner:#x}");
+        let fixture = fifth_native_trade_fixture_with_ending_balances(
+            source,
+            owner,
+            condition_id,
+            [U256::from(200_u64), U256::from(200_u64)],
+            U256::from(949_u64),
+        );
+        let (opening_header, _, end_header, _) = ctf_inventory_headers_with_102(&fixture);
+        let primary = ctf_inventory_provider(fixture.clone()).await;
+        let secondary = ctf_inventory_provider(fixture.clone()).await;
+        let error = ChainLogVerifier::new(&primary, &secondary)
+            .unwrap()
+            .verify_fifth_native_binary_trade_interval_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                100,
+                101,
+                opening_header["hash"].as_str().unwrap(),
+                end_header["hash"].as_str().unwrap(),
+                129,
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            BoundedFifthNativeBinaryTradeError::RequestBudgetExceeded
+        );
+        let sends = fixture.requests.load(Ordering::Relaxed);
+        assert!(sends > 0);
+        assert!(sends <= 129);
+    }
+
+    #[tokio::test]
+    async fn fifth_native_binary_trade_refuses_paused_missing_operator_and_active_maker() {
+        use super::fifth_native_binary_trades::{
+            FifthNativeBinaryTradeStatus, FifthNativeBinaryTradeUnavailableReason,
+        };
+
+        let cases = [
+            (
+                U256::ONE,
+                U256::from(2_u64),
+                U256::ZERO,
+                99,
+                FifthNativeBinaryTradeUnavailableReason::ExchangePaused,
+            ),
+            (
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                99,
+                FifthNativeBinaryTradeUnavailableReason::SubmitterNotOperator,
+            ),
+            (
+                U256::ZERO,
+                U256::from(2_u64),
+                U256::from(100_u64),
+                100,
+                FifthNativeBinaryTradeUnavailableReason::MakerPaused,
+            ),
+        ];
+
+        for (global_pause, role_bitmap, maker_activation, expected_block, expected_reason) in cases
+        {
+            let (source, owner, position_ids) =
+                fifth_binary_trades::tests::native_pair_source_trade();
+            let condition_id = position_ids[0];
+            let owner_text = format!("{owner:#x}");
+            let fixture = fifth_native_trade_fixture_with_controls(
+                source,
+                owner,
+                condition_id,
+                [U256::from(200_u64), U256::from(200_u64)],
+                U256::from(949_u64),
+                global_pause,
+                role_bitmap,
+                maker_activation,
+            );
+            let (opening_header, _, end_header, _) = ctf_inventory_headers_with_102(&fixture);
+            let primary = ctf_inventory_provider(fixture.clone()).await;
+            let secondary = ctf_inventory_provider(fixture).await;
+            let report = ChainLogVerifier::new(&primary, &secondary)
+                .unwrap()
+                .verify_fifth_native_binary_trade_interval_bounded(
+                    &owner_text,
+                    &format!("{condition_id:#x}"),
+                    100,
+                    101,
+                    opening_header["hash"].as_str().unwrap(),
+                    end_header["hash"].as_str().unwrap(),
+                    2_000,
+                    Duration::from_secs(20),
+                )
+                .await
+                .unwrap();
+
+            assert!(report.transactions().is_empty());
+            assert!(matches!(
+                report.status(),
+                FifthNativeBinaryTradeStatus::Unavailable {
+                    block_number: Some(block_number),
+                    reason,
+                    ..
+                } if *block_number == expected_block && *reason == expected_reason
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn fifth_native_binary_trade_refuses_control_change_even_after_round_trip() {
+        use super::fifth_native_binary_trades::{
+            FifthNativeBinaryTradeStatus, FifthNativeBinaryTradeUnavailableReason,
+        };
+
+        let (source, owner, position_ids) = fifth_binary_trades::tests::native_pair_source_trade();
+        let condition_id = position_ids[0];
+        let owner_text = format!("{owner:#x}");
+        let controls = [
+            (U256::ZERO, U256::from(7_u64), U256::from(2_u64), U256::ZERO),
+            (U256::ZERO, U256::from(8_u64), U256::from(2_u64), U256::ZERO),
+            (U256::ZERO, U256::from(7_u64), U256::from(2_u64), U256::ZERO),
+        ];
+        let fixture = fifth_native_trade_fixture_with_states_and_controls(
+            source,
+            owner,
+            condition_id,
+            [U256::from(200_u64), U256::from(200_u64)],
+            U256::from(949_u64),
+            [U256::from(200_u64), U256::from(200_u64)],
+            U256::from(949_u64),
+            controls,
+        );
+        let (opening_header, _, end_header, _) = ctf_inventory_headers_with_102(&fixture);
+        let primary = ctf_inventory_provider(fixture.clone()).await;
+        let secondary = ctf_inventory_provider(fixture).await;
+        let report = ChainLogVerifier::new(&primary, &secondary)
+            .unwrap()
+            .verify_fifth_native_binary_trade_interval_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                100,
+                101,
+                opening_header["hash"].as_str().unwrap(),
+                end_header["hash"].as_str().unwrap(),
+                2_000,
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+
+        assert!(report.transactions().is_empty());
+        assert_eq!(
+            report.status(),
+            &FifthNativeBinaryTradeStatus::Unavailable {
+                block_number: None,
+                transaction_hash: None,
+                reason: FifthNativeBinaryTradeUnavailableReason::ExchangeControlTransition,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fifth_native_binary_trade_clears_prefix_on_middle_balance_mismatch() {
+        use super::fifth_native_binary_trades::{
+            FifthNativeBinaryTradeAsset, FifthNativeBinaryTradeStatus,
+        };
+
+        let (source, owner, position_ids) = fifth_binary_trades::tests::native_pair_source_trade();
+        let condition_id = position_ids[0];
+        let owner_text = format!("{owner:#x}");
+        let controls = [(U256::ZERO, U256::from(7_u64), U256::from(2_u64), U256::ZERO); 3];
+        let fixture = fifth_native_trade_fixture_with_states_and_controls(
+            source,
+            owner,
+            condition_id,
+            [U256::from(199_u64), U256::from(200_u64)],
+            U256::from(949_u64),
+            [U256::from(200_u64), U256::from(200_u64)],
+            U256::from(949_u64),
+            controls,
+        );
+        let (opening_header, _, end_header, _) = ctf_inventory_headers_with_102(&fixture);
+        let primary = ctf_inventory_provider(fixture.clone()).await;
+        let secondary = ctf_inventory_provider(fixture).await;
+        let report = ChainLogVerifier::new(&primary, &secondary)
+            .unwrap()
+            .verify_fifth_native_binary_trade_interval_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                100,
+                101,
+                opening_header["hash"].as_str().unwrap(),
+                end_header["hash"].as_str().unwrap(),
+                2_000,
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+
+        assert!(report.transactions().is_empty());
+        assert!(matches!(
+            report.status(),
+            FifthNativeBinaryTradeStatus::Mismatch {
+                block_number: 100,
+                asset: FifthNativeBinaryTradeAsset::OwnerPositionA,
+                authenticated_balance,
+                reconstructed_balance,
+            } if *authenticated_balance == U256::from(199_u64)
+                && *reconstructed_balance == U256::from(200_u64)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fifth_native_binary_trade_rejects_extra_or_reordered_source_logs() {
+        use super::fifth_native_binary_trades::FifthNativeBinaryTradeStatus;
+
+        for change in [0_u8, 1, 2] {
+            let (source, owner, position_ids) =
+                fifth_binary_trades::tests::native_pair_source_trade();
+            let condition_id = position_ids[0];
+            let owner_text = format!("{owner:#x}");
+            let mut fixture = fifth_native_trade_fixture_with_ending_balances(
+                source,
+                owner,
+                condition_id,
+                [U256::from(200_u64), U256::from(200_u64)],
+                U256::from(949_u64),
+            );
+            {
+                let logs = &mut fixture.rooted_gas_block.as_mut().unwrap().receipt_logs[0];
+                match change {
+                    0 => {
+                        let duplicate = logs[0].clone();
+                        logs.push(duplicate);
+                    }
+                    1 => logs.reverse(),
+                    _ => {
+                        for signature in ["TradingPaused(address)", "TradingUnpaused(address)"] {
+                            logs.push(json!({
+                                "address":super::fifth_code_context::EXCHANGE_PROXY,
+                                "topics":[format!("0x{}",hex::encode(Keccak256::digest(signature.as_bytes())))],
+                                "data":"0x",
+                            }));
+                        }
+                    }
+                }
+            }
+            fixture.inventory_logs =
+                Some(fixture.rooted_gas_block.as_ref().unwrap().receipt_logs[0].clone());
+            let (opening_header, _, end_header, _) = ctf_inventory_headers_with_102(&fixture);
+            let primary = ctf_inventory_provider(fixture.clone()).await;
+            let secondary = ctf_inventory_provider(fixture).await;
+            let report = ChainLogVerifier::new(&primary, &secondary)
+                .unwrap()
+                .verify_fifth_native_binary_trade_interval_bounded(
+                    &owner_text,
+                    &format!("{condition_id:#x}"),
+                    100,
+                    101,
+                    opening_header["hash"].as_str().unwrap(),
+                    end_header["hash"].as_str().unwrap(),
+                    2_000,
+                    Duration::from_secs(20),
+                )
+                .await
+                .unwrap();
+
+            assert!(report.transactions().is_empty());
+            assert_ne!(report.status(), &FifthNativeBinaryTradeStatus::Matched);
+        }
+    }
+
+    #[tokio::test]
+    async fn fifth_native_binary_trade_clears_prefix_on_late_unsupported_exchange_call() {
+        use super::fifth_native_binary_trades::{
+            FifthNativeBinaryTradeStatus, FifthNativeBinaryTradeUnavailableReason,
+        };
+
+        let (source, owner, position_ids) = fifth_binary_trades::tests::native_pair_source_trade();
+        let condition_id = position_ids[0];
+        let owner_text = format!("{owner:#x}");
+        let mut fixture = fifth_native_trade_fixture_with_ending_balances(
+            source,
+            owner,
+            condition_id,
+            [U256::from(200_u64), U256::from(200_u64)],
+            U256::from(949_u64),
+        );
+        let (unsupported_call, recovered_from) = signed_polygon_transaction_with_key(
+            super::fifth_code_context::EXCHANGE_PROXY,
+            &[0xde, 0xad, 0xbe, 0xef],
+            0x42,
+        );
+        let (_, expected_operator) = signed_polygon_transaction_with_key(
+            super::fifth_code_context::EXCHANGE_PROXY,
+            &[],
+            0x42,
+        );
+        assert_eq!(recovered_from, expected_operator);
+        fixture.extra_direct_call_transaction = Some(unsupported_call);
+        fixture.extra_inventory_logs = Some(Vec::new());
+        let (opening_header, _, block101, _) = ctf_inventory_headers_with_102(&fixture);
+        let primary = ctf_inventory_provider(fixture.clone()).await;
+        let secondary = ctf_inventory_provider(fixture).await;
+        let report = ChainLogVerifier::new(&primary, &secondary)
+            .unwrap()
+            .verify_fifth_native_binary_trade_interval_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                100,
+                101,
+                opening_header["hash"].as_str().unwrap(),
+                block101["hash"].as_str().unwrap(),
+                2_000,
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+
+        assert!(report.transactions().is_empty());
+        assert!(matches!(
+            report.status(),
+            FifthNativeBinaryTradeStatus::Unavailable {
+                block_number: Some(101),
+                reason: FifthNativeBinaryTradeUnavailableReason::UnsupportedDirectCall,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fifth_native_binary_trade_enforces_deadline_and_cancellation() {
+        use super::fifth_native_binary_trades::BoundedFifthNativeBinaryTradeError;
+
+        let (source, owner, position_ids) = fifth_binary_trades::tests::native_pair_source_trade();
+        let condition_id = position_ids[0];
+        let owner_text = format!("{owner:#x}");
+        let mut fixture = fifth_native_trade_fixture_with_ending_balances(
+            source,
+            owner,
+            condition_id,
+            [U256::from(200_u64), U256::from(200_u64)],
+            U256::from(949_u64),
+        );
+        fixture.delay_ms = 10;
+        let (opening_header, _, end_header, _) = ctf_inventory_headers_with_102(&fixture);
+        let primary = ctf_inventory_provider(fixture.clone()).await;
+        let secondary = ctf_inventory_provider(fixture.clone()).await;
+        let timeout_error = ChainLogVerifier::new(&primary, &secondary)
+            .unwrap()
+            .verify_fifth_native_binary_trade_interval_bounded(
+                &owner_text,
+                &format!("{condition_id:#x}"),
+                100,
+                101,
+                opening_header["hash"].as_str().unwrap(),
+                end_header["hash"].as_str().unwrap(),
+                2_000,
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(timeout_error, BoundedFifthNativeBinaryTradeError::Timeout);
+
+        let mut cancel_fixture = fifth_native_trade_fixture_with_ending_balances(
+            fifth_binary_trades::tests::native_pair_source_trade().0,
+            owner,
+            condition_id,
+            [U256::from(200_u64), U256::from(200_u64)],
+            U256::from(949_u64),
+        );
+        let gate = std::sync::Arc::new(CtfInventoryDeadlineGate::new());
+        cancel_fixture.deadline_gate = Some(gate.clone());
+        let (cancel_opening, _, cancel_end, _) = ctf_inventory_headers_with_102(&cancel_fixture);
+        let cancel_sends = cancel_fixture.requests.clone();
+        let cancel_primary = ctf_inventory_provider(cancel_fixture.clone()).await;
+        let cancel_secondary = ctf_inventory_provider(cancel_fixture).await;
+        let cancel_owner = owner_text.clone();
+        let cancel_condition = format!("{condition_id:#x}");
+        let task = tokio::spawn(async move {
+            ChainLogVerifier::new(&cancel_primary, &cancel_secondary)
+                .unwrap()
+                .verify_fifth_native_binary_trade_interval_bounded(
+                    &cancel_owner,
+                    &cancel_condition,
+                    100,
+                    101,
+                    cancel_opening["hash"].as_str().unwrap(),
+                    cancel_end["hash"].as_str().unwrap(),
+                    2_000,
+                    Duration::from_secs(20),
+                )
+                .await
+        });
+        tokio::select! {
+            _ = gate.started.notified() => {}
+            _ = test_wall_timeout(Duration::from_secs(30)) => panic!("native trade cancellation gate was not reached"),
+        }
+        let sends_at_gate = cancel_sends.load(Ordering::Relaxed);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        gate.release.send_replace(true);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let settled_sends = cancel_sends.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(cancel_sends.load(Ordering::Relaxed), settled_sends);
+        assert!(settled_sends >= sends_at_gate);
     }
 
     #[tokio::test]

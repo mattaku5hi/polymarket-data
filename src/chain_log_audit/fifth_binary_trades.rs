@@ -1703,7 +1703,7 @@ fn topic_is_address(topic: &str, address: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{TransactionClassification, classify_transaction, event_topic};
     use crate::chain_log_audit::{
         ChainReceiptIntervalTransaction, FifthExchangeImplementationVersion,
@@ -1726,7 +1726,8 @@ mod tests {
         ]
     }
 
-    fn native_pair_source_trade() -> (ChainReceiptIntervalTransaction, Address, [B256; 2]) {
+    pub(in crate::chain_log_audit) fn native_pair_source_trade()
+    -> (ChainReceiptIntervalTransaction, Address, [B256; 2]) {
         let (source_transaction, owner, mut logs) = fifth_normal_buy_source_fixture();
         let owner = Address::from_str(&owner).unwrap();
         let original_input = hex::decode(

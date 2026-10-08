@@ -79,6 +79,15 @@ a shared budget and deadline. Its sealed context can be reused internally;
 rooted current/prior fixtures cover exact limits, cancellation and malformed
 proofs. Current point state does not establish control state at a trade call.
 
+`ChainLogVerifier::verify_fifth_native_binary_trade_interval_bounded` attributes
+direct native Binary `matchOrders` receipts to the selected owner and reconciles
+both position balances and pUSD at every block boundary. One request budget and
+deadline cover native context, receipts and every recovered submitter/order-maker
+control proof. Control transitions and unsupported activity refuse the entire
+interval and clear transaction facts. Successful observations establish bounded
+source correspondence; they do not independently validate order signatures,
+execute an EVM trace or establish native creation, opening cost basis or P&L.
+
 Polydoghound consumes these modules through thin local trait/domain adapters.
 Polyazimuth can consume gross-depth acquisition through its observation consumer
 seam; its reconstructed book views are not silently upgraded to executable quotes.
