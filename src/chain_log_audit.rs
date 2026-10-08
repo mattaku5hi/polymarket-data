@@ -340,16 +340,65 @@ impl OperationRequestBudget {
     }
 
     fn reserve(&self) -> Result<(), ()> {
-        let reservation =
-            self.reserved
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-                    (reserved < self.limit).then(|| reserved + 1)
-                });
-        if reservation.is_err() {
-            self.exhaustion.send_replace(true);
-            return Err(());
+        let mut reserved = self.reserved.load(Ordering::Acquire);
+        while reserved < self.limit {
+            match self.reserved.compare_exchange_weak(
+                reserved,
+                reserved + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => reserved = actual,
+            }
         }
-        Ok(())
+        self.exhaustion.send_replace(true);
+        Err(())
+    }
+}
+
+#[cfg(test)]
+mod request_budget_tests {
+    use super::{OperationRequestBudget, Ordering};
+    use std::sync::{Arc, Barrier, atomic::AtomicUsize};
+
+    #[test]
+    fn reservations_are_atomic_under_contention_and_do_not_overflow() {
+        let budget = Arc::new(OperationRequestBudget::new(1_000));
+        let barrier = Arc::new(Barrier::new(16));
+        let successes = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let budget = budget.clone();
+                let barrier = barrier.clone();
+                let successes = &successes;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..128 {
+                        if budget.reserve().is_ok() {
+                            successes.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(successes.load(Ordering::Relaxed), 1_000);
+        assert_eq!(budget.reserved.load(Ordering::Acquire), 1_000);
+        assert!(*budget.exhaustion.borrow());
+
+        let zero = OperationRequestBudget::new(0);
+        assert!(zero.reserve().is_err());
+        assert_eq!(zero.reserved.load(Ordering::Acquire), 0);
+        assert!(*zero.exhaustion.borrow());
+
+        let maximum = OperationRequestBudget::new(usize::MAX);
+        maximum.reserved.store(usize::MAX - 1, Ordering::Release);
+        assert!(maximum.reserve().is_ok());
+        assert_eq!(maximum.reserved.load(Ordering::Acquire), usize::MAX);
+        assert!(!*maximum.exhaustion.borrow());
+        assert!(maximum.reserve().is_err());
+        assert_eq!(maximum.reserved.load(Ordering::Acquire), usize::MAX);
+        assert!(*maximum.exhaustion.borrow());
     }
 }
 
