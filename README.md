@@ -1,6 +1,6 @@
-# polymarket-data (read-only slices)
+# polymarket-data
 
-Standalone, **read-only** Rust library for Polymarket public data. Implements Data API v2 `GET /v2/trades` **one page** and CLOB `GET /book` **one snapshot**. It accepts an injected `reqwest::Client` and a base URL, with either a wallet-filtered trade page or an explicit global raw page; no signing keys, global runtime, storage, trading actions or hidden retries. The caller owns pagination, cancellation, rate budgets and coverage policy.
+Standalone, **read-only** Rust library shared by Polymarket applications. Default APIs acquire Data API v2 pages and CLOB snapshots and calculate exact gross depth. Optional modules provide market/RTDS streams, Gamma metadata and bounded rooted chain evidence. Page readers accept an injected `reqwest::Client` and a base URL; callers own pagination, cancellation, rate budgets and coverage policy. Stream reconnect behavior and chain request budgets are explicit module contracts.
 
 ```rust,ignore
 let page = polymarket_data::fetch_v2_trades_page(
@@ -47,8 +47,54 @@ let book = polymarket_data::clob::fetch_book(
 assert_eq!(book.asset_id, token_id);
 ```
 
-The book reader checks token identity, nonblank hash, 13-digit millisecond timestamp and all bid/ask levels atomically, preserving decimal text and vendor order. Decimal values outside the exact supported representation are rejected rather than rounded. The response is capped at 2 MiB, including chunked bodies. Empty sides are valid observations, not executable prices. Numeric `Retry-After` is surfaced; the caller owns timeout/retry/cancellation policy via its injected client. No fee, freshness, depth-execution or coverage claim is derived. This new CLOB slice is local and not yet wired into the pinned Polydoghound consumer; its paper depth calculations remain project-owned.
+The book reader checks token identity, nonblank hash, 13-digit millisecond timestamp and all bid/ask levels atomically, preserving decimal text and vendor order. Decimal values outside the exact supported representation are rejected rather than rounded. The response is capped at 2 MiB, including chunked bodies. Empty sides are valid observations, not executable prices. Numeric `Retry-After` is surfaced; the caller owns timeout/retry/cancellation policy via its injected client. No fee, freshness, depth-execution or coverage claim is derived. The shared gross-depth calculations described below are used by the Polydoghound adapter; its full-position SELL requirement and paper fee policy remain project-owned.
 
-**Provenance and limits:** Data API v2 provides no per-fill ID. Equal wallet/transaction/token/side/time/price/size rows may represent distinct fills; this package neither deduplicates them nor claims historical completeness. An opaque cursor is not an independently verified source of coverage. The 8 MiB cap is a safety limit, not a throughput measurement. CLOB market/user WebSockets, account/auth/order submission, Gamma, RTDS, Polygon receipts, resolution semantics and the dashboard are **not** exported by these slices. This is not a full CLOB client wrapper. The new global/CLOB slices are not wired into the pinned Polydoghound consumer.
+## Shared adapter capabilities
 
-Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`. Tests use only loopback fixture servers. This directory is an independent Cargo project inside `crypto-tools`; it does not import Polydoghound or modify `trader-scout/`. The package is currently `UNLICENSED`; licensing, versioned distribution and rollback need owner approval. Do not publish or wire a production consumer without parity tests and an approved dependency/rollback path.
+Default features expose trade pages, raw resolution pages, bounded HTTP defaults,
+candidate overlap observations and exact Decimal CLOB depth calculations:
+
+```rust,ignore
+let buy = polymarket_data::clob::quote_buy(&book, requested_notional)?;
+let sell = polymarket_data::clob::quote_sell(&book, requested_quantity)?;
+// Reports retain asset_id, book_hash, book_timestamp and permit partial depth.
+// Gross notional/proceeds exclude fees and do not establish executable quotes.
+```
+
+Optional features keep a single reusable implementation:
+
+| Feature | Public modules | Scope |
+|---|---|---|
+| `streams` | `market_stream`, `trade_firehose` | CLOB bid cache and RTDS observations; reconnect clears stale market state |
+| `gamma` | `gamma_index`, `gamma_market_metadata`, `ttl_cache` | Bounded Gamma acquisition, neutral metadata and cache; no strategy/risk traits |
+| `chain-audit` | `chain_log_audit`, `activity_hints` | Budgeted independent-provider rooted evidence, signed transaction/receipt binding, source-specific CTF/fifth contracts |
+
+Core, `streams` and `gamma` support Rust 1.85. `chain-audit` requires Rust 1.88.
+All modules are read-only. No private keys, submitted orders, wallet spending,
+complete ExecutionQuote, fee discovery, FX conversion, history completeness or
+qualification is supplied. Chain observations retain their narrow source policy
+and mismatch/unavailable states; a proof for one contract/path does not validate
+unsupported products. The fifth Exchange control observer is an in-progress
+compile-checked API; rooted acceptance fixtures remain subsequent work.
+
+Polydoghound consumes these modules through thin local trait/domain adapters.
+Polyazimuth can consume gross-depth acquisition through its observation consumer
+seam; its reconstructed book views are not silently upgraded to executable quotes.
+The library has no dependency on either application's domain, persistence or risk.
+
+**Provenance and limits:** Data API v2 provides no per-fill ID. Equal
+wallet/transaction/token/side/time/price/size rows may represent distinct fills;
+observed overlap and opaque cursors do not establish historical completeness.
+Raw vendor data is preserved separately from derived observations. Bounds are
+safety limits, not capacity measurements. Caller-selected budgets, cancellation
+and coverage policy remain explicit. Book provenance supplies no freshness SLA,
+fee/currency evidence or order validity guarantee.
+
+Run `cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets --all-features -- -D warnings`,
+`cargo test --locked --all-features` and
+`cargo +1.85.0 check --locked --no-default-features --features streams,gamma`.
+Tests use offline deterministic artifacts and loopback fixture servers.
+This is an independent Cargo project inside `crypto-tools`; it does not modify
+`trader-scout/`. The package remains `UNLICENSED` and is distributed through
+explicit reviewed Git revisions, not a package-registry release.

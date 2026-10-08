@@ -1,0 +1,107 @@
+{
+  "compiler": "solc-0.8.34",
+  "source_commit": "741f8bbe88c3f29a1c55d1248a3dd411f622f111",
+  "input_sha256": "4b507b2ba2cf92430d1344e389bf9c4e4d77561334b424f8797aa32a0c77a31d",
+  "sources_sha256": {
+    "src/modules/abstract/BaseModule.sol": "f2c098892ecf3a522d1e54aac546218080b968b1a1b5696d14cf19f09d2c0a9c",
+    "src/modules/migration/BaseMigrationMixin.sol": "1f2d2d9c8efd0916eaefeb4929074c13e2e074b8d2ee311c2b43def3585d8475",
+    "src/libraries/Ids.sol": "7d60ec78c16b2b64ffb46c3be2b6bafa885d7470f2f83c364e36da9d6033aefb"
+  },
+  "compiler_result_storage_entry": {
+    "astId": 6734,
+    "contract": "src/modules/BinaryModule.sol:BinaryModule",
+    "label": "result",
+    "offset": 0,
+    "slot": "50",
+    "type": "t_mapping(t_userDefinedValueType(ConditionId)5366,t_array(t_uint256)dyn_storage)"
+  },
+  "compiler_mapping_type": {
+    "encoding": "mapping",
+    "key": "t_userDefinedValueType(ConditionId)5366",
+    "label": "mapping(ConditionId => uint256[])",
+    "numberOfBytes": "32",
+    "value": "t_array(t_uint256)dyn_storage"
+  },
+  "legacy_condition_id": "0x1212121212121212121212121212121212121212121212121212121212121212",
+  "v2_condition_word": "0x0112121212121212121212121212121212000000000000000000000000000000",
+  "mapping_preimage": "0x01121212121212121212121212121212120000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000032",
+  "storage_keys": [
+    "0xa53fc20f9ca67ac83ba221e946c0220bb940a1f7422f8eeab42d32971d14169f",
+    "0x928c363dc18ec3cdb6ab84061eb82462d2fdbc6876a88a74c555af12d02d8ac9",
+    "0x928c363dc18ec3cdb6ab84061eb82462d2fdbc6876a88a74c555af12d02d8aca"
+  ],
+  "normalization_vectors": [
+    {
+      "ctf_numerators": [
+        "1",
+        "3"
+      ],
+      "module_result": [
+        "250000",
+        "750000"
+      ]
+    },
+    {
+      "ctf_numerators": [
+        "2",
+        "1"
+      ],
+      "module_result": [
+        "666666",
+        "333334"
+      ]
+    },
+    {
+      "ctf_numerators": [
+        "1",
+        "2"
+      ],
+      "module_result": [
+        "333333",
+        "666667"
+      ]
+    },
+    {
+      "ctf_numerators": [
+        "0",
+        "5"
+      ],
+      "module_result": [
+        "0",
+        "1000000"
+      ]
+    },
+    {
+      "ctf_numerators": [
+        "7",
+        "0"
+      ],
+      "module_result": [
+        "1000000",
+        "0"
+      ]
+    },
+    {
+      "ctf_numerators": [
+        "0",
+        "0"
+      ],
+      "module_result": "unresolved"
+    },
+    {
+      "ctf_numerators": [
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "1"
+      ],
+      "module_result": "checked_overflow"
+    },
+    {
+      "ctf_numerators": [
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "0"
+      ],
+      "module_result": "checked_overflow"
+    }
+  ],
+  "source_denominator": "1000000"
+}

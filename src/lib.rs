@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
-//! Bounded, read-only public Polymarket Data API v2 trade pages and CLOB
-//! book observations, without order submission, account state or P&L claims.
+//! Bounded read-only Polymarket data, book depth, streams and rooted evidence.
+//! No order submission, wallet spending or qualified P&L claims.
 
 pub mod clob;
 
@@ -14,11 +14,46 @@ pub const MAX_BATCH_LIMIT: usize = 1_000;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MILLISECOND_THRESHOLD: i64 = 1_000_000_000_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TradeSide {
     Buy,
     Sell,
 }
+
+impl TradeSide {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+        }
+    }
+}
+
+#[cfg(feature = "streams")]
+pub mod trade_firehose;
+#[cfg(feature = "streams")]
+pub use trade_firehose::FirehoseTrade;
+#[cfg(feature = "streams")]
+pub mod market_stream;
+
+#[cfg(feature = "chain-audit")]
+pub mod chain_log_audit;
+
+#[cfg(feature = "chain-audit")]
+pub mod activity_hints;
+pub mod resolutions;
+pub mod v2_reconciliation;
+
+#[cfg(feature = "gamma")]
+pub mod gamma_index;
+#[cfg(feature = "gamma")]
+pub mod gamma_market_metadata;
+pub mod http_client;
+#[cfg(feature = "gamma")]
+pub mod ttl_cache;
+#[cfg(feature = "gamma")]
+pub use gamma_index::GAMMA_DEFAULT_BASE_URL;
 
 /// A vendor observation, not a unique fill, wallet P&L or a trade to execute.
 #[derive(Clone, Debug, PartialEq)]

@@ -2,18 +2,38 @@
 name = "polymarket-data"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "UNLICENSED"
-description = "Bounded read-only Polymarket Data API trade pages and CLOB book observations"
+description = "Bounded read-only Polymarket data, book depth, streams and rooted chain evidence"
+
+[features]
+default = []
+streams = ["dep:async-trait", "dep:futures-util", "dep:tokio", "dep:tokio-tungstenite", "dep:tokio-util"]
+gamma = ["dep:async-trait", "dep:futures-util", "dep:tokio"]
+chain-audit = ["streams", "dep:alloy-primitives", "dep:alloy-rlp", "dep:alloy-trie", "dep:hex", "dep:num-bigint-dig", "dep:sha2", "dep:sha3"]
 
 [dependencies]
-chrono = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rust_decimal = "1"
+rust_decimal = { version = "1", features = ["serde"] }
 thiserror = "2"
+async-trait = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["macros", "sync", "time", "rt"], optional = true }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
+alloy-primitives = { version = "1.7", features = ["k256"], optional = true }
+alloy-rlp = { version = "0.3", optional = true }
+alloy-trie = { version = "0.9", features = ["ethereum"], optional = true }
+hex = { version = "0.4", optional = true }
+num-bigint-dig = { version = "0.8", optional = true }
+sha2 = { version = "0.10", optional = true }
+sha3 = { version = "0.10", optional = true }
 
 [dev-dependencies]
+k256 = { version = "0.13", features = ["ecdsa"] }
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util"] }
 tokio-stream = "0.1"

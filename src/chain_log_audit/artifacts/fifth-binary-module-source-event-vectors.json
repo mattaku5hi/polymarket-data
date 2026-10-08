@@ -1,0 +1,129 @@
+{
+  "provenance": {
+    "repository": "Polymarket/polymarket-v2-external",
+    "commit": "741f8bbe88c3f29a1c55d1248a3dd411f622f111",
+    "compiler": "solc-0.8.34",
+    "standard_input_sha256": "4b507b2ba2cf92430d1344e389bf9c4e4d77561334b424f8797aa32a0c77a31d",
+    "source": "src/modules/abstract/BaseModule.sol",
+    "compiler_output_sha256": "317c40ec2f9bf5ade61aff4b4b704218eea5940ce5d84e71f4020e1f48b33b74"
+  },
+  "events": [
+    {
+      "abi": {
+        "anonymous": false,
+        "inputs": [
+          {
+            "indexed": true,
+            "internalType": "address",
+            "name": "initiator",
+            "type": "address"
+          },
+          {
+            "indexed": true,
+            "internalType": "PositionId",
+            "name": "positionId",
+            "type": "uint256"
+          },
+          {
+            "indexed": true,
+            "internalType": "address",
+            "name": "recipient",
+            "type": "address"
+          },
+          {
+            "indexed": false,
+            "internalType": "uint256",
+            "name": "amount",
+            "type": "uint256"
+          },
+          {
+            "indexed": false,
+            "internalType": "uint256",
+            "name": "payout",
+            "type": "uint256"
+          }
+        ],
+        "name": "PositionRedeemed",
+        "type": "event"
+      },
+      "signature": "PositionRedeemed(address,uint256,address,uint256,uint256)",
+      "topic": "0x4fd474b703f46b453536518b4cbc159dfbea6fd663233763d321a9bc8ccdf97f"
+    },
+    {
+      "abi": {
+        "anonymous": false,
+        "inputs": [
+          {
+            "indexed": true,
+            "internalType": "address",
+            "name": "initiator",
+            "type": "address"
+          },
+          {
+            "indexed": true,
+            "internalType": "ConditionId",
+            "name": "conditionId",
+            "type": "bytes31"
+          },
+          {
+            "indexed": true,
+            "internalType": "address",
+            "name": "recipient",
+            "type": "address"
+          },
+          {
+            "indexed": false,
+            "internalType": "uint256",
+            "name": "amount",
+            "type": "uint256"
+          }
+        ],
+        "name": "PositionsMerged",
+        "type": "event"
+      },
+      "signature": "PositionsMerged(address,bytes31,address,uint256)",
+      "topic": "0xf233f7be4ce81130a78e8eb2fa626497586c56094d27bfec2e196471e9c60301"
+    },
+    {
+      "abi": {
+        "anonymous": false,
+        "inputs": [
+          {
+            "indexed": true,
+            "internalType": "address",
+            "name": "initiator",
+            "type": "address"
+          },
+          {
+            "indexed": true,
+            "internalType": "ConditionId",
+            "name": "conditionId",
+            "type": "bytes31"
+          },
+          {
+            "indexed": true,
+            "internalType": "address",
+            "name": "recipient0",
+            "type": "address"
+          },
+          {
+            "indexed": false,
+            "internalType": "address",
+            "name": "recipient1",
+            "type": "address"
+          },
+          {
+            "indexed": false,
+            "internalType": "uint256",
+            "name": "amount",
+            "type": "uint256"
+          }
+        ],
+        "name": "PositionsSplit",
+        "type": "event"
+      },
+      "signature": "PositionsSplit(address,bytes31,address,address,uint256)",
+      "topic": "0xb6a6b8b17a43b07b9359dd12d304e42077eede9e672f8646144842c8604582a4"
+    }
+  ]
+}

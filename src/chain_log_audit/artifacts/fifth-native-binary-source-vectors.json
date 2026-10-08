@@ -1,0 +1,260 @@
+{
+  "provenance": "Parent independent Solidity ABI/Keccak/bit encoding from pinned Ids.sol and accepted BinaryModule compiler ABI/layout; source/unsigned vectors, not native creation/history or market identity.",
+  "compiler_output_sha256": "317c40ec2f9bf5ade61aff4b4b704218eea5940ce5d84e71f4020e1f48b33b74",
+  "source_abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "ConditionId",
+          "name": "conditionId",
+          "type": "bytes31"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256[]",
+          "name": "result",
+          "type": "uint256[]"
+        }
+      ],
+      "name": "ConditionResolved",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "resolver",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "ConditionId",
+          "name": "conditionId",
+          "type": "bytes31"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256[]",
+          "name": "result",
+          "type": "uint256[]"
+        }
+      ],
+      "name": "ResultReported",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes",
+          "name": "_data",
+          "type": "bytes"
+        }
+      ],
+      "name": "getConditionId",
+      "outputs": [
+        {
+          "internalType": "ConditionId",
+          "name": "",
+          "type": "bytes31"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "ConditionId",
+          "name": "_conditionId",
+          "type": "bytes31"
+        }
+      ],
+      "name": "getResult",
+      "outputs": [
+        {
+          "internalType": "uint256[]",
+          "name": "",
+          "type": "uint256[]"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "ConditionId",
+          "name": "_conditionId",
+          "type": "bytes31"
+        }
+      ],
+      "name": "hasResult",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_to",
+          "type": "address"
+        },
+        {
+          "internalType": "ConditionId",
+          "name": "_conditionId",
+          "type": "bytes31"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "merge",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_to",
+          "type": "address"
+        },
+        {
+          "internalType": "PositionId",
+          "name": "_positionId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "redeem",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "ConditionId",
+          "name": "_conditionId",
+          "type": "bytes31"
+        },
+        {
+          "internalType": "uint256[]",
+          "name": "_result",
+          "type": "uint256[]"
+        }
+      ],
+      "name": "reportResult",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address[]",
+          "name": "_to",
+          "type": "address[]"
+        },
+        {
+          "internalType": "ConditionId",
+          "name": "_conditionId",
+          "type": "bytes31"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "split",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ],
+  "canonical_fields": {
+    "module_id": 1,
+    "arity": 0,
+    "reserved": 0,
+    "resolution_chain_enum": 0,
+    "condition_index": 0,
+    "condition_outcome_byte": 0
+  },
+  "module_registry_key": "0xada5013122d395ba3c54772283fb069b10426056ef8ca54750cb9bb552a59e7d",
+  "normalization_denominator": 1000000,
+  "vectors": [
+    {
+      "name": "empty",
+      "raw_data": "0x",
+      "abi_module_data": "0x000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000",
+      "full_base_hash": "0xd0d56fb725de6864c5219d41e7cdd2557301a353abf350f06d887582614feb61",
+      "canonical_condition_id": "0x017301a353abf350f06d887582614feb61000000000000000000000000000000",
+      "position_ids": [
+        "0x017301a353abf350f06d887582614feb61000000000000000000000000000000",
+        "0x017301a353abf350f06d887582614feb61000000000000000000000000000001"
+      ],
+      "event_id_word": "0x017301a353abf350f06d887582614feb61000000000000000000000000000000",
+      "module_storage_keys": {
+        "legacy_mapping": "0xdc4ae10ee9507d9d61657c635526f1fbb5f8b3127e4f1484a94ef925c8db7e66",
+        "result_length": "0x5e4e59e86bdb6204d669a71053e2cac53de7373f15ea3177be29e5ada358f4ce",
+        "result_numerator0": "0x6b02cc64e1fa179087bcef72451129b874c4b8808ae879559d4b21214308f164",
+        "result_numerator1": "0x6b02cc64e1fa179087bcef72451129b874c4b8808ae879559d4b21214308f165"
+      }
+    },
+    {
+      "name": "fixture",
+      "raw_data": "0x7064682d6e61746976652d62696e6172792d666978747572652d7631",
+      "abi_module_data": "0x00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000001c7064682d6e61746976652d62696e6172792d666978747572652d763100000000",
+      "full_base_hash": "0xe25cc972dd7ec981bb0baa9ec444327615e42a7febd7cf27ddbb2f5f5d708060",
+      "canonical_condition_id": "0x0115e42a7febd7cf27ddbb2f5f5d708060000000000000000000000000000000",
+      "position_ids": [
+        "0x0115e42a7febd7cf27ddbb2f5f5d708060000000000000000000000000000000",
+        "0x0115e42a7febd7cf27ddbb2f5f5d708060000000000000000000000000000001"
+      ],
+      "event_id_word": "0x0115e42a7febd7cf27ddbb2f5f5d708060000000000000000000000000000000",
+      "module_storage_keys": {
+        "legacy_mapping": "0x237d48077c03cbfde7aa591bdb313da4cd0df2a6064b061be602a6a155f5d055",
+        "result_length": "0x8ad5b58297350f21bd11fbd2c2b98e8e091ba8233b04e0454bfe1b961a179bd5",
+        "result_numerator0": "0x8c33dba804634597e660634d2f9a1015c92f83b87a8c66c6ccab8950ab0f667c",
+        "result_numerator1": "0x8c33dba804634597e660634d2f9a1015c92f83b87a8c66c6ccab8950ab0f667d"
+      }
+    },
+    {
+      "name": "raw-bytes",
+      "raw_data": "0x000102ff",
+      "abi_module_data": "0x000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000004000102ff00000000000000000000000000000000000000000000000000000000",
+      "full_base_hash": "0x86a28dc3160f62cb5d378ee39bed5df0649605877d9abd9cb49dc6f0a5768604",
+      "canonical_condition_id": "0x01649605877d9abd9cb49dc6f0a5768604000000000000000000000000000000",
+      "position_ids": [
+        "0x01649605877d9abd9cb49dc6f0a5768604000000000000000000000000000000",
+        "0x01649605877d9abd9cb49dc6f0a5768604000000000000000000000000000001"
+      ],
+      "event_id_word": "0x01649605877d9abd9cb49dc6f0a5768604000000000000000000000000000000",
+      "module_storage_keys": {
+        "legacy_mapping": "0xb38ba5de28b9a2ceee43e9bb0f6695a61265283b76ba765cf4a6381a1e162fb5",
+        "result_length": "0x7a8d36954ed6dd523966ed7e32841dfa2166be184a5ab137ce81b830110c7e6d",
+        "result_numerator0": "0xa80f54807451b8d311dbc174d90b5f549c6648de3969712837b3507fff53c094",
+        "result_numerator1": "0xa80f54807451b8d311dbc174d90b5f549c6648de3969712837b3507fff53c095"
+      }
+    }
+  ]
+}

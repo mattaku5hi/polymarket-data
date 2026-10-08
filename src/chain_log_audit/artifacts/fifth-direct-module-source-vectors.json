@@ -1,0 +1,212 @@
+{
+  "source_commit": "741f8bbe88c3f29a1c55d1248a3dd411f622f111",
+  "compiler": "solc-0.8.34",
+  "functions": [
+    {
+      "contract": "PositionManager",
+      "abi": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "from",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "to",
+            "type": "address"
+          },
+          {
+            "internalType": "uint256",
+            "name": "id",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "amount",
+            "type": "uint256"
+          },
+          {
+            "internalType": "bytes",
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "safeTransferFrom",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      "signature": "safeTransferFrom(address,address,uint256,uint256,bytes)",
+      "selector": "0xf242432a",
+      "compiler_output_sha256": "caad24ccf5cee523bc5ff10c16998cc9a749509b04c9679eaef1368dad2fd679"
+    },
+    {
+      "contract": "CollateralToken",
+      "abi": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "to",
+            "type": "address"
+          },
+          {
+            "internalType": "uint256",
+            "name": "amount",
+            "type": "uint256"
+          }
+        ],
+        "name": "transfer",
+        "outputs": [
+          {
+            "internalType": "bool",
+            "name": "",
+            "type": "bool"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      "signature": "transfer(address,uint256)",
+      "selector": "0xa9059cbb",
+      "compiler_output_sha256": "313078d05e3fa10eb6b503d684e3306cf05051de623607ddd93d040e20d0fa76"
+    },
+    {
+      "contract": "BinaryModule",
+      "abi": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "_to",
+            "type": "address"
+          },
+          {
+            "internalType": "ConditionId",
+            "name": "_conditionId",
+            "type": "bytes31"
+          },
+          {
+            "internalType": "uint256",
+            "name": "_amount",
+            "type": "uint256"
+          }
+        ],
+        "name": "merge",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      "signature": "merge(address,bytes31,uint256)",
+      "selector": "0x1d479a82",
+      "compiler_output_sha256": "317c40ec2f9bf5ade61aff4b4b704218eea5940ce5d84e71f4020e1f48b33b74"
+    },
+    {
+      "contract": "BinaryModule",
+      "abi": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "_to",
+            "type": "address"
+          },
+          {
+            "internalType": "PositionId",
+            "name": "_positionId",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "_amount",
+            "type": "uint256"
+          }
+        ],
+        "name": "redeem",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      "signature": "redeem(address,uint256,uint256)",
+      "selector": "0x2b83cccd",
+      "compiler_output_sha256": "317c40ec2f9bf5ade61aff4b4b704218eea5940ce5d84e71f4020e1f48b33b74"
+    },
+    {
+      "contract": "BinaryModule",
+      "abi": {
+        "inputs": [
+          {
+            "internalType": "address[]",
+            "name": "_to",
+            "type": "address[]"
+          },
+          {
+            "internalType": "ConditionId",
+            "name": "_conditionId",
+            "type": "bytes31"
+          },
+          {
+            "internalType": "uint256",
+            "name": "_amount",
+            "type": "uint256"
+          }
+        ],
+        "name": "split",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      "signature": "split(address[],bytes31,uint256)",
+      "selector": "0x2d20cffd",
+      "compiler_output_sha256": "317c40ec2f9bf5ade61aff4b4b704218eea5940ce5d84e71f4020e1f48b33b74"
+    }
+  ],
+  "module_proxy_fixture": "0x3333333333333333333333333333333333333333",
+  "roles_storage_preimage": "0x333333333333333333333333333333333333333300000000000000008b78c6d8",
+  "roles_storage_key": "0xf6882f2cabea9eb100ca4ed8847c87f0e39a87c5c6fd5c03c87ae070c084b7e2",
+  "minter_role_mask": "1",
+  "roles_source_sha256": "376ac3f09e64d7c2c10ac90cae16a771bd30c38a17f05b6e361a2ebae87cca7b",
+  "collateral_source_sha256": "05a82b0702ef65e1327b517d9273e2f343cf61791d2bf787bc08e734bfe2ad87",
+  "module_pusd_balance_key": "0x0a5fdb825949145b03ce661f42727ba1f1ce871640f4c5d1fbd06ef66688fa13",
+  "module_position_balance_keys": [
+    "0xcda748dc0493e3da5980283f818de2b854ccfa0cb40ce5e7b5821cacb2e1809a",
+    "0x157885bea278f7f6f62bcc2350db7449d13c781c51a02bf8d288d09cbcd728f8"
+  ],
+  "fixture_signing_key_byte": 66,
+  "independent_fixture_owner": "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+  "normalized_redeem_floor_cases": [
+    {
+      "numerator": "333333",
+      "denominator": "1000000",
+      "amount": "3",
+      "payout": "0"
+    },
+    {
+      "numerator": "666667",
+      "denominator": "1000000",
+      "amount": "3",
+      "payout": "2"
+    }
+  ],
+  "pusd_roles_updated_event": {
+    "abi": {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "user",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "roles",
+          "type": "uint256"
+        }
+      ],
+      "name": "RolesUpdated",
+      "type": "event"
+    },
+    "signature": "RolesUpdated(address,uint256)",
+    "topic": "0x715ad5ce61fc9595c7b415289d59cf203f23a94fa06f04af7e489a0a76e1fe26"
+  }
+}
