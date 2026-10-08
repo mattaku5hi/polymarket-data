@@ -1,0 +1,172 @@
+{
+  "provenance": "Independently checked pinned solc packets and Solidity/Solady source; synthetic vector, no deployed chronology or live authority.",
+  "source_policy_version": "fifth-exchange-rooted-control-state/1",
+  "packets": [
+    {
+      "version": "641b",
+      "compiler_input_sha256": "5ed0ac27b5943be319d7955b5a7438293dd49e554b102a70e4bd0a5b8de12b71",
+      "compiler_output_sha256": "4a423b0e69b7db14e97a88fb7d2d812ff70ddde4ca2d5bd7ca10605bca400a1b",
+      "exchange_source_sha256": "698f29ff5c659e7f54cb98bfe206bddd19d62e7dfbe9bddfe3f06e6d5cfadcd0",
+      "ownable_roles_source_sha256": "376ac3f09e64d7c2c10ac90cae16a771bd30c38a17f05b6e361a2ebae87cca7b",
+      "control_storage_layout": {
+        "paused": [
+          "0",
+          0,
+          "t_bool"
+        ],
+        "userPauseBlockInterval": [
+          "1",
+          0,
+          "t_uint256"
+        ],
+        "userPausedBlockAt": [
+          "3",
+          0,
+          "t_mapping(t_address,t_uint256)"
+        ]
+      }
+    },
+    {
+      "version": "7345",
+      "compiler_input_sha256": "d22999eada395aeab67433cf8c787d28ce06f4b843b28107338f182934737b28",
+      "compiler_output_sha256": "ead3c268442929531bf5dbbf4be9676e49bf722c78865c75667674dc0d9cdea0",
+      "exchange_source_sha256": "2a5b07912e338f9729bc319eaa494dc1bdce087a1bc4d5eec6c357b44048dc81",
+      "ownable_roles_source_sha256": "376ac3f09e64d7c2c10ac90cae16a771bd30c38a17f05b6e361a2ebae87cca7b",
+      "control_storage_layout": {
+        "paused": [
+          "0",
+          0,
+          "t_bool"
+        ],
+        "userPauseBlockInterval": [
+          "1",
+          0,
+          "t_uint256"
+        ],
+        "userPausedBlockAt": [
+          "3",
+          0,
+          "t_mapping(t_address,t_uint256)"
+        ]
+      }
+    }
+  ],
+  "operator_role_mask": "0x2",
+  "admin_role_mask": "0x1",
+  "selected_abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_usr",
+          "type": "address"
+        }
+      ],
+      "name": "isOperator",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_user",
+          "type": "address"
+        }
+      ],
+      "name": "isUserPaused",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "paused",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "user",
+          "type": "address"
+        }
+      ],
+      "name": "rolesOf",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "roles",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "userPauseBlockInterval",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "name": "userPausedBlockAt",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "vector": {
+    "submitter": "0x1111111111111111111111111111111111111111",
+    "maker": "0x2222222222222222222222222222222222222222",
+    "storage_keys": [
+      "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "0x3b201b37f7f0462fb8fdc664ac33af91eec2da626905eb3da809c4f044b171f0",
+      "0x53af42d0a8bf5903ecbc159ba2f6e0fa2dc0165bfe911ace311677c562114276"
+    ]
+  },
+  "maker_pause_predicate": "activation > 0 && U256(block_number) >= activation",
+  "interval_is_raw_observation": true
+}

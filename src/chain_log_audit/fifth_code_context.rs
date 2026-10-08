@@ -497,10 +497,11 @@ pub(super) mod tests {
         responses: Arc<Mutex<Vec<Value>>>,
         chain_id: &'static str,
         gate_pm_proof: bool,
+        gate_control_proof: bool,
         gate: Arc<ProofGate>,
     }
 
-    struct ProofGate {
+    pub(in crate::chain_log_audit) struct ProofGate {
         started: AtomicUsize,
         started_notify: Notify,
         release: watch::Sender<bool>,
@@ -516,10 +517,14 @@ pub(super) mod tests {
             })
         }
 
-        async fn wait_until_started(&self, count: usize) {
+        pub(in crate::chain_log_audit) async fn wait_until_started(&self, count: usize) {
             while self.started.load(Ordering::Acquire) < count {
                 self.started_notify.notified().await;
             }
+        }
+
+        pub(in crate::chain_log_audit) fn release(&self) {
+            self.release.send_replace(true);
         }
 
         async fn stop(&self) {
@@ -556,7 +561,34 @@ pub(super) mod tests {
                 if fixture.gate_pm_proof && address == POSITION_MANAGER_IMPLEMENTATION {
                     fixture.gate.stop().await;
                 }
-                fixture.proofs.get(&address).cloned().unwrap_or(Value::Null)
+                if fixture.gate_control_proof
+                    && address == EXCHANGE_PROXY
+                    && params[1].as_array().is_some_and(|keys| keys.len() == 4)
+                {
+                    fixture.gate.stop().await;
+                }
+                fixture
+                    .proofs
+                    .get(&address)
+                    .cloned()
+                    .map(|mut proof| {
+                        if let Some(requested) = params[1].as_array() {
+                            let requested = requested
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_ascii_lowercase)
+                                .collect::<std::collections::BTreeSet<_>>();
+                            if let Some(entries) = proof["storageProof"].as_array_mut() {
+                                entries.retain(|entry| {
+                                    entry["key"].as_str().is_some_and(|key| {
+                                        requested.contains(&key.to_ascii_lowercase())
+                                    })
+                                });
+                            }
+                        }
+                        proof
+                    })
+                    .unwrap_or(Value::Null)
             }
             _ => Value::Null,
         };
@@ -579,7 +611,7 @@ pub(super) mod tests {
         (endpoint, task)
     }
 
-    async fn test_wall_timeout(duration: Duration) {
+    pub(in crate::chain_log_audit) async fn test_wall_timeout(duration: Duration) {
         let deadline = Instant::now() + duration;
         while Instant::now() < deadline {
             tokio::task::yield_now().await;
@@ -590,36 +622,67 @@ pub(super) mod tests {
         version: FifthExchangeImplementationVersion,
         options: ProofOptions,
     ) -> RootedFixture {
+        rooted_fixture_with_storage(version, options, &[])
+    }
+
+    fn rooted_fixture_with_storage(
+        version: FifthExchangeImplementationVersion,
+        options: ProofOptions,
+        exchange_storage: &[(B256, U256)],
+    ) -> RootedFixture {
         let slot = parse_fixed_b256(ERC1967_IMPLEMENTATION_SLOT).unwrap();
-        let proxy_account = |address: &str, implementation: &str, code_hash: B256| {
+        let proxy_account = |address: &str,
+                             implementation: &str,
+                             code_hash: B256,
+                             additional_storage: &[(B256, U256)]| {
             let implementation_bytes = hex::decode(&implementation[2..]).unwrap();
-            let trie_key = B256::from_slice(&sha3::Keccak256::digest(slot.as_slice()));
-            let trie_path = alloy_trie::Nibbles::unpack(trie_key);
-            let mut storage =
-                HashBuilder::default().with_proof_retainer(ProofRetainer::from_iter([trie_path]));
-            storage.add_leaf(
-                trie_path,
-                &alloy_rlp::encode(implementation_bytes.as_slice()),
-            );
+            let mut storage_values = vec![(slot, U256::from_be_slice(&implementation_bytes))];
+            storage_values.extend_from_slice(additional_storage);
+            storage_values.sort_by_key(|(key, _)| {
+                alloy_trie::Nibbles::unpack(B256::from_slice(&sha3::Keccak256::digest(
+                    key.as_slice(),
+                )))
+            });
+            let storage_paths = storage_values
+                .iter()
+                .map(|(key, _)| {
+                    alloy_trie::Nibbles::unpack(B256::from_slice(&sha3::Keccak256::digest(
+                        key.as_slice(),
+                    )))
+                })
+                .collect::<Vec<_>>();
+            let mut storage = HashBuilder::default()
+                .with_proof_retainer(ProofRetainer::from_iter(storage_paths.iter().copied()));
+            for ((_, value), path) in storage_values.iter().zip(&storage_paths) {
+                if !value.is_zero() {
+                    storage.add_leaf(*path, &rlp_u256(*value));
+                }
+            }
             let storage_root = storage.root();
             let storage_nodes = storage.take_proof_nodes();
-            let storage_proof = storage_nodes
-                .matching_nodes_sorted(&trie_path)
-                .into_iter()
-                .map(|(_, node)| format!("0x{}", hex::encode(node)))
-                .collect::<Vec<_>>();
             let account = TrieAccount {
                 nonce: 1,
                 balance: U256::ZERO,
                 storage_root,
                 code_hash,
             };
-            let slot_entry = json!({
-                "key": format!("{slot:#x}"),
-                "value": format!("0x{}", hex::encode(implementation_bytes)),
-                "proof": storage_proof,
-            });
-            (address.to_owned(), account, Some(slot_entry))
+            let slot_entries = storage_values
+                .iter()
+                .zip(&storage_paths)
+                .map(|((key, value), path)| {
+                    let proof = storage_nodes
+                        .matching_nodes_sorted(path)
+                        .into_iter()
+                        .map(|(_, node)| format!("0x{}", hex::encode(node)))
+                        .collect::<Vec<_>>();
+                    json!({
+                        "key": format!("{key:#x}"),
+                        "value": format!("{value:#x}"),
+                        "proof": proof,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (address.to_owned(), account, Some(slot_entries))
         };
         let implementation_account = |address: &str, code_hash: B256| {
             (
@@ -639,6 +702,7 @@ pub(super) mod tests {
                 EXCHANGE_PROXY,
                 &options.exchange_slot_address,
                 options.exchange_proxy_code_hash,
+                exchange_storage,
             ),
             implementation_account(
                 exchange_source_binding(version).0,
@@ -648,6 +712,7 @@ pub(super) mod tests {
                 POSITION_MANAGER_PROXY,
                 &options.pm_slot_address,
                 options.pm_proxy_code_hash,
+                &[],
             ),
             implementation_account(POSITION_MANAGER_IMPLEMENTATION, options.pm_code_hash),
         ];
@@ -694,7 +759,7 @@ pub(super) mod tests {
                     "storageHash": format!("{:#x}", account.storage_root),
                     "codeHash": format!("{:#x}", account.code_hash),
                     "accountProof": account_proof,
-                    "storageProof": slot.into_iter().collect::<Vec<_>>(),
+                    "storageProof": slot.into_iter().flatten().collect::<Vec<_>>(),
                 });
                 (address, proof)
             })
@@ -721,6 +786,7 @@ pub(super) mod tests {
             responses: Arc::new(Mutex::new(Vec::new())),
             chain_id: "0x89",
             gate_pm_proof: false,
+            gate_control_proof: false,
             gate: ProofGate::new(),
         }
     }
@@ -762,7 +828,88 @@ pub(super) mod tests {
         )
     }
 
-    fn rpc_rows(responses: &[Value]) -> Vec<Value> {
+    pub(in crate::chain_log_audit) async fn rooted_exchange_controls_pair(
+        version: FifthExchangeImplementationVersion,
+        keys_and_values: &[(B256, U256)],
+        gate_control_proof: bool,
+        mutation: Option<&str>,
+    ) -> (
+        ChainLogVerifier,
+        JoinHandle<()>,
+        JoinHandle<()>,
+        Arc<Mutex<Vec<Value>>>,
+        Arc<Mutex<Vec<Value>>>,
+        Arc<ProofGate>,
+        String,
+    ) {
+        let mut primary =
+            rooted_fixture_with_storage(version, ProofOptions::valid(version), keys_and_values);
+        if let Some(mutation) = mutation {
+            mutate_exchange_storage_proof(&mut primary, mutation);
+        }
+        primary.gate_control_proof = gate_control_proof;
+        let mut secondary =
+            rooted_fixture_with_storage(version, ProofOptions::valid(version), keys_and_values);
+        if let Some(mutation) = mutation {
+            mutate_exchange_storage_proof(&mut secondary, mutation);
+        }
+        secondary.gate_control_proof = gate_control_proof;
+        secondary.gate = primary.gate.clone();
+        let gate = primary.gate.clone();
+        let expected_hash = primary.block_header["hash"]
+            .as_str()
+            .expect("fixture hash")
+            .to_owned();
+        let (verifier, primary_server, secondary_server, primary_calls, secondary_calls) =
+            verifier_pair(primary, secondary).await;
+        (
+            verifier,
+            primary_server,
+            secondary_server,
+            primary_calls,
+            secondary_calls,
+            gate,
+            expected_hash,
+        )
+    }
+
+    fn mutate_exchange_storage_proof(fixture: &mut RootedFixture, mutation: &str) {
+        let proof = fixture.proofs.get_mut(EXCHANGE_PROXY).unwrap();
+        let implementation_slot = format!(
+            "{:#x}",
+            parse_fixed_b256(ERC1967_IMPLEMENTATION_SLOT).unwrap()
+        );
+        let target_index = proof["storageProof"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|entry| entry["key"] != implementation_slot)
+            .unwrap();
+        match mutation {
+            "missing" => {
+                proof["storageProof"]
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(target_index);
+            }
+            "extra" => {
+                let entries = proof["storageProof"].as_array_mut().unwrap();
+                let duplicate = entries[target_index].clone();
+                entries.push(duplicate);
+            }
+            "wrong_key" => {
+                proof["storageProof"][target_index]["key"] =
+                    json!(format!("0x{}", "77".repeat(32)));
+            }
+            "wrong_value" => proof["storageProof"][target_index]["value"] = json!("0x1"),
+            "corrupt_storage_proof" => proof["storageProof"][target_index]["proof"] = json!([]),
+            "wrong_account" => proof["address"] = json!(POSITION_MANAGER_PROXY),
+            "wrong_code_hash" => proof["codeHash"] = json!(format!("0x{}", "77".repeat(32))),
+            _ => unreachable!(),
+        };
+    }
+
+    pub(in crate::chain_log_audit) fn rpc_rows(responses: &[Value]) -> Vec<Value> {
         let mut unique = BTreeMap::new();
         for response in responses {
             let key =

@@ -74,8 +74,10 @@ All modules are read-only. No private keys, submitted orders, wallet spending,
 complete ExecutionQuote, fee discovery, FX conversion, history completeness or
 qualification is supplied. Chain observations retain their narrow source policy
 and mismatch/unavailable states; a proof for one contract/path does not validate
-unsupported products. The fifth Exchange control observer is an in-progress
-compile-checked API; rooted acceptance fixtures remain subsequent work.
+unsupported products. The fifth Exchange control observer proves current role and pause words under
+a shared budget and deadline. Its sealed context can be reused internally;
+rooted current/prior fixtures cover exact limits, cancellation and malformed
+proofs. Current point state does not establish control state at a trade call.
 
 Polydoghound consumes these modules through thin local trait/domain adapters.
 Polyazimuth can consume gross-depth acquisition through its observation consumer
