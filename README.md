@@ -70,6 +70,14 @@ Optional features keep a single reusable implementation:
 | `chain-audit` | `chain_log_audit`, `activity_hints` | Budgeted independent-provider rooted evidence, signed transaction/receipt binding, source-specific CTF/fifth contracts |
 
 Core, `streams` and `gamma` support Rust 1.85. `chain-audit` requires Rust 1.88.
+Signed transaction binding supports legacy, EIP-2930, EIP-1559 and EIP-7702
+envelopes. Type-4 authorization tuples stay in the signed payload; binding them
+does not establish authorization validity or expand supported contract targets.
+Failed Polygon receipts may contain one shape- and bloom-checked native Bor
+`LogFeeTransfer` event, retained in the receipt root; other failed-receipt logs
+are rejected. Native gas uses the signed fee terms and receipt gas delta, rather
+than the deprecated fee-event payload. Receipt, interval and native-gas policy
+versions are `/2`; fill and asset-movement decoder policies are unchanged.
 All modules are read-only. Execution quotes below expose modeled API fees and
 cash totals with local expiry. No submitted orders, wallet spending, guaranteed
 settlement, FX conversion, history completeness or qualification is supplied.

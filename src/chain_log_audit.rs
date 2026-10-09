@@ -164,6 +164,9 @@ const MAX_BLOCKS: u64 = 16;
 const MAX_BRIDGE_BLOCKS: u64 = 64;
 const MAX_VERSION_TRACE_BLOCKS: u64 = 4096;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const BOR_FEE_LOG_ADDRESS: &str = "0x0000000000000000000000000000000000001010";
+const BOR_FEE_LOG_TOPIC: &str =
+    "0x4dfe1bbbcf077ddc3e01291eea2d5c70c2b422b415d95645b9adcfd678cb1d63";
 const PROXY_IMPLEMENTATION_SLOT: &str =
     "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 const CTF_CONDITIONAL_TOKENS_ADDRESS: &str = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
@@ -207,7 +210,7 @@ const V1_MATCH_ORDERS_SELECTOR: [u8; 4] = [0xe6, 0x0f, 0x0c, 0x05];
 pub const V1_TRADE_ATTRIBUTION_POLICY_VERSION: &str =
     "v1-direct-and-bounded-multi-maker-complementary-match-root-bound/3";
 pub const NATIVE_GAS_OBSERVATION_POLICY_VERSION: &str =
-    "polygon-root-bound-signed-envelope-receipt-gas/1";
+    "polygon-root-bound-signed-envelope-receipt-gas/2";
 pub const V1_DIRECT_FILL_ATTRIBUTION_POLICY_VERSION: &str =
     "v1-direct-fill-root-bound-call-context-three-log/1";
 pub const USDC_E_PROXY_BALANCE_OBSERVER_POLICY_VERSION: &str =
@@ -2998,8 +3001,8 @@ struct VerifiedReceiptBlock {
 /// Decoder contract included in any transaction-evidence reuse context.
 pub const ORDER_OWNER_FILL_DECODER_POLICY_VERSION: &str = "ctf-order-owner-v1-v2/1";
 pub const MOVEMENT_DECODER_POLICY_VERSION: &str = "erc20-transfer-erc1155-single-batch-strict/1";
-pub const RECEIPT_OBSERVER_POLICY_VERSION: &str = "root-bound-raw-receipt-movements/1";
-pub const RECEIPT_INTERVAL_POLICY_VERSION: &str = "root-bound-complete-raw-receipt-interval/1";
+pub const RECEIPT_OBSERVER_POLICY_VERSION: &str = "root-bound-raw-receipt-movements/2";
+pub const RECEIPT_INTERVAL_POLICY_VERSION: &str = "root-bound-complete-raw-receipt-interval/2";
 
 pub struct ChainLogVerifier {
     client: reqwest::Client,
@@ -6710,6 +6713,55 @@ fn signed_transaction_access_list(value: &Value) -> Result<Vec<u8>, ChainLogAudi
     Ok(rlp_list(&encoded_entries))
 }
 
+fn signed_authorization_list(value: &Value) -> Result<Vec<u8>, ChainLogAuditError> {
+    let entries = value
+        .get("authorizationList")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .ok_or(ChainLogAuditError::Unverified)?;
+    let mut encoded_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let object = entry.as_object().ok_or(ChainLogAuditError::Unverified)?;
+        if object.keys().any(|key| {
+            !["chainId", "address", "nonce", "yParity", "v", "r", "s"].contains(&key.as_str())
+        }) {
+            return Err(ChainLogAuditError::Unverified);
+        }
+        let chain_id = signed_transaction_quantity_text(field(entry, "chainId")?)?;
+        let address = validate_hex(field(entry, "address")?, 20)?;
+        let address = hex::decode(&address[2..]).map_err(|_| ChainLogAuditError::Unverified)?;
+        let nonce = u256_to_u64(signed_transaction_quantity_text(field(entry, "nonce")?)?)?;
+        let parity = |name| {
+            entry
+                .get(name)
+                .map(signed_transaction_quantity)
+                .transpose()?
+                .map(u256_to_u64)
+                .transpose()
+                .map_err(|_| ChainLogAuditError::Unverified)
+        };
+        let y_parity = parity("yParity")?;
+        let v = parity("v")?;
+        let parity = match (v, y_parity) {
+            (Some(v), Some(y)) if v == y => v,
+            (Some(v), None) | (None, Some(v)) => v,
+            _ => return Err(ChainLogAuditError::Unverified),
+        };
+        let parity = u8::try_from(parity).map_err(|_| ChainLogAuditError::Unverified)?;
+        let r = signed_transaction_quantity_text(field(entry, "r")?)?;
+        let s = signed_transaction_quantity_text(field(entry, "s")?)?;
+        encoded_entries.push(rlp_list(&[
+            rlp_u256(chain_id),
+            alloy_rlp::encode(address.as_slice()),
+            rlp_u256(U256::from(nonce)),
+            rlp_u256(U256::from(parity)),
+            rlp_u256(r),
+            rlp_u256(s),
+        ]));
+    }
+    Ok(rlp_list(&encoded_entries))
+}
+
 fn optional_signature_parity(value: &Value) -> Result<Option<u64>, ChainLogAuditError> {
     value
         .get("yParity")
@@ -6751,18 +6803,18 @@ fn encode_signed_transaction_with_sender_recovery(
         Some(kind) => u8::try_from(u256_to_u64(signed_transaction_quantity(kind)?)?)
             .map_err(|_| ChainLogAuditError::Unverified)?,
     };
-    if transaction_type > 2
-        || [
-            "maxFeePerBlobGas",
-            "blobVersionedHashes",
-            "authorizationList",
-        ]
-        .iter()
-        .any(|name| value.get(*name).is_some())
+    if !matches!(transaction_type, 0..=2 | 4)
+        || ["maxFeePerBlobGas", "blobVersionedHashes"]
+            .iter()
+            .any(|name| value.get(*name).is_some())
+        || (transaction_type != 4 && value.get("authorizationList").is_some())
     {
         return Err(ChainLogAuditError::Unverified);
     }
     let to = signed_transaction_to(value)?;
+    if transaction_type == 4 && to.len() != 20 {
+        return Err(ChainLogAuditError::Unverified);
+    }
     let input = signed_transaction_input(value)?;
     let mut fields = Vec::new();
     let chain_id;
@@ -6798,7 +6850,7 @@ fn encode_signed_transaction_with_sender_recovery(
             chain_id = None;
             fields.push(rlp_u256(v));
         }
-        1 | 2 => {
+        1 | 2 | 4 => {
             let typed_chain_id = signed_transaction_quantity_text(field(value, "chainId")?)?;
             chain_id = Some(typed_chain_id);
             fields.push(rlp_u256(typed_chain_id));
@@ -6836,6 +6888,10 @@ fn encode_signed_transaction_with_sender_recovery(
             )?)?));
             fields.push(alloy_rlp::encode(input.as_slice()));
             fields.push(signed_transaction_access_list(value)?);
+            if transaction_type == 4 {
+                // EIP-7702 commits tuples Bor may skip when their signatures are invalid.
+                fields.push(signed_authorization_list(value)?);
+            }
             let v = value
                 .get("v")
                 .map(signed_transaction_quantity)
@@ -6947,7 +7003,7 @@ fn root_bound_native_gas_terms(
             transaction,
             "gasPrice",
         )?)?),
-        2 => RootBoundGasPrice::Dynamic {
+        2 | 4 => RootBoundGasPrice::Dynamic {
             max_fee: signed_transaction_quantity_text(field(transaction, "maxFeePerGas")?)?,
             max_priority_fee: signed_transaction_quantity_text(field(
                 transaction,
@@ -7014,6 +7070,68 @@ fn validate_transaction_chain_id(
     Ok(())
 }
 
+fn is_bor_fee_log(row: &Value) -> Result<bool, ChainLogAuditError> {
+    if validate_hex(field(row, "address")?, 20)? != BOR_FEE_LOG_ADDRESS {
+        return Ok(false);
+    }
+    let topics = row
+        .get("topics")
+        .and_then(Value::as_array)
+        .ok_or(ChainLogAuditError::Unverified)?;
+    if topics.len() != 4
+        || validate_hex(
+            topics[0].as_str().ok_or(ChainLogAuditError::Unverified)?,
+            32,
+        )? != BOR_FEE_LOG_TOPIC
+    {
+        return Ok(false);
+    }
+    let fee_address_topic = format!("0x{}{}", "00".repeat(12), &BOR_FEE_LOG_ADDRESS[2..]);
+    if validate_hex(
+        topics[1].as_str().ok_or(ChainLogAuditError::Unverified)?,
+        32,
+    )? != fee_address_topic
+    {
+        return Ok(false);
+    }
+    for topic in &topics[2..] {
+        let topic = validate_hex(topic.as_str().ok_or(ChainLogAuditError::Unverified)?, 32)?;
+        if !topic[2..26].bytes().all(|byte| byte == b'0') {
+            return Ok(false);
+        }
+    }
+    let data = validate_hex_data_with_limit(field(row, "data")?, MAX_RESPONSE_BYTES)?;
+    // Bor v2.10.2 (9c445ef) emits this system log only for a positive tip.
+    Ok(data.len() == 2 + 160 * 2 && !data[2..66].bytes().all(|byte| byte == b'0'))
+}
+
+fn log_bloom_add(bloom: &mut [u8], value: &[u8]) {
+    let hash = Keccak256::digest(value);
+    for offset in [0, 2, 4] {
+        let bit = (usize::from(hash[offset]) << 8 | usize::from(hash[offset + 1])) & 2047;
+        bloom[255 - bit / 8] |= 1 << (bit % 8);
+    }
+}
+
+fn receipt_logs_bloom(rows: &[Value]) -> Result<Vec<u8>, ChainLogAuditError> {
+    let mut bloom = vec![0_u8; 256];
+    for row in rows {
+        log_bloom_add(&mut bloom, &receipt_hex(row, "address", 20)?);
+        for topic in row
+            .get("topics")
+            .and_then(Value::as_array)
+            .ok_or(ChainLogAuditError::Unverified)?
+        {
+            let topic = validate_hex(topic.as_str().ok_or(ChainLogAuditError::Unverified)?, 32)?;
+            log_bloom_add(
+                &mut bloom,
+                &hex::decode(&topic[2..]).map_err(|_| ChainLogAuditError::Unverified)?,
+            );
+        }
+    }
+    Ok(bloom)
+}
+
 fn encode_receipts(
     receipts: &[Value],
     transactions: &[Value],
@@ -7060,7 +7178,11 @@ fn encode_receipts(
             .get("logs")
             .and_then(Value::as_array)
             .ok_or(ChainLogAuditError::Unverified)?;
-        if status == 0 && !rows.is_empty() {
+        // Bor v2.10.2 appends one positive-tip system fee log after EVM failure.
+        if status == 0
+            && !rows.is_empty()
+            && (rows.len() != 1 || !is_bor_fee_log(&rows[0])? || receipt_logs_bloom(rows)? != bloom)
+        {
             return Err(ChainLogAuditError::Unverified);
         }
         let mut encoded_logs = Vec::with_capacity(rows.len());
@@ -10783,7 +10905,26 @@ mod receipt_tests {
                 alloy_rlp::encode([]),
                 rlp_list(&[]),
             ],
-            _ => panic!("fixture supports only transaction types 0, 1, and 2"),
+            4 => vec![
+                rlp_u256(U256::from(CHAIN_ID)),
+                rlp_u256(U256::from(nonce)),
+                rlp_u256(max_priority_fee),
+                rlp_u256(max_fee),
+                rlp_u256(U256::from(gas_limit)),
+                alloy_rlp::encode(to_bytes.as_slice()),
+                rlp_u256(U256::ZERO),
+                alloy_rlp::encode([]),
+                rlp_list(&[]),
+                rlp_list(&[rlp_list(&[
+                    rlp_u256(U256::from(CHAIN_ID)),
+                    alloy_rlp::encode([0x33_u8; 20].as_slice()),
+                    rlp_u256(U256::ZERO),
+                    rlp_u256(U256::from(2_u8)),
+                    rlp_u256(U256::ZERO),
+                    rlp_u256(U256::ZERO),
+                ])]),
+            ],
+            _ => panic!("fixture supports only transaction types 0, 1, 2, and 4"),
         };
         let mut signing_payload = Vec::new();
         if transaction_type == 0 {
@@ -10835,6 +10976,19 @@ mod receipt_tests {
                 transaction["maxFeePerGas"] = json!(format!("{max_fee:#x}"));
                 transaction["maxPriorityFeePerGas"] = json!(format!("{max_priority_fee:#x}"));
                 transaction["accessList"] = json!([]);
+                transaction["yParity"] = json!(format!("{parity:#x}"));
+            }
+            4 => {
+                transaction["type"] = json!("0x4");
+                transaction["chainId"] = json!(format!("{CHAIN_ID:#x}"));
+                transaction["maxFeePerGas"] = json!(format!("{max_fee:#x}"));
+                transaction["maxPriorityFeePerGas"] = json!(format!("{max_priority_fee:#x}"));
+                transaction["accessList"] = json!([]);
+                transaction["authorizationList"] = json!([{
+                    "chainId": format!("{CHAIN_ID:#x}"),
+                    "address": format!("0x{}", "33".repeat(20)),
+                    "nonce": "0x0", "yParity": "0x2", "r": "0x0", "s": "0x0"
+                }]);
                 transaction["yParity"] = json!(format!("{parity:#x}"));
             }
             _ => unreachable!(),
@@ -12246,6 +12400,36 @@ mod receipt_tests {
         })
     }
 
+    fn type_four_test_transaction() -> (Value, String) {
+        signed_polygon_native_gas_transaction(
+            4,
+            0x42,
+            0,
+            50_000,
+            U256::ZERO,
+            U256::from(70),
+            U256::from(7),
+        )
+    }
+
+    fn bor_fee_log_row(block_hash: &str, transaction_hash: &str) -> Value {
+        json!({
+            "address": BOR_FEE_LOG_ADDRESS,
+            "transactionHash": transaction_hash,
+            "blockNumber": "0x64",
+            "blockHash": block_hash,
+            "logIndex": "0x0",
+            "removed": false,
+            "topics": [
+                BOR_FEE_LOG_TOPIC,
+                address_topic(BOR_FEE_LOG_ADDRESS),
+                address_topic("0x1111111111111111111111111111111111111111"),
+                address_topic("0x2222222222222222222222222222222222222222")
+            ],
+            "data": format!("0x{:064x}{}", 1, "00".repeat(128))
+        })
+    }
+
     #[test]
     fn published_legacy_transaction_vector_encodes_and_hashes_exactly() {
         let encoded = encode_signed_transaction(&published_eip155_legacy_transaction()).unwrap();
@@ -12294,7 +12478,7 @@ mod receipt_tests {
         assert!(encode_signed_transaction(&transaction).is_err());
 
         let typed = published_eip2930_transaction();
-        for kind in ["0x3", "0x4", "0x5", "0x7f"] {
+        for kind in ["0x3", "0x5", "0x7f"] {
             let mut unsupported = typed.clone();
             unsupported["type"] = json!(kind);
             assert!(encode_signed_transaction(&unsupported).is_err());
@@ -12329,6 +12513,139 @@ mod receipt_tests {
         let mut explicit_creation = published_eip155_legacy_transaction();
         explicit_creation["to"] = Value::Null;
         assert!(encode_signed_transaction(&explicit_creation).is_ok());
+    }
+
+    #[test]
+    fn type_four_signed_vector_binds_authorizations_and_rejects_bad_outer_shape() {
+        let (transaction, sender) = type_four_test_transaction();
+        let encoded = encode_signed_transaction_with_sender_recovery(&transaction, true).unwrap();
+        assert_eq!(encoded.transaction_type, 4);
+        assert_eq!(encoded.chain_id, Some(U256::from(CHAIN_ID)));
+        assert_eq!(
+            format!("{:#x}", encoded.recovered_sender.unwrap()),
+            sender.to_ascii_lowercase()
+        );
+        assert_eq!(
+            format!("0x{}", hex::encode(&encoded.envelope)),
+            "0x04f880818980074682c3509400000000000000000000000000000000000000028080c0dcdb81899433333333333333333333333333333333333333338002808080a01375491704387e7b34bf72ea07492e420eb3239d9cd266755d0f5dd3f85198eea0076d1ea13d9723d96b679b1c7b118686de4da123f52d36abda2d6cbbf5f1f9a7"
+        );
+        assert_eq!(
+            format!("{:#x}", encoded.hash),
+            "0x09e2f3d333ced12cf8902690f70f2f170e66d8dbdbaac7d7990758a4c4cdad5e"
+        );
+        assert_eq!(
+            format!(
+                "{:#x}",
+                ordered_trie_root_encoded(std::slice::from_ref(&encoded.envelope))
+            ),
+            "0x911b6239de7a380cb2c1b51dbba2d18c33d7b2141b7fc78a4d41eca0e42492a2"
+        );
+        assert_eq!(transaction["authorizationList"][0]["r"], "0x0");
+        assert_eq!(transaction["authorizationList"][0]["s"], "0x0");
+        assert_eq!(transaction["authorizationList"][0]["yParity"], "0x2");
+
+        let mut changed_authorization = transaction.clone();
+        changed_authorization["authorizationList"][0]["nonce"] = json!("0x1");
+        let changed =
+            encode_signed_transaction_with_sender_recovery(&changed_authorization, true).unwrap();
+        assert_ne!(encoded.hash, changed.hash);
+        assert_ne!(
+            ordered_trie_root_encoded(std::slice::from_ref(&encoded.envelope)),
+            ordered_trie_root_encoded(&[changed.envelope])
+        );
+        assert_ne!(changed.recovered_sender, Some(sender.parse().unwrap()));
+
+        let mut empty_authorizations = transaction.clone();
+        empty_authorizations["authorizationList"] = json!([]);
+        assert!(encode_signed_transaction(&empty_authorizations).is_err());
+        let mut contract_creation = transaction.clone();
+        contract_creation["to"] = Value::Null;
+        assert!(encode_signed_transaction(&contract_creation).is_err());
+        let mut wrong_chain = transaction.clone();
+        wrong_chain["chainId"] = json!("0x1");
+        let wrong_chain =
+            encode_signed_transaction_with_sender_recovery(&wrong_chain, true).unwrap();
+        assert!(validate_transaction_chain_id(&wrong_chain).is_err());
+        let mut conflicting_inner_parity = transaction.clone();
+        conflicting_inner_parity["authorizationList"][0]["v"] = json!("0x1");
+        assert!(encode_signed_transaction(&conflicting_inner_parity).is_err());
+        let mut oversized_inner_nonce = transaction.clone();
+        oversized_inner_nonce["authorizationList"][0]["nonce"] = json!("0x10000000000000000");
+        assert!(encode_signed_transaction(&oversized_inner_nonce).is_err());
+        let mut oversized_inner_parity = transaction.clone();
+        oversized_inner_parity["authorizationList"][0]["yParity"] = json!("0x100");
+        assert!(encode_signed_transaction(&oversized_inner_parity).is_err());
+        let mut authorization_on_type_two = published_eip1559_transaction();
+        authorization_on_type_two["authorizationList"] = transaction["authorizationList"].clone();
+        assert!(encode_signed_transaction(&authorization_on_type_two).is_err());
+        for kind in ["0x3", "0x5", "0x7f"] {
+            let mut unsupported = transaction.clone();
+            unsupported["type"] = json!(kind);
+            assert!(encode_signed_transaction(&unsupported).is_err());
+        }
+    }
+
+    #[test]
+    fn bor_status_zero_fee_log_is_shape_limited_and_receipt_root_bound() {
+        let block_hash = format!("0x{}", "aa".repeat(32));
+        let transaction_hash = format!("0x{}", "bb".repeat(32));
+        let fee_log = bor_fee_log_row(&block_hash, &transaction_hash);
+        let rows = vec![fee_log.clone()];
+        let bloom = format!("0x{}", hex::encode(receipt_logs_bloom(&rows).unwrap()));
+        let receipt = json!({
+            "transactionIndex":"0x0", "transactionHash":transaction_hash.clone(),
+            "blockNumber":"0x64", "blockHash":block_hash, "type":"0x4", "status":"0x0",
+            "cumulativeGasUsed":"0x5208", "logsBloom":bloom, "logs":rows
+        });
+        let encoded = encode_receipts(
+            std::slice::from_ref(&receipt),
+            &[json!(transaction_hash)],
+            100,
+            &block_hash,
+        )
+        .unwrap();
+        assert_eq!(encoded.types, vec![4]);
+        assert_eq!(encoded.encoded[0][0], 4);
+        assert_eq!(encoded.receipt_logs.len(), 1);
+        assert_eq!(encoded.receipt_logs[0].address(), BOR_FEE_LOG_ADDRESS);
+        assert_eq!(
+            format!("{:#x}", ordered_trie_root_encoded(&encoded.encoded)),
+            "0x9a288aa6f0adf3501c8a758cb50be8551465bd9e1592de299abbf8a1fd56bbbe"
+        );
+
+        let mut wrong_emitter = receipt.clone();
+        wrong_emitter["logs"][0]["address"] = json!("0x3333333333333333333333333333333333333333");
+        let mut wrong_topic = receipt.clone();
+        wrong_topic["logs"][0]["topics"][0] = json!(format!("0x{}", "00".repeat(32)));
+        let mut wrong_fee_address_topic = receipt.clone();
+        wrong_fee_address_topic["logs"][0]["topics"][1] =
+            json!(address_topic("0x3333333333333333333333333333333333333333"));
+        let mut wrong_sender_padding = receipt.clone();
+        wrong_sender_padding["logs"][0]["topics"][2] = json!(format!("0x01{}", "11".repeat(31)));
+        let mut wrong_data_length = receipt.clone();
+        wrong_data_length["logs"][0]["data"] = json!("0x");
+        let mut zero_fee = receipt.clone();
+        zero_fee["logs"][0]["data"] = json!(format!("0x{}{}", "00".repeat(32), "00".repeat(128)));
+        let mut wrong_bloom = receipt.clone();
+        wrong_bloom["logsBloom"] = json!(format!("0x{}", "00".repeat(256)));
+        let mut extra_log = receipt.clone();
+        let mut second_log = fee_log;
+        second_log["logIndex"] = json!("0x1");
+        extra_log["logs"].as_array_mut().unwrap().push(second_log);
+        for invalid in [
+            wrong_emitter,
+            wrong_topic,
+            wrong_fee_address_topic,
+            wrong_sender_padding,
+            wrong_data_length,
+            zero_fee,
+            wrong_bloom,
+            extra_log,
+        ] {
+            assert!(
+                encode_receipts(&[invalid], &[json!(transaction_hash)], 100, &block_hash).is_err()
+            );
+        }
     }
 
     #[test]
@@ -16539,7 +16856,7 @@ mod receipt_tests {
         let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
         let cancel_owner = owner_text.clone();
         let cancel_intervals = intervals.clone();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             verifier
                 .verify_v1_trade_attribution_intervals_with_ctf_operations_bounded(
                     &cancel_owner,
@@ -16551,7 +16868,10 @@ mod receipt_tests {
                 )
                 .await
         });
-        gate.started.notified().await;
+        tokio::select! {
+            _ = gate.started.notified() => {}
+            result = &mut task => panic!("verification ended before cancellation proof gate: {result:?}"),
+        }
         let sent = cancel_fixture.requests.load(Ordering::Relaxed);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
@@ -21874,6 +22194,15 @@ mod receipt_tests {
             U256::from(60),
             U256::from(8),
         );
+        let (type_four, _) = signed_polygon_native_gas_transaction(
+            4,
+            gas_owner_key,
+            4,
+            50_000,
+            U256::ZERO,
+            U256::from(70),
+            U256::from(7),
+        );
         let (other_payer, other_sender) = signed_polygon_native_gas_transaction(
             0,
             0x43,
@@ -21895,12 +22224,13 @@ mod receipt_tests {
                 type_one,
                 type_two_with_untrusted_gas_price,
                 failed_type_two,
+                type_four,
                 other_payer,
             ],
-            receipt_logs: vec![Vec::new(); 5],
-            receipt_statuses: vec![1, 1, 1, 0, 1],
-            cumulative_gas_used: vec![21_000, 44_000, 69_000, 99_000, 121_000],
-            receipt_types: vec![0, 1, 2, 2, 0],
+            receipt_logs: vec![Vec::new(); 6],
+            receipt_statuses: vec![1, 1, 1, 0, 1, 1],
+            cumulative_gas_used: vec![21_000, 44_000, 69_000, 99_000, 127_000, 149_000],
+            receipt_types: vec![0, 1, 2, 2, 4, 0],
             gas_limit: 1_000_000,
             base_fee_per_gas: U256::from(20),
             header_gas_used_override: None,
@@ -21925,7 +22255,7 @@ mod receipt_tests {
         let block = &report.blocks()[0];
         assert!(block.native_gas_available());
         let transactions = block.transactions();
-        assert_eq!(transactions.len(), 5);
+        assert_eq!(transactions.len(), 6);
         let gas = transactions
             .iter()
             .map(|transaction| transaction.native_gas().unwrap())
@@ -21934,19 +22264,19 @@ mod receipt_tests {
             gas.iter()
                 .map(|charge| charge.gas_used())
                 .collect::<Vec<_>>(),
-            [21_000, 23_000, 25_000, 30_000, 22_000].map(U256::from)
+            [21_000, 23_000, 25_000, 30_000, 28_000, 22_000].map(U256::from)
         );
         assert_eq!(
             gas.iter()
                 .map(|charge| charge.effective_gas_price())
                 .collect::<Vec<_>>(),
-            [30, 25, 25, 28, 22].map(U256::from)
+            [30, 25, 25, 28, 27, 22].map(U256::from)
         );
         assert_eq!(
             gas.iter()
                 .map(|charge| charge.charge_base_units())
                 .collect::<Vec<_>>(),
-            [630_000, 575_000, 625_000, 840_000, 484_000].map(U256::from)
+            [630_000, 575_000, 625_000, 840_000, 756_000, 484_000].map(U256::from)
         );
         assert_eq!(
             transactions[0].native_gas().unwrap().recovered_sender(),
@@ -21955,8 +22285,10 @@ mod receipt_tests {
         assert_eq!(transactions[0].status(), 1);
         assert_eq!(transactions[3].status(), 0);
         assert_eq!(gas[3].recovered_sender(), owner);
-        assert_eq!(gas[4].recovered_sender(), other_sender);
-        assert_ne!(gas[4].recovered_sender(), owner);
+        assert_eq!(transactions[4].receipt_type(), 4);
+        assert_eq!(gas[4].recovered_sender(), owner);
+        assert_eq!(gas[5].recovered_sender(), other_sender);
+        assert_ne!(gas[5].recovered_sender(), owner);
 
         for (tamper_header, tamper_cumulative) in [(true, None), (false, Some(2))] {
             let mut tampered = fixture.clone();
