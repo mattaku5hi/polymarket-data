@@ -3,6 +3,8 @@
 //! No order submission, wallet spending or qualified P&L claims.
 
 pub mod clob;
+pub mod position_history;
+pub mod rpc_position_history;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;

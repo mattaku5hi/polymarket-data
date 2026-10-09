@@ -209,6 +209,19 @@ The read-only example acquires Gamma/market/book under a three-request budget:
 BUY input is gross notional before fees; use `sell` for a share quantity. Output
 names modeled cash units and remaining local TTL. It submits no orders.
 
+`position_history::SqdPositionHistoryReader` captures both ERC-1155 holder
+directions from the Polygon finalized stream, retaining sparse-page cursors and
+raw bodies until the fixed caller anchor is reached. `rpc_position_history::`
+`RpcPositionHistoryReader` uses a caller-configured Polygon RPC endpoint: chain,
+finality and before/after anchor checks surround the two full-range log queries.
+Both readers validate CTF/PositionManager filters, preserve separate ledgers,
+reject conflicts and return source observations with literal request, byte and
+deadline budgets. They establish no receipt proof, complete wallet inventory,
+basis, P&L or qualification; unsupported server ranges and backpressure return
+errors with no partial observation. Production provider selection stays with
+the caller. The `position_history` example reads its endpoint from
+`POLYGON_HISTORY_RPC_URL` and prints only source counts, never that endpoint.
+
 `chain_log_audit::bind_fifth_native_execution_assets` joins a sealed rooted
 native Binary observation with a sealed HTTP V2 execution context only when the
 ordered full-width provider asset IDs exactly equal the native pair. It keeps
