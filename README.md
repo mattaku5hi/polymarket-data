@@ -70,9 +70,10 @@ Optional features keep a single reusable implementation:
 | `chain-audit` | `chain_log_audit`, `activity_hints` | Budgeted independent-provider rooted evidence, signed transaction/receipt binding, source-specific CTF/fifth contracts |
 
 Core, `streams` and `gamma` support Rust 1.85. `chain-audit` requires Rust 1.88.
-All modules are read-only. No private keys, submitted orders, wallet spending,
-complete ExecutionQuote, fee discovery, FX conversion, history completeness or
-qualification is supplied. Chain observations retain their narrow source policy
+All modules are read-only. Execution quotes below expose modeled API fees and
+cash totals with local expiry. No submitted orders, wallet spending, guaranteed
+settlement, FX conversion, history completeness or qualification is supplied.
+Chain observations retain their narrow source policy
 and mismatch/unavailable states; a proof for one contract/path does not validate
 unsupported products. The fifth Exchange control observer proves current role and pause words under
 a shared budget and deadline. Its sealed context can be reused internally;
@@ -221,6 +222,17 @@ basis, P&L or qualification; unsupported server ranges and backpressure return
 errors with no partial observation. Production provider selection stays with
 the caller. The `position_history` example reads its endpoint from
 `POLYGON_HISTORY_RPC_URL` and prints only source counts, never that endpoint.
+
+With `chain-audit`, `verify_known_position_balances_bounded` proves an explicit
+set of up to 2,048 full-width CTF/PositionManager IDs at one caller block/hash.
+The same integer in both ledgers remains two assets. It shares code/header
+verification, request budget and deadline across both providers and 64-key proof
+batches; missing keys, bad proofs or disagreement refuse the whole result.
+These are point balances, not a complete wallet universe or accounting report.
+The `known_position_balances` example uses private input/output JSON files and
+`POLYGON_BALANCE_RPC_PRIMARY` / `POLYGON_BALANCE_RPC_SECONDARY`; stdout contains
+counts only. Historical proof retention is a separate endpoint capability from
+historical log availability.
 
 `chain_log_audit::bind_fifth_native_execution_assets` joins a sealed rooted
 native Binary observation with a sealed HTTP V2 execution context only when the

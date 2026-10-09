@@ -50,6 +50,7 @@ mod fifth_native_two_condition_splits;
 mod fifth_native_two_condition_trades;
 mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
+mod known_position_balances;
 mod v1_binary_trades;
 pub use ctf_operations::{
     CtfOperationClassificationEvidence, CtfOperationKind, CtfOperationTransactionFact,
@@ -145,6 +146,11 @@ pub use fifth_receipt_maker_window::{
 pub use fifth_selected_balances::{
     BoundedFifthSelectedBalancesError, FIFTH_SELECTED_BALANCES_POLICY_VERSION,
     FifthSelectedBalancesObservation,
+};
+pub use known_position_balances::{
+    BoundedKnownPositionBalancesError, KNOWN_POSITION_BALANCES_POLICY_VERSION,
+    KnownPositionBalanceId, KnownPositionBalanceNamespace, KnownPositionBalanceRow,
+    KnownPositionBalancesObservation,
 };
 pub use v1_binary_trades::{
     V1BinaryTradeTransactionFact, V1BinaryTradeTransactionStatus, V1BinaryTradesEvidence,
@@ -3029,6 +3035,7 @@ impl ChainLogVerifier {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|_| ChainLogAuditError::InvalidInput)?;
         Ok(Self {

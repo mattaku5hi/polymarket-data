@@ -466,7 +466,7 @@ fn pusd_balance_key(owner: Address) -> B256 {
     B256::from_slice(&Keccak256::digest(preimage))
 }
 
-fn position_manager_balance_key(owner: Address, id: B256) -> B256 {
+pub(super) fn position_manager_balance_key(owner: Address, id: B256) -> B256 {
     let owner_value = U256::from_be_slice(owner.as_slice());
     let seed: U256 = (owner_value << 96_u32) | U256::from(POSITION_MANAGER_BALANCE_SEED);
     let mut preimage = [0_u8; 64];
