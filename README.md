@@ -186,6 +186,29 @@ Callers may supply a positive maximum age to `local_valid_until`; the returned
 monotonic deadline is anchored to the original acquisition start and expires at
 the exact boundary. It does not infer upstream freshness or a venue TTL.
 
+`clob::execution_quote::estimate_execution_quote` calculates a read-only,
+full-depth BUY estimate by gross notional or SELL estimate by shares. It requires
+explicit `feesEnabled` and matching Gamma `feeSchedule` / CLOB `fd` fields for
+positive API fee curves on supported V1 and V2 contexts; disabled fees require
+a consistent explicit zero profile. It uses the market API curve fields and
+does not infer fees from the legacy signed-order `feeRateBps` field.
+The modeled platform fee applies `shares × rate × (price × (1-price))^exponent`
+to each consumed displayed price level and rounds each merged price level upward
+to five decimal places with checked integer-rational arithmetic. This selected
+estimate policy does not claim exchange settlement exactness; the book does not
+expose maker grouping. Builder fees are disabled, the role is Taker, and
+unsupported models refuse. All cash values are labeled `ClobUsdNotional`,
+without a collateral token/address binding or native pUSD claim. BUY quantity is
+floored to 18 decimal places so gross spend stays within budget; the remaining
+budget is returned. Returned total BUY cash and net SELL proceeds are modeled
+estimates and do not relax caller safety gates. `ExecutionQuote::check_validity`
+checks the original local deadline and does not renew it.
+
+The read-only example acquires Gamma/market/book under a three-request budget:
+`cargo run --locked --example execution_quote -- CONDITION_ID ASSET_ID buy 10`.
+BUY input is gross notional before fees; use `sell` for a share quantity. Output
+names modeled cash units and remaining local TTL. It submits no orders.
+
 `chain_log_audit::bind_fifth_native_execution_assets` joins a sealed rooted
 native Binary observation with a sealed HTTP V2 execution context only when the
 ordered full-width provider asset IDs exactly equal the native pair. It keeps

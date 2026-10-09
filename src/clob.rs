@@ -1,6 +1,7 @@
 //! Public CLOB book reads, not executable quotes, simulated fills or fees.
 pub mod depth;
 pub mod execution_context;
+pub mod execution_quote;
 
 use rust_decimal::Decimal;
 use serde_json::Value;
