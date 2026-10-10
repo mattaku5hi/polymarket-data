@@ -287,3 +287,40 @@ modeled fee classification and neutral CLOB cash notation; this is no FX
 conversion or assertion of settled fee amounts. Source-tagged minimum fields
 remain separate observations: market FAK/FOK applicability is unresolved, so
 this binding does not establish venue-minimum validity or trading eligibility.
+
+The quote also exposes the versioned published-client market minimum model via
+`market_minimum_status()`, `market_minimum_basis()` and
+`market_minimum_check_amount()`. Gross-BUY checks its requested gross input;
+all-in BUY checks the resulting modeled gross notional, rather than its cash
+ceiling. BUY requires at least1 in CLOB notional; SELL has `NoClientSellFloor`.
+The all-in mapping is this estimate model's conservative input mapping, not an
+official `maxSpend` or normalized signed-order contract. The inspected frontend
+source SHA-256 is available from `market_minimum_source_sha256()`.
+Endpoint-specific Gamma/book/compact minimum observations remain unchanged and
+are not substituted for this market profile. `venue_minimum_status()` remains
+`Unverified`: a client minimum result does not satisfy a caller's verified
+venue-eligibility gate. Callers must also check the original expiry; below-floor
+quotes remain readable estimates for compatibility.
+
+The rooted native binding adds `quote_share_unit()`, `quote_share_decimals()`
+and `share_unit_policy_version()`. Normalized native position shares use six
+decimals, established by source-bound BinaryModule/BaseModule split/merge
+amount parity and the official native order encoder. This applies to the sealed
+native condition, not legacy migration or generic V1 shares.
+`estimated_buy_received_shares()` returns the modeled BUY quantity without
+subtracting cash-side native fees; SELL returns `None`. It is an estimate of
+received shares at full modeled execution, not a current redeemability or
+future-fill guarantee. `exact_modeled_share_base_units()` returns native units
+only for exactly representable six-decimal quantities; otherwise it returns
+`None` and leaves the 18-decimal estimate untouched. Exact unit conversion is
+separate from tick-dependent signing precision. `vwap_share_denominator()`
+explicitly supplies the gross-share denominator of the fee-exclusive VWAP.
+
+For a consumer handoff, keep the quote condition/asset/index, execution side,
+amount kind, gross values, modeled fees/totals, original times/expiry, book
+identity, model versions and the native binding's units/source identities in one
+immutable record. The application supplies its own quote ID, market/UP-DOWN and
+forecast mapping, selector availability, qualified-clock deadline, latency
+scenario and risk/trading status. Native BUY received shares can serve as a
+modeled full-win payout quantity; other profiles do not inherit that meaning.
+Missing or unverified eligibility stays explicit. No order API is introduced.

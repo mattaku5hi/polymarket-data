@@ -94,7 +94,7 @@ pub use fifth_execution_context::{
 };
 pub use fifth_execution_quote::{
     FIFTH_NATIVE_EXECUTION_QUOTE_BINDING_POLICY_VERSION, FifthNativeExecutionQuoteBinding,
-    FifthNativeExecutionQuoteBindingError, FifthNativeQuoteCashUnit,
+    FifthNativeExecutionQuoteBindingError, FifthNativeQuoteCashUnit, FifthNativeQuoteShareUnit,
     bind_fifth_native_execution_quote,
 };
 pub use fifth_legacy_binary_balances::{

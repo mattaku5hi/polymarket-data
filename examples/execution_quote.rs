@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     quote.check_validity()?;
     println!(
-        "protocol={:?} side={:?} amount_kind={:?} shares={} gross={} estimated_fee={} buy_total={:?} sell_net={:?} unspent_buy_budget={:?} cash_unit={:?} fee_model={} local_ttl_ms={}",
+        "protocol={:?} side={:?} amount_kind={:?} shares={} gross={} estimated_fee={} buy_total={:?} sell_net={:?} unspent_buy_budget={:?} cash_unit={:?} fee_model={} client_minimum={:?} minimum_basis={:?} minimum_check_amount={} venue_minimum={:?} local_ttl_ms={}",
         quote.protocol_version(),
         quote.side(),
         quote.amount_kind(),
@@ -57,6 +57,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         quote.unspent_buy_budget(),
         quote.fee_currency(),
         quote.fee_model_version(),
+        quote.market_minimum_status(),
+        quote.market_minimum_basis(),
+        quote.market_minimum_check_amount(),
+        quote.venue_minimum_status(),
         quote
             .valid_until()
             .saturating_duration_since(tokio::time::Instant::now())

@@ -34,6 +34,31 @@ pub enum ExecutionQuoteAmountKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionQuoteMarketMinimumBasis {
+    RequestedBuyGrossNotional,
+    EstimatedBuyGrossNotional,
+    RequestedSellShares,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionQuoteMarketMinimumStatus {
+    MeetsClientBuyMinimum,
+    BelowClientBuyMinimum,
+    NoClientSellFloor,
+}
+
+/// A client input model does not establish private CLOB minimum validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionQuoteVenueMinimumStatus {
+    Unverified,
+}
+
+const CLIENT_MARKET_BUY_MINIMUM: Decimal = Decimal::ONE;
+const MARKET_MINIMUM_POLICY_VERSION: &str = "polymarket-frontend-market-input-minimum/2026-10-11";
+const MARKET_MINIMUM_SOURCE_SHA256: &str =
+    "bf1323dcfbfdae3ae3c78c6bc9283ec8a57d8d8e26f0bcc3ed3001150e5ecc60";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionQuoteRole {
     Taker,
 }
@@ -114,6 +139,69 @@ impl ExecutionQuote {
     pub const fn requested_amount(&self) -> Decimal {
         self.requested_amount
     }
+    /// Amount used by this published-client market-minimum model. For all-in
+    /// BUY quotes this SDK's modeled gross order amount is the check input; this
+    /// mapping is not an official `maxSpend` contract. It does not establish
+    /// server acceptance or eligibility after fee or signed-amount normalization,
+    /// nor FAK/FOK execution.
+    #[must_use]
+    pub const fn market_minimum_check_amount(&self) -> Decimal {
+        match self.amount_kind {
+            ExecutionQuoteAmountKind::BuyGrossNotional => self.requested_amount,
+            ExecutionQuoteAmountKind::BuyAllInCash => self.gross_notional,
+            ExecutionQuoteAmountKind::SellShares => self.requested_amount,
+        }
+    }
+    #[must_use]
+    pub const fn market_minimum_basis(&self) -> ExecutionQuoteMarketMinimumBasis {
+        match self.amount_kind {
+            ExecutionQuoteAmountKind::BuyGrossNotional => {
+                ExecutionQuoteMarketMinimumBasis::RequestedBuyGrossNotional
+            }
+            ExecutionQuoteAmountKind::BuyAllInCash => {
+                ExecutionQuoteMarketMinimumBasis::EstimatedBuyGrossNotional
+            }
+            ExecutionQuoteAmountKind::SellShares => {
+                ExecutionQuoteMarketMinimumBasis::RequestedSellShares
+            }
+        }
+    }
+    #[must_use]
+    pub fn market_minimum_status(&self) -> ExecutionQuoteMarketMinimumStatus {
+        if self.side == ExecutionQuoteSide::Sell {
+            ExecutionQuoteMarketMinimumStatus::NoClientSellFloor
+        } else if self.market_minimum_check_amount() >= CLIENT_MARKET_BUY_MINIMUM {
+            ExecutionQuoteMarketMinimumStatus::MeetsClientBuyMinimum
+        } else {
+            ExecutionQuoteMarketMinimumStatus::BelowClientBuyMinimum
+        }
+    }
+    /// Kept separate from client minimum and freshness. Consumers requiring
+    /// verified venue eligibility must retain their NO_TRADE gate.
+    #[must_use]
+    pub const fn venue_minimum_status(&self) -> ExecutionQuoteVenueMinimumStatus {
+        ExecutionQuoteVenueMinimumStatus::Unverified
+    }
+    /// Published client-profile BUY notional floor; SELL has no client floor.
+    #[must_use]
+    pub const fn required_market_buy_notional_minimum(&self) -> Option<Decimal> {
+        match self.side {
+            ExecutionQuoteSide::Buy => Some(CLIENT_MARKET_BUY_MINIMUM),
+            ExecutionQuoteSide::Sell => None,
+        }
+    }
+    /// Identifies the published frontend input-check model used here. Its
+    /// checks do not establish server acceptance or eligibility after fee or
+    /// signed-amount normalization, nor FAK/FOK execution.
+    #[must_use]
+    pub const fn market_minimum_policy_version(&self) -> &'static str {
+        MARKET_MINIMUM_POLICY_VERSION
+    }
+    /// SHA-256 of the inspected public frontend chunk defining this profile.
+    #[must_use]
+    pub const fn market_minimum_source_sha256(&self) -> &'static str {
+        MARKET_MINIMUM_SOURCE_SHA256
+    }
     #[must_use]
     pub const fn gross_shares(&self) -> Decimal {
         self.gross_shares
@@ -129,6 +217,12 @@ impl ExecutionQuote {
     #[must_use]
     pub const fn vwap(&self) -> Decimal {
         self.vwap
+    }
+    /// Gross displayed shares used as the denominator of the fee-exclusive
+    /// book VWAP: `gross_notional() / vwap_share_denominator()`.
+    #[must_use]
+    pub const fn vwap_share_denominator(&self) -> Decimal {
+        self.gross_shares
     }
     #[must_use]
     pub const fn estimated_platform_fee(&self) -> Decimal {

@@ -20,6 +20,8 @@ use super::{
 
 pub const FIFTH_NATIVE_EXECUTION_QUOTE_BINDING_POLICY_VERSION: &str =
     "fifth-native-v2-rooted-pusd-modeled-quote-binding/1";
+const FIFTH_NATIVE_SHARE_UNIT_POLICY_VERSION: &str =
+    "fifth-native-v2-position-share-six-decimal-scale/1";
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum FifthNativeExecutionQuoteBindingError {
@@ -32,6 +34,11 @@ pub enum FifthNativeExecutionQuoteBindingError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FifthNativeQuoteCashUnit {
     Pusd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FifthNativeQuoteShareUnit {
+    NormalizedNativePositionShares,
 }
 
 /// A borrowed native pUSD annotation for one quote from the bound context.
@@ -84,6 +91,48 @@ impl FifthNativeExecutionQuoteBinding<'_> {
     #[must_use]
     pub const fn quote_cash_decimals(&self) -> u8 {
         self.native_context.selected_balances().pusd_decimals()
+    }
+
+    /// Position amounts use the normalized native six-decimal share scale.
+    /// PositionManager itself stores raw ERC-1155 integers without declaring
+    /// token decimals; the scale follows native split/merge parity with pUSD
+    /// base units and the official native order encoder's six-decimal scale.
+    #[must_use]
+    pub const fn quote_share_unit(&self) -> FifthNativeQuoteShareUnit {
+        FifthNativeQuoteShareUnit::NormalizedNativePositionShares
+    }
+
+    #[must_use]
+    pub const fn quote_share_decimals(&self) -> u8 {
+        6
+    }
+
+    #[must_use]
+    pub const fn share_unit_policy_version(&self) -> &'static str {
+        FIFTH_NATIVE_SHARE_UNIT_POLICY_VERSION
+    }
+
+    /// Modeled BUY share quantity received at full displayed-depth completion.
+    /// Native fees are cash-side, so the quote fee is not subtracted from this
+    /// estimate. This does not guarantee a fill, settlement, or redeemability
+    /// before a full winning outcome.
+    #[must_use]
+    pub const fn estimated_buy_received_shares(&self) -> Option<rust_decimal::Decimal> {
+        match self.quote.side() {
+            crate::clob::execution_quote::ExecutionQuoteSide::Buy => {
+                Some(self.quote.gross_shares())
+            }
+            crate::clob::execution_quote::ExecutionQuoteSide::Sell => None,
+        }
+    }
+
+    /// Return the modeled gross quantity in six-decimal native base units only
+    /// when it is exactly representable. The quote may retain an 18-decimal
+    /// share grid; this conversion does not assert tick-dependent order
+    /// precision or signed-order encodability, and it never rounds the quote.
+    #[must_use]
+    pub fn exact_modeled_share_base_units(&self) -> Option<alloy_primitives::U256> {
+        exact_decimal_base_units(self.quote.gross_shares(), self.quote_share_decimals())
     }
 
     #[must_use]
@@ -242,6 +291,26 @@ impl FifthNativeExecutionQuoteBinding<'_> {
     const fn code_context(&self) -> &super::fifth_code_context::FifthCodeContextObservation {
         self.native_context.selected_balances().code_context()
     }
+}
+
+fn exact_decimal_base_units(
+    amount: rust_decimal::Decimal,
+    decimals: u8,
+) -> Option<alloy_primitives::U256> {
+    let mantissa = u128::try_from(amount.mantissa()).ok()?;
+    let scale = amount.scale();
+    let base_scale = u32::from(decimals);
+    let raw_units = if scale <= base_scale {
+        let factor = 10_u128.checked_pow(base_scale - scale)?;
+        mantissa.checked_mul(factor)?
+    } else {
+        let factor = 10_u128.checked_pow(scale - base_scale)?;
+        if mantissa % factor != 0 {
+            return None;
+        }
+        mantissa / factor
+    };
+    Some(alloy_primitives::U256::from(raw_units))
 }
 
 /// Bind a modeled quote to the already sealed native V2 pair and source profile.

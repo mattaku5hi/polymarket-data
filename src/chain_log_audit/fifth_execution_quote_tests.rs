@@ -6,7 +6,7 @@ use std::sync::{
 use crate::{
     chain_log_audit::{
         FifthExchangeImplementationVersion, FifthNativeExecutionQuoteBindingError,
-        FifthNativeQuoteCashUnit, bind_fifth_native_execution_assets,
+        FifthNativeQuoteCashUnit, FifthNativeQuoteShareUnit, bind_fifth_native_execution_assets,
         bind_fifth_native_execution_quote,
     },
     clob::{
@@ -142,12 +142,21 @@ fn quote(
     context: &crate::clob::execution_context::ExecutionContextObservation,
     max_age: std::time::Duration,
 ) -> Result<ExecutionQuote, ExecutionQuoteError> {
-    estimate_execution_quote(
+    quote_amount(
         context,
         ExecutionQuoteSide::Buy,
         rust_decimal::Decimal::ONE,
         max_age,
     )
+}
+
+fn quote_amount(
+    context: &crate::clob::execution_context::ExecutionContextObservation,
+    side: ExecutionQuoteSide,
+    amount: rust_decimal::Decimal,
+    max_age: std::time::Duration,
+) -> Result<ExecutionQuote, ExecutionQuoteError> {
+    estimate_execution_quote(context, side, amount, max_age)
 }
 
 async fn rooted_native() -> (
@@ -211,6 +220,23 @@ async fn binds_both_selected_assets_to_current_rooted_pusd_profile_without_io() 
         assert_eq!(sends.load(Ordering::Relaxed), 3);
         assert_eq!(profile.quote_cash_unit(), FifthNativeQuoteCashUnit::Pusd);
         assert_eq!(profile.quote_cash_decimals(), 6);
+        assert_eq!(
+            profile.quote_share_unit(),
+            FifthNativeQuoteShareUnit::NormalizedNativePositionShares
+        );
+        assert_eq!(profile.quote_share_decimals(), 6);
+        assert_eq!(
+            profile.share_unit_policy_version(),
+            "fifth-native-v2-position-share-six-decimal-scale/1"
+        );
+        assert_eq!(
+            profile.estimated_buy_received_shares(),
+            Some(quote.gross_shares())
+        );
+        assert_eq!(
+            profile.exact_modeled_share_base_units(),
+            Some(alloy_primitives::U256::from(2_000_000_u64))
+        );
         assert_eq!(profile.selected_native_outcome_index(), selected_index);
         assert_eq!(
             profile.selected_native_position_id(),
@@ -285,6 +311,84 @@ async fn binds_both_selected_assets_to_current_rooted_pusd_profile_without_io() 
         task.abort();
     }
     assert_eq!(fixture_requests.load(Ordering::Relaxed), initial_requests);
+}
+
+#[tokio::test]
+async fn native_share_units_are_exactly_converted_without_rounding_or_io() {
+    let (fixture_requests, native) = rooted_native().await;
+    let ids = provider_ids(&native);
+    let (context, task, sends) = context_server(
+        "v2",
+        [&ids[0], &ids[1]],
+        0,
+        API_CONDITION,
+        "share-unit-book",
+        "1700000000123",
+    )
+    .await;
+    let assets = bind_fifth_native_execution_assets(&native, &context).unwrap();
+    let before = fixture_requests.load(Ordering::Relaxed);
+    let max_age = std::time::Duration::from_secs(10);
+
+    let exact_quote = quote_amount(
+        &context,
+        ExecutionQuoteSide::Buy,
+        rust_decimal::Decimal::from_str_exact("1.000000000000000000").unwrap(),
+        max_age,
+    )
+    .unwrap();
+    let exact_profile = bind_fifth_native_execution_quote(&assets, &exact_quote).unwrap();
+    let original_expiry = exact_profile.valid_until();
+    assert_eq!(exact_quote.gross_shares().scale(), 18);
+    assert_eq!(
+        exact_quote.gross_shares(),
+        rust_decimal::Decimal::from_str_exact("2.000000000000000000").unwrap()
+    );
+    assert_eq!(
+        exact_profile.estimated_buy_received_shares(),
+        Some(exact_quote.gross_shares())
+    );
+    assert_eq!(
+        exact_profile.exact_modeled_share_base_units(),
+        Some(alloy_primitives::U256::from(2_000_000_u64))
+    );
+    assert_eq!(exact_profile.valid_until(), original_expiry);
+
+    let fractional_quote = quote_amount(
+        &context,
+        ExecutionQuoteSide::Buy,
+        rust_decimal::Decimal::from_str_exact("0.999999999999999999").unwrap(),
+        max_age,
+    )
+    .unwrap();
+    let fractional_profile = bind_fifth_native_execution_quote(&assets, &fractional_quote).unwrap();
+    assert!(fractional_quote.gross_shares() > rust_decimal::Decimal::ZERO);
+    assert_eq!(
+        fractional_profile.estimated_buy_received_shares(),
+        Some(fractional_quote.gross_shares())
+    );
+    assert_eq!(fractional_profile.exact_modeled_share_base_units(), None);
+
+    let sell_quote = quote_amount(
+        &context,
+        ExecutionQuoteSide::Sell,
+        rust_decimal::Decimal::from_str_exact("0.1").unwrap(),
+        max_age,
+    )
+    .unwrap();
+    let sell_profile = bind_fifth_native_execution_quote(&assets, &sell_quote).unwrap();
+    assert_eq!(
+        sell_quote.market_minimum_status(),
+        crate::clob::execution_quote::ExecutionQuoteMarketMinimumStatus::NoClientSellFloor
+    );
+    assert_eq!(sell_profile.estimated_buy_received_shares(), None);
+    assert_eq!(
+        sell_profile.exact_modeled_share_base_units(),
+        Some(alloy_primitives::U256::from(100_000_u64))
+    );
+    assert_eq!(fixture_requests.load(Ordering::Relaxed), before);
+    assert_eq!(sends.load(Ordering::Relaxed), 3);
+    task.abort();
 }
 
 #[tokio::test]
