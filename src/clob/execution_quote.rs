@@ -27,6 +27,13 @@ pub enum ExecutionQuoteSide {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionQuoteAmountKind {
+    BuyGrossNotional,
+    BuyAllInCash,
+    SellShares,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionQuoteRole {
     Taker,
 }
@@ -69,6 +76,7 @@ pub enum ExecutionQuoteError {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionQuote {
     side: ExecutionQuoteSide,
+    amount_kind: ExecutionQuoteAmountKind,
     requested_amount: Decimal,
     gross_shares: Decimal,
     gross_notional: Decimal,
@@ -97,6 +105,10 @@ impl ExecutionQuote {
     #[must_use]
     pub const fn side(&self) -> ExecutionQuoteSide {
         self.side
+    }
+    #[must_use]
+    pub const fn amount_kind(&self) -> ExecutionQuoteAmountKind {
+        self.amount_kind
     }
     #[must_use]
     pub const fn requested_amount(&self) -> Decimal {
@@ -281,6 +293,10 @@ pub fn estimate_execution_quote(
         })?;
     Ok(ExecutionQuote {
         side,
+        amount_kind: match side {
+            ExecutionQuoteSide::Buy => ExecutionQuoteAmountKind::BuyGrossNotional,
+            ExecutionQuoteSide::Sell => ExecutionQuoteAmountKind::SellShares,
+        },
         requested_amount: amount,
         gross_shares,
         gross_notional,
@@ -297,6 +313,88 @@ pub fn estimate_execution_quote(
         fee_currency: ExecutionQuoteFeeCurrency::ClobUsdNotional,
         total_buy_cash,
         net_sell_proceeds,
+        api_condition_id: context.api_condition_id().to_owned(),
+        selected_asset_id: context.selected_asset_id().to_owned(),
+        selected_outcome_index: context.selected_outcome_index(),
+        protocol_version: context.protocol_version(),
+        book_hash: context.book().hash.clone(),
+        vendor_timestamp: context.book().timestamp.clone(),
+        observed_at: context.started_at(),
+        available_at: context.completed_at(),
+        valid_until,
+        request_count: context.request_count(),
+    })
+}
+
+/// Calculate the maximum BUY shares supported by a total cash budget.
+///
+/// This is a modeled estimate over the displayed asks. Fees use the same
+/// ceil-to-five-decimal-per-merged-price-level policy as
+/// [`estimate_execution_quote`]. The budget includes modeled fees, and any
+/// remaining amount is returned as unspent precision dust. This does not bind
+/// settlement collateral or guarantee execution or settlement.
+///
+/// # Errors
+/// Returns an error for expired contexts, unsupported fee metadata, incomplete
+/// displayed depth, nonpositive budgets, budgets below share precision, or
+/// checked arithmetic failure.
+pub fn estimate_all_in_buy_execution_quote(
+    context: &ExecutionContextObservation,
+    max_cash_budget: Decimal,
+    max_age: Duration,
+) -> Result<ExecutionQuote, ExecutionQuoteError> {
+    if max_cash_budget <= Decimal::ZERO {
+        return Err(ExecutionQuoteError::InvalidInput);
+    }
+    let valid_until = context
+        .local_valid_until(max_age)
+        .map_err(|error| match error {
+            super::execution_context::ExecutionContextValidityError::Expired => {
+                ExecutionQuoteError::Expired
+            }
+            super::execution_context::ExecutionContextValidityError::InvalidMaxAge => {
+                ExecutionQuoteError::InvalidInput
+            }
+        })?;
+    let fee_profile = fee_profile(context)?;
+    let (gross_shares, gross_notional, estimated_platform_fee, unspent_buy_budget) =
+        walk_all_in_buy(&context.book().asks, max_cash_budget, fee_profile)?;
+    let total_buy_cash = checked_add_exact(gross_notional, estimated_platform_fee)?;
+    if total_buy_cash > max_cash_budget {
+        return Err(ExecutionQuoteError::ArithmeticOverflow);
+    }
+    let vwap = gross_notional
+        .checked_div(gross_shares)
+        .ok_or(ExecutionQuoteError::ArithmeticOverflow)?;
+    context
+        .local_valid_until(max_age)
+        .map_err(|error| match error {
+            super::execution_context::ExecutionContextValidityError::Expired => {
+                ExecutionQuoteError::Expired
+            }
+            super::execution_context::ExecutionContextValidityError::InvalidMaxAge => {
+                ExecutionQuoteError::InvalidInput
+            }
+        })?;
+    Ok(ExecutionQuote {
+        side: ExecutionQuoteSide::Buy,
+        amount_kind: ExecutionQuoteAmountKind::BuyAllInCash,
+        requested_amount: max_cash_budget,
+        gross_shares,
+        gross_notional,
+        unspent_buy_budget: Some(unspent_buy_budget),
+        vwap,
+        estimated_platform_fee,
+        fee_rate: fee_profile.rate,
+        fee_exponent: fee_profile.exponent,
+        fee_kind: if fee_profile.rate.is_zero() {
+            ExecutionQuoteFeeKind::ExactZero
+        } else {
+            ExecutionQuoteFeeKind::ModeledEstimate
+        },
+        fee_currency: ExecutionQuoteFeeCurrency::ClobUsdNotional,
+        total_buy_cash: Some(total_buy_cash),
+        net_sell_proceeds: None,
         api_condition_id: context.api_condition_id().to_owned(),
         selected_asset_id: context.selected_asset_id().to_owned(),
         selected_outcome_index: context.selected_outcome_index(),
@@ -540,6 +638,133 @@ fn walk(
     Ok((shares, notional, fee_total, unspent))
 }
 
+fn walk_all_in_buy(
+    levels: &[BookLevel],
+    budget: Decimal,
+    fee: FeeProfile,
+) -> Result<(Decimal, Decimal, Decimal, Decimal), ExecutionQuoteError> {
+    let mut merged = BTreeMap::<Decimal, Decimal>::new();
+    for level in levels {
+        let price =
+            Decimal::from_str_exact(&level.price).map_err(|_| ExecutionQuoteError::InvalidInput)?;
+        let size =
+            Decimal::from_str_exact(&level.size).map_err(|_| ExecutionQuoteError::InvalidInput)?;
+        let prior = merged.get(&price).copied().unwrap_or(Decimal::ZERO);
+        merged.insert(price, checked_add_exact(prior, size)?);
+    }
+
+    let mut remaining = budget;
+    let mut shares = Decimal::ZERO;
+    let mut notional = Decimal::ZERO;
+    let mut fee_total = Decimal::ZERO;
+    let mut last_level: Option<(Decimal, BigUint, BigUint)> = None;
+    for (price, available) in merged {
+        let (available_num, available_den) = decimal_ratio(available)?;
+        let scale = BigUint::from(10u8).pow(BUY_SHARE_DECIMAL_PLACES);
+        let max_units = (&available_num * &scale) / &available_den;
+        let take_units = if all_in_cost_within_budget(&max_units, price, remaining, fee)? {
+            max_units.clone()
+        } else {
+            affordable_all_in_shares(remaining, price, &max_units, fee)?
+        };
+        if take_units.is_zero() {
+            continue;
+        }
+        let take = shares_from_units(&take_units)?;
+        let level_notional = checked_mul_exact(take, price)?;
+        let level_fee = fee_for_level(take, price, fee)?;
+        let level_cash = checked_add_exact(level_notional, level_fee)?;
+        shares = checked_add_exact(shares, take)?;
+        notional = checked_add_exact(notional, level_notional)?;
+        fee_total = checked_add_exact(fee_total, level_fee)?;
+        remaining = checked_sub_exact(remaining, level_cash)?;
+        let reached_level_end = take_units == max_units;
+        last_level = Some((price, take_units, max_units));
+        if !reached_level_end {
+            break;
+        }
+    }
+
+    if shares.is_zero() {
+        return Err(ExecutionQuoteError::BuyQuantityPrecision);
+    }
+    if fee_total > notional {
+        return Err(ExecutionQuoteError::UnsupportedFeeMetadata);
+    }
+    if !remaining.is_zero() {
+        if let Some((price, take_units, available_units)) = last_level {
+            if take_units == available_units
+                && incremental_level_cost_within_budget(&take_units, price, &remaining, fee)?
+            {
+                return Err(ExecutionQuoteError::InsufficientDepth);
+            }
+        }
+    }
+    let unspent = checked_sub_exact(budget, checked_add_exact(notional, fee_total)?)?;
+    Ok((shares, notional, fee_total, unspent))
+}
+
+fn affordable_all_in_shares(
+    budget: Decimal,
+    price: Decimal,
+    max_units: &BigUint,
+    fee: FeeProfile,
+) -> Result<BigUint, ExecutionQuoteError> {
+    let mut low = BigUint::zero();
+    let mut high = max_units.clone();
+    while low < high {
+        let mid = (&low + &high + BigUint::from(1u8)) / BigUint::from(2u8);
+        if all_in_cost_within_budget(&mid, price, budget, fee)? {
+            low = mid;
+        } else {
+            high = mid - BigUint::from(1u8);
+        }
+    }
+    Ok(low)
+}
+
+fn shares_from_units(units: &BigUint) -> Result<Decimal, ExecutionQuoteError> {
+    decimal_from_coefficient(units.clone(), BUY_SHARE_DECIMAL_PLACES)
+}
+
+fn all_in_cost_within_budget(
+    share_units: &BigUint,
+    price: Decimal,
+    budget: Decimal,
+    fee: FeeProfile,
+) -> Result<bool, ExecutionQuoteError> {
+    let (price_num, price_den) = decimal_ratio(price)?;
+    let (budget_num, budget_den) = decimal_ratio(budget)?;
+    let share_scale = BigUint::from(10u8).pow(BUY_SHARE_DECIMAL_PLACES);
+    let fee_scale = BigUint::from(10u8).pow(FEE_DECIMAL_PLACES);
+    let fee_units = fee_units_for_share_units(share_units, price, fee)?;
+    let gross_and_fee =
+        share_units * &price_num * &fee_scale + fee_units * &share_scale * &price_den;
+    let denominator = share_scale * price_den * fee_scale;
+    Ok(gross_and_fee * budget_den <= budget_num * denominator)
+}
+
+fn incremental_level_cost_within_budget(
+    share_units: &BigUint,
+    price: Decimal,
+    budget: &Decimal,
+    fee: FeeProfile,
+) -> Result<bool, ExecutionQuoteError> {
+    let (price_num, price_den) = decimal_ratio(price)?;
+    let (budget_num, budget_den) = decimal_ratio(*budget)?;
+    let share_scale = BigUint::from(10u8).pow(BUY_SHARE_DECIMAL_PLACES);
+    let fee_scale = BigUint::from(10u8).pow(FEE_DECIMAL_PLACES);
+    let current_fee = fee_units_for_share_units(share_units, price, fee)?;
+    let next_fee = fee_units_for_share_units(&(share_units + BigUint::from(1u8)), price, fee)?;
+    if next_fee < current_fee {
+        return Err(ExecutionQuoteError::ArithmeticOverflow);
+    }
+    let fee_delta = next_fee - current_fee;
+    let gross_and_fee = &price_num * &fee_scale + fee_delta * &share_scale * &price_den;
+    let denominator = share_scale * price_den * fee_scale;
+    Ok(gross_and_fee * budget_den <= budget_num * denominator)
+}
+
 fn affordable_buy_shares(
     budget: Decimal,
     price: Decimal,
@@ -629,8 +854,32 @@ fn fee_for_level(
     if fee.rate.is_zero() {
         return Ok(Decimal::ZERO);
     }
-    let one_minus_price = checked_sub_exact(Decimal::ONE, price)?;
     let (shares_num, shares_den) = decimal_ratio(shares)?;
+    decimal_from_coefficient(
+        fee_units_for_ratio(&shares_num, &shares_den, price, fee)?,
+        FEE_DECIMAL_PLACES,
+    )
+}
+
+fn fee_units_for_share_units(
+    share_units: &BigUint,
+    price: Decimal,
+    fee: FeeProfile,
+) -> Result<BigUint, ExecutionQuoteError> {
+    let shares_den = BigUint::from(10u8).pow(BUY_SHARE_DECIMAL_PLACES);
+    fee_units_for_ratio(share_units, &shares_den, price, fee)
+}
+
+fn fee_units_for_ratio(
+    shares_num: &BigUint,
+    shares_den: &BigUint,
+    price: Decimal,
+    fee: FeeProfile,
+) -> Result<BigUint, ExecutionQuoteError> {
+    if fee.rate.is_zero() {
+        return Ok(BigUint::zero());
+    }
+    let one_minus_price = checked_sub_exact(Decimal::ONE, price)?;
     let (rate_num, rate_den) = decimal_ratio(fee.rate)?;
     let (price_num, price_den) = decimal_ratio(price)?;
     let (complement_num, complement_den) = decimal_ratio(one_minus_price)?;
@@ -641,17 +890,11 @@ fn fee_for_level(
     let scaled = numerator * BigUint::from(10u8).pow(FEE_DECIMAL_PLACES);
     let quotient = &scaled / &denominator;
     let remainder = &scaled % &denominator;
-    let units = if remainder == BigUint::default() {
+    Ok(if remainder == BigUint::default() {
         quotient
     } else {
         quotient + BigUint::from(1u8)
-    };
-    let units = units
-        .to_u128()
-        .ok_or(ExecutionQuoteError::ArithmeticOverflow)?;
-    let units = i128::try_from(units).map_err(|_| ExecutionQuoteError::ArithmeticOverflow)?;
-    Decimal::try_from_i128_with_scale(units, FEE_DECIMAL_PLACES)
-        .map_err(|_| ExecutionQuoteError::ArithmeticOverflow)
+    })
 }
 
 fn decimal_ratio(value: Decimal) -> Result<(BigUint, BigUint), ExecutionQuoteError> {

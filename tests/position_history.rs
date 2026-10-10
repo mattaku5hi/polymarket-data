@@ -173,7 +173,7 @@ fn holder_topic() -> String {
     format!("0x{:0>64}", &HOLDER[2..])
 }
 fn hash_for(block: u64) -> String {
-    format!("0x{:064x}", block)
+    format!("0x{block:064x}")
 }
 fn header(number: u64, hash: &str) -> Value {
     json!({"number": number, "hash": hash, "parentHash": hash_for(number.saturating_sub(1)),
@@ -260,7 +260,7 @@ async fn paginates_sparse_pages_keeps_filter_evidence_and_deduplicates_self_tran
     assert!(first["logs"][0].get("topic2").is_some());
     let to: Value = serde_json::from_str(observation.pages()[2].request_body()).unwrap();
     assert!(to["logs"][0].get("topic3").is_some());
-    assert!(!to["logs"][0].get("topic2").is_some());
+    assert!(to["logs"][0].get("topic2").is_none());
     assert_eq!(observation.from_terminal().hash(), HASH15);
     assert_eq!(state.requests.load(Ordering::SeqCst), 3);
 }

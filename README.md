@@ -218,6 +218,16 @@ The read-only example acquires Gamma/market/book under a three-request budget:
 BUY input is gross notional before fees; use `sell` for a share quantity. Output
 names modeled cash units and remaining local TTL. It submits no orders.
 
+For a total cash cap that includes modeled fees, use
+`execution_quote::estimate_all_in_buy_execution_quote(context, max_cash_budget, max_age)`.
+Its `requested_amount()` is identified by `amount_kind() == BuyAllInCash`; the
+existing `estimate_execution_quote` BUY remains gross notional before fees
+(`BuyGrossNotional`), and SELL remains shares (`SellShares`). The all-in result
+maximizes displayed shares on the 18-decimal quantity grid, reports budget dust
+in `unspent_buy_budget()`, and uses the same ceil-per-merged-price-level fee
+estimate. It does not guarantee matching or settlement and does not bind cash
+to a collateral token or native unit.
+
 `position_history::SqdPositionHistoryReader` captures both ERC-1155 holder
 directions from the Polygon finalized stream, retaining sparse-page cursors and
 raw bodies until the fixed caller anchor is reached. `rpc_position_history::`
@@ -266,3 +276,14 @@ labelled USDC notional by its documentation, book `min_order_size` is shares,
 and compact CLOB `mos` has an unspecified unit. Typed unit getters describe those
 source claims; these separate numbers are never compared as one constraint or
 converted to collateral. Tick-size disagreement still refuses context.
+
+
+With `chain-audit`, `bind_fifth_native_execution_quote` binds a quote to the
+existing sealed V2 native asset context without additional RPC calls. It checks
+market/asset/index, book provenance, acquisition timing and the original expiry.
+The borrowed binding exposes the rooted pUSD collateral identity (six decimals)
+and the separate source-bound Exchange fee cap. The original quote retains its
+modeled fee classification and neutral CLOB cash notation; this is no FX
+conversion or assertion of settled fee amounts. Source-tagged minimum fields
+remain separate observations: market FAK/FOK applicability is unresolved, so
+this binding does not establish venue-minimum validity or trading eligibility.

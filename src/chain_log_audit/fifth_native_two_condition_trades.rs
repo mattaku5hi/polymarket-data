@@ -663,7 +663,7 @@ fn scan_transactions(
                 if has_owner_position_or_cash_movement(transaction, owner) {
                     return Err(ChainLogAuditError::Unverified.into());
                 }
-                for condition_index in 0..2 {
+                for (condition_index, condition_ids) in ids.iter().enumerate() {
                     let version = points[block_index][condition_index]
                         .native_context()
                         .selected_balances()
@@ -674,7 +674,7 @@ fn scan_transactions(
                         block.block_number(),
                         block.block_hash(),
                         owner,
-                        ids[condition_index],
+                        *condition_ids,
                         module,
                         version,
                     ) {

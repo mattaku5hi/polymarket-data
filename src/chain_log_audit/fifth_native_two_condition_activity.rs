@@ -768,7 +768,7 @@ fn scan_activity(
                 {
                     return Err(ChainLogAuditError::Unverified);
                 }
-                for index in 0..2 {
+                for (index, condition_ids) in ids.iter().enumerate() {
                     let version = points[block_index][index]
                         .native_context()
                         .selected_balances()
@@ -779,7 +779,7 @@ fn scan_activity(
                         block.block_number(),
                         block.block_hash(),
                         owner,
-                        ids[index],
+                        *condition_ids,
                         module,
                         version,
                     ) {

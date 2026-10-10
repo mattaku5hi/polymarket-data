@@ -2084,8 +2084,8 @@ async fn native_binary_activity_batches_fund_quiet_and_sell_segments_contiguousl
 }
 
 fn rpc_requested_block_102(row: &Value) -> bool {
-    row["method"] == "eth_getBlockByNumber" && row["params"][0] == "0x66"
-        || row["method"] == "eth_getBlockReceipts" && row["params"][0] == "0x66"
+    (row["method"] == "eth_getBlockByNumber" || row["method"] == "eth_getBlockReceipts")
+        && row["params"][0] == "0x66"
         || row["method"] == "eth_getProof" && row["params"][2] == "0x66"
         || row["method"] == "eth_getLogs" && row["params"][0]["fromBlock"] == "0x66"
 }

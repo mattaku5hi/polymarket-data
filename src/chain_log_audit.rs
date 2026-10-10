@@ -37,6 +37,7 @@ mod fifth_direct_legacy_migration;
 mod fifth_direct_module_operations;
 mod fifth_exchange_controls;
 mod fifth_execution_context;
+mod fifth_execution_quote;
 mod fifth_legacy_binary_balances;
 mod fifth_legacy_binary_inventory;
 mod fifth_legacy_binary_result;
@@ -90,6 +91,11 @@ pub use fifth_exchange_controls::{
 pub use fifth_execution_context::{
     FIFTH_NATIVE_EXECUTION_ASSET_BINDING_POLICY_VERSION, FifthNativeExecutionAssetBinding,
     FifthNativeExecutionAssetBindingError, bind_fifth_native_execution_assets,
+};
+pub use fifth_execution_quote::{
+    FIFTH_NATIVE_EXECUTION_QUOTE_BINDING_POLICY_VERSION, FifthNativeExecutionQuoteBinding,
+    FifthNativeExecutionQuoteBindingError, FifthNativeQuoteCashUnit,
+    bind_fifth_native_execution_quote,
 };
 pub use fifth_legacy_binary_balances::{
     BoundedFifthLegacyBinaryBalancesError, FIFTH_LEGACY_BINARY_BALANCES_POLICY_VERSION,
@@ -10127,6 +10133,10 @@ mod receipt_tests {
 
         mod fifth_execution_context_tests {
             include!("chain_log_audit/fifth_execution_context_tests.rs");
+
+            mod fifth_execution_quote_tests {
+                include!("chain_log_audit/fifth_execution_quote_tests.rs");
+            }
         }
     }
 

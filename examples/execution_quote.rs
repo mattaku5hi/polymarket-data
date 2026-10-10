@@ -1,11 +1,13 @@
-//! Read-only quote smoke: CONDITION_ID ASSET_ID buy|sell AMOUNT.
-//! BUY amount is gross notional; fees are additional modeled cash.
+//! Read-only quote smoke: CONDITION_ID ASSET_ID buy|buy-all-in|sell AMOUNT.
+//! BUY is gross notional; BUY-all-in caps gross plus modeled fees.
 
 use std::{error::Error, time::Duration};
 
 use polymarket_data::clob::{
     execution_context::{ClobExecutionContextReader, ExecutionContextRequest},
-    execution_quote::{ExecutionQuoteSide, estimate_execution_quote},
+    execution_quote::{
+        ExecutionQuoteSide, estimate_all_in_buy_execution_quote, estimate_execution_quote,
+    },
 };
 use rust_decimal::Decimal;
 
@@ -13,12 +15,14 @@ use rust_decimal::Decimal;
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() != 4 {
-        return Err("usage: execution_quote CONDITION_ID ASSET_ID buy|sell AMOUNT".into());
+        return Err(
+            "usage: execution_quote CONDITION_ID ASSET_ID buy|buy-all-in|sell AMOUNT".into(),
+        );
     }
     let side = match args[2].as_str() {
-        "buy" => ExecutionQuoteSide::Buy,
+        "buy" | "buy-all-in" => ExecutionQuoteSide::Buy,
         "sell" => ExecutionQuoteSide::Sell,
-        _ => return Err("side must be buy or sell".into()),
+        _ => return Err("mode must be buy, buy-all-in or sell".into()),
     };
     let amount = Decimal::from_str_exact(&args[3])?;
     let reader = ClobExecutionContextReader::with_client_builder(
@@ -34,12 +38,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             total_timeout: Duration::from_secs(5),
         })
         .await?;
-    let quote = estimate_execution_quote(&context, side, amount, Duration::from_secs(10))?;
+    let quote = if args[2] == "buy-all-in" {
+        estimate_all_in_buy_execution_quote(&context, amount, Duration::from_secs(10))?
+    } else {
+        estimate_execution_quote(&context, side, amount, Duration::from_secs(10))?
+    };
     quote.check_validity()?;
     println!(
-        "protocol={:?} side={:?} shares={} gross={} estimated_fee={} buy_total={:?} sell_net={:?} unspent_buy_budget={:?} cash_unit={:?} fee_model={} local_ttl_ms={}",
+        "protocol={:?} side={:?} amount_kind={:?} shares={} gross={} estimated_fee={} buy_total={:?} sell_net={:?} unspent_buy_budget={:?} cash_unit={:?} fee_model={} local_ttl_ms={}",
         quote.protocol_version(),
         quote.side(),
+        quote.amount_kind(),
         quote.gross_shares(),
         quote.gross_notional(),
         quote.estimated_platform_fee(),
