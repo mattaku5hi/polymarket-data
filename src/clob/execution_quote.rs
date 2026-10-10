@@ -19,6 +19,10 @@ use super::{BookLevel, execution_context::ExecutionContextObservation};
 const FEE_DECIMAL_PLACES: u32 = 5;
 const MAX_SUPPORTED_EXPONENT: u32 = 8;
 const BUY_SHARE_DECIMAL_PLACES: u32 = 18;
+const MARKET_BUY_MAKER_POLICY_VERSION: &str = "polymarket-market-buy-maker-cent-floor-minimum/1";
+const MARKET_BUY_MAKER_SOURCE_COMMIT: &str = "24e346374acef3e3a3da4e3c08a8981e0122ea81";
+const MARKET_BUY_MAKER_SOURCE_SHA256: &str =
+    "1e373ee5207426201cff4687c7dbaf4b2094483c4fda094da4c20065b0cd9fe0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionQuoteSide {
@@ -96,6 +100,52 @@ pub enum ExecutionQuoteError {
     ArithmeticOverflow,
     #[error("BUY budget is below the supported share quantity precision")]
     BuyQuantityPrecision,
+    #[error("normalized market BUY maker cash is below the supported minimum")]
+    BelowMarketBuyCashMinimum,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketBuyBudget {
+    GrossNotional(Decimal),
+    AllInCash(Decimal),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NormalizedMarketBuyQuote {
+    quote: ExecutionQuote,
+    normalized_maker_notional: Decimal,
+    reserved_buy_cash: Decimal,
+}
+
+impl NormalizedMarketBuyQuote {
+    #[must_use]
+    pub const fn quote(&self) -> &ExecutionQuote {
+        &self.quote
+    }
+    #[must_use]
+    pub const fn normalized_maker_notional(&self) -> Decimal {
+        self.normalized_maker_notional
+    }
+    #[must_use]
+    pub const fn reserved_buy_cash(&self) -> Decimal {
+        self.reserved_buy_cash
+    }
+    #[must_use]
+    pub const fn required_maker_minimum(&self) -> Decimal {
+        Decimal::ONE
+    }
+    #[must_use]
+    pub const fn maker_amount_policy_version(&self) -> &'static str {
+        MARKET_BUY_MAKER_POLICY_VERSION
+    }
+    #[must_use]
+    pub const fn maker_amount_source_commit(&self) -> &'static str {
+        MARKET_BUY_MAKER_SOURCE_COMMIT
+    }
+    #[must_use]
+    pub const fn maker_amount_source_sha256(&self) -> &'static str {
+        MARKET_BUY_MAKER_SOURCE_SHA256
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -500,6 +550,101 @@ pub fn estimate_all_in_buy_execution_quote(
         valid_until,
         request_count: context.request_count(),
     })
+}
+
+/// Estimate a BUY after applying the published market-maker cash cent rule.
+///
+/// This binds the normalized maker cash amount and its one-dollar minimum to
+/// the existing fee/depth estimate. It does not normalize signed shares or
+/// establish venue eligibility. All-in budgets retain a full-budget depth
+/// check before selecting the largest whole-cent maker amount whose modeled
+/// maker cash plus fee fits the cap.
+pub fn estimate_normalized_market_buy_quote(
+    context: &ExecutionContextObservation,
+    budget: MarketBuyBudget,
+    max_age: Duration,
+) -> Result<NormalizedMarketBuyQuote, ExecutionQuoteError> {
+    match budget {
+        MarketBuyBudget::GrossNotional(requested) => {
+            if requested <= Decimal::ZERO {
+                return Err(ExecutionQuoteError::InvalidInput);
+            }
+            let maker = floor_to_cents(requested)?;
+            if maker < Decimal::ONE {
+                return Err(ExecutionQuoteError::BelowMarketBuyCashMinimum);
+            }
+            let mut quote =
+                estimate_execution_quote(context, ExecutionQuoteSide::Buy, maker, max_age)?;
+            quote.requested_amount = requested;
+            // Include initial cent truncation as well as the estimator's share dust.
+            quote.unspent_buy_budget = Some(checked_sub_exact(requested, quote.gross_notional)?);
+            let reserved_buy_cash = checked_add_exact(maker, quote.estimated_platform_fee)?;
+            Ok(NormalizedMarketBuyQuote {
+                quote,
+                normalized_maker_notional: maker,
+                reserved_buy_cash,
+            })
+        }
+        MarketBuyBudget::AllInCash(cash_cap) => {
+            if cash_cap <= Decimal::ZERO {
+                return Err(ExecutionQuoteError::InvalidInput);
+            }
+            // Preserve the existing full-budget depth, fee metadata, and freshness gates.
+            let _ = estimate_all_in_buy_execution_quote(context, cash_cap, max_age)?;
+            let max_cents = cents_coefficient(cash_cap)?;
+            let mut low = BigUint::zero();
+            let mut high = max_cents;
+            while low < high {
+                let mid = (&low + &high + BigUint::from(1u8)) / BigUint::from(2u8);
+                let maker = decimal_from_coefficient(mid.clone(), 2)?;
+                match estimate_execution_quote(context, ExecutionQuoteSide::Buy, maker, max_age) {
+                    Ok(quote) => {
+                        let reserved = checked_add_exact(maker, quote.estimated_platform_fee)?;
+                        if reserved <= cash_cap {
+                            low = mid;
+                        } else {
+                            high = mid - BigUint::from(1u8);
+                        }
+                    }
+                    Err(ExecutionQuoteError::InsufficientDepth) => {
+                        high = mid - BigUint::from(1u8);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let maker = decimal_from_coefficient(low, 2)?;
+            if maker < Decimal::ONE {
+                return Err(ExecutionQuoteError::BelowMarketBuyCashMinimum);
+            }
+            // Recompute the selected candidate even when it was the initial lower bound.
+            let mut quote =
+                estimate_execution_quote(context, ExecutionQuoteSide::Buy, maker, max_age)?;
+            let reserved_buy_cash = checked_add_exact(maker, quote.estimated_platform_fee)?;
+            if reserved_buy_cash > cash_cap {
+                return Err(ExecutionQuoteError::ArithmeticOverflow);
+            }
+            quote.amount_kind = ExecutionQuoteAmountKind::BuyAllInCash;
+            quote.requested_amount = cash_cap;
+            quote.unspent_buy_budget = Some(checked_sub_exact(
+                cash_cap,
+                checked_add_exact(quote.gross_notional, quote.estimated_platform_fee)?,
+            )?);
+            Ok(NormalizedMarketBuyQuote {
+                quote,
+                normalized_maker_notional: maker,
+                reserved_buy_cash,
+            })
+        }
+    }
+}
+
+fn cents_coefficient(amount: Decimal) -> Result<BigUint, ExecutionQuoteError> {
+    let (numerator, denominator) = decimal_ratio(amount)?;
+    Ok((numerator * BigUint::from(100u8)) / denominator)
+}
+
+fn floor_to_cents(amount: Decimal) -> Result<Decimal, ExecutionQuoteError> {
+    decimal_from_coefficient(cents_coefficient(amount)?, 2)
 }
 
 #[derive(Clone, Copy)]

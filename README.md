@@ -228,6 +228,28 @@ in `unspent_buy_budget()`, and uses the same ceil-per-merged-price-level fee
 estimate. It does not guarantee matching or settlement and does not bind cash
 to a collateral token or native unit.
 
+For a cent-normalized market BUY budget, use
+`execution_quote::estimate_normalized_market_buy_quote(context, MarketBuyBudget::GrossNotional(amount), max_age)`
+or `MarketBuyBudget::AllInCash(cap)`. The sealed result reports
+`normalized_maker_notional()` and `reserved_buy_cash()`, and `quote()` exposes
+the same depth/fee/identity/expiry contract for existing consumers and native
+binding. Gross input is floored to whole cents. All-in input selects the largest
+whole-cent maker budget whose entire maker reserve plus modeled fees fits the
+cash cap, after the existing full-budget depth check. Both paths refuse maker
+cash below1 with `BelowMarketBuyCashMinimum`. For example, all-in1 with positive
+fees may fail while1.0025 can reserve maker1 plus modeled fee.0025.
+
+The maker rule is pinned to [official py-sdk PR292](https://github.com/Polymarket/py-sdk/pull/292)
+and its merge24e34637; policy/source getters identify the inspected amount
+implementation. Maker cash and modeled executed gross stay separate: budget1
+at price.07 retains maker1 even when modeled share dust leaves gross slightly
+below1. Original requested input and all remaining dust stay observable. The
+all-in reserve calculation is this SDK's exact displayed-depth estimate, not
+a reproduction of the official floating-point `maxSpend` helper or a proven
+operator fee ceiling. Shares retain the18-decimal estimate grid; no signed
+taker normalization or protected-price order is constructed. Complete venue
+eligibility remains unverified. Existing estimators/getters keep their behavior.
+
 `position_history::SqdPositionHistoryReader` captures both ERC-1155 holder
 directions from the Polygon finalized stream, retaining sparse-page cursors and
 raw bodies until the fixed caller anchor is reached. `rpc_position_history::`
@@ -240,6 +262,16 @@ basis, P&L or qualification; unsupported server ranges and backpressure return
 errors with no partial observation. Production provider selection stays with
 the caller. The `position_history` example reads its endpoint from
 `POLYGON_HISTORY_RPC_URL` and prints only source counts, never that endpoint.
+
+For endpoints with finite log-range limits, call
+`read_history_paginated(request, max_blocks_per_log_query)` with a positive
+caller-selected inclusive span. Both directions are read for every contiguous
+chunk. One global request/byte/deadline budget and before/after terminal header
+cover the complete requested interval; any failed chunk returns no observation.
+Planned calls are checked before sending. The512-call limit permits at most254
+chunks. The example accepts an optional fifth span argument and then uses the
+same30-second/32MiB limits with512 calls. This enables bounded windows, not an
+automatic full-genesis scan or a claim of provider/source completeness.
 
 With `chain-audit`, `verify_known_position_balances_bounded` proves an explicit
 set of up to 2,048 full-width CTF/PositionManager IDs at one caller block/hash.

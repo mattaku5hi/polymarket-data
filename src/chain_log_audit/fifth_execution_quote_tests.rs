@@ -13,7 +13,8 @@ use crate::{
         execution_context::{ClobExecutionContextReader, ExecutionContextRequest},
         execution_quote::{
             ExecutionQuote, ExecutionQuoteError, ExecutionQuoteFeeCurrency, ExecutionQuoteFeeKind,
-            ExecutionQuoteSide, estimate_execution_quote,
+            ExecutionQuoteSide, MarketBuyBudget, estimate_execution_quote,
+            estimate_normalized_market_buy_quote,
         },
     },
 };
@@ -311,6 +312,59 @@ async fn binds_both_selected_assets_to_current_rooted_pusd_profile_without_io() 
         task.abort();
     }
     assert_eq!(fixture_requests.load(Ordering::Relaxed), initial_requests);
+}
+
+#[tokio::test]
+async fn normalized_buy_reuses_native_binding_without_io_or_new_expiry() {
+    let (fixture_requests, native) = rooted_native().await;
+    let ids = provider_ids(&native);
+    let before = fixture_requests.load(Ordering::Relaxed);
+    for selected_index in [0, 1] {
+        let (context, task, sends) = context_server(
+            "v2",
+            [&ids[0], &ids[1]],
+            selected_index,
+            API_CONDITION,
+            "normalized-buy-book",
+            "1700000000123",
+        )
+        .await;
+        let assets = bind_fifth_native_execution_assets(&native, &context).unwrap();
+        let max_age = std::time::Duration::from_secs(10);
+        let normalized = estimate_normalized_market_buy_quote(
+            &context,
+            MarketBuyBudget::AllInCash(rust_decimal::Decimal::new(10025, 4)),
+            max_age,
+        )
+        .unwrap();
+        let profile = bind_fifth_native_execution_quote(&assets, normalized.quote()).unwrap();
+        assert_eq!(
+            normalized.normalized_maker_notional(),
+            rust_decimal::Decimal::ONE
+        );
+        assert_eq!(
+            normalized.reserved_buy_cash(),
+            rust_decimal::Decimal::new(10025, 4)
+        );
+        assert_eq!(profile.quote_cash_unit(), FifthNativeQuoteCashUnit::Pusd);
+        assert_eq!(profile.selected_native_outcome_index(), selected_index);
+        assert_eq!(
+            profile.selected_native_position_id(),
+            native.position_ids()[selected_index]
+        );
+        assert_eq!(
+            profile.exact_modeled_share_base_units(),
+            Some(alloy_primitives::U256::from(2_000_000_u64))
+        );
+        assert_eq!(
+            profile.valid_until(),
+            context.local_valid_until(max_age).unwrap()
+        );
+        assert_eq!(profile.quote(), normalized.quote());
+        assert_eq!(sends.load(Ordering::Relaxed), 3);
+        task.abort();
+    }
+    assert_eq!(fixture_requests.load(Ordering::Relaxed), before);
 }
 
 #[tokio::test]

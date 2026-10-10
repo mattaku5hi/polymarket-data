@@ -16,7 +16,7 @@ use crate::position_history::{
 };
 
 const RPC_CHAIN_ID: u64 = 137;
-const RPC_CALLS: usize = 6;
+const RPC_CONTEXT_CALLS: u128 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RpcPositionHistoryError {
@@ -223,6 +223,30 @@ impl RpcPositionHistoryReader {
         &self,
         request: &RpcPositionHistoryRequest,
     ) -> Result<RpcPositionHistoryObservation, RpcPositionHistoryError> {
+        self.read_history_inner(request, None).await
+    }
+
+    /// Reads one finite interval using caller-sized inclusive `eth_getLogs` ranges.
+    ///
+    /// The chunk width is required and provider-neutral. This returns an observation only if
+    /// every chunk and both directions succeed under the request's shared budgets.
+    pub async fn read_history_paginated(
+        &self,
+        request: &RpcPositionHistoryRequest,
+        max_blocks_per_log_query: u64,
+    ) -> Result<RpcPositionHistoryObservation, RpcPositionHistoryError> {
+        if max_blocks_per_log_query == 0 {
+            return Err(RpcPositionHistoryError::InvalidInput);
+        }
+        self.read_history_inner(request, Some(max_blocks_per_log_query))
+            .await
+    }
+
+    async fn read_history_inner(
+        &self,
+        request: &RpcPositionHistoryRequest,
+        max_blocks_per_log_query: Option<u64>,
+    ) -> Result<RpcPositionHistoryObservation, RpcPositionHistoryError> {
         let holder = normalize_address(&request.holder_address)
             .ok_or(RpcPositionHistoryError::InvalidInput)?;
         if holder == format!("0x{}", "00".repeat(20)) {
@@ -239,7 +263,16 @@ impl RpcPositionHistoryReader {
         {
             return Err(RpcPositionHistoryError::InvalidInput);
         }
-        if request.max_requests < RPC_CALLS {
+        let chunk_count = match max_blocks_per_log_query {
+            Some(width) => {
+                let inclusive_blocks =
+                    u128::from(request.through_block) - u128::from(request.from_block) + 1;
+                inclusive_blocks.div_ceil(u128::from(width))
+            }
+            None => 1,
+        };
+        let planned_calls = RPC_CONTEXT_CALLS + 2 * chunk_count;
+        if planned_calls > request.max_requests as u128 {
             return Err(RpcPositionHistoryError::RequestBudgetExceeded);
         }
 
@@ -295,77 +328,92 @@ impl RpcPositionHistoryReader {
         let mut logs = BTreeMap::<(String, u64), PositionTransferLog>::new();
         let mut block_hashes = BTreeMap::<u64, String>::new();
         let mut transaction_hashes = BTreeMap::<(String, u64), String>::new();
-        for direction in [PositionHistoryDirection::From, PositionHistoryDirection::To] {
-            let topics = match direction {
-                PositionHistoryDirection::From => json!([
-                    [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
-                    null,
-                    holder_topic,
-                    null
-                ]),
-                PositionHistoryDirection::To => json!([
-                    [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
-                    null,
-                    null,
-                    holder_topic
-                ]),
+        let mut chunk_start = request.from_block;
+        loop {
+            let chunk_end = match max_blocks_per_log_query {
+                Some(width) => chunk_start
+                    .saturating_add(width - 1)
+                    .min(request.through_block),
+                None => request.through_block,
             };
-            let filter = json!({"fromBlock": quantity(request.from_block), "toBlock": quantity(request.through_block),
-                "address": [CTF_EMITTER, POSITION_MANAGER_EMITTER], "topics": topics});
-            let result = self
-                .call(
-                    "eth_getLogs",
-                    json!([filter]),
-                    deadline,
-                    request,
-                    &mut state,
-                )
-                .await?;
-            let entries = result
-                .as_array()
-                .ok_or(RpcPositionHistoryError::MalformedResponse)?;
-            for entry in entries {
-                if entry.is_null() || entry.get("removed").and_then(Value::as_bool) != Some(false) {
-                    return Err(RpcPositionHistoryError::MalformedResponse);
-                }
-                let block_number = entry
-                    .get("blockNumber")
-                    .and_then(parse_quantity)
-                    .ok_or(RpcPositionHistoryError::MalformedResponse)?;
-                if block_number < request.from_block || block_number > request.through_block {
-                    return Err(RpcPositionHistoryError::MalformedResponse);
-                }
-                let block_hash = entry
-                    .get("blockHash")
-                    .and_then(Value::as_str)
-                    .and_then(normalize_hash)
-                    .ok_or(RpcPositionHistoryError::MalformedResponse)?;
-                let log = normalize_log(entry, block_number, &block_hash, &holder, direction)
-                    .map_err(map_log_error)?;
-                let locator = (block_hash, log.log_index());
-                if block_hashes
-                    .insert(block_number, locator.0.clone())
-                    .is_some_and(|previous| previous != locator.0)
-                {
-                    return Err(RpcPositionHistoryError::ConflictingHeader);
-                }
-                if transaction_hashes
-                    .insert(
-                        (locator.0.clone(), log.transaction_index()),
-                        log.transaction_hash().to_owned(),
+            for direction in [PositionHistoryDirection::From, PositionHistoryDirection::To] {
+                let topics = match direction {
+                    PositionHistoryDirection::From => json!([
+                        [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
+                        null,
+                        holder_topic,
+                        null
+                    ]),
+                    PositionHistoryDirection::To => json!([
+                        [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
+                        null,
+                        null,
+                        holder_topic
+                    ]),
+                };
+                let filter = json!({"fromBlock": quantity(chunk_start), "toBlock": quantity(chunk_end),
+                    "address": [CTF_EMITTER, POSITION_MANAGER_EMITTER], "topics": topics});
+                let result = self
+                    .call(
+                        "eth_getLogs",
+                        json!([filter]),
+                        deadline,
+                        request,
+                        &mut state,
                     )
-                    .is_some_and(|previous| previous != log.transaction_hash())
-                {
-                    return Err(RpcPositionHistoryError::ConflictingLocator);
-                }
-                if let Some(previous) = logs.get(&locator) {
-                    if previous != &log {
+                    .await?;
+                let entries = result
+                    .as_array()
+                    .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+                for entry in entries {
+                    if entry.is_null()
+                        || entry.get("removed").and_then(Value::as_bool) != Some(false)
+                    {
+                        return Err(RpcPositionHistoryError::MalformedResponse);
+                    }
+                    let block_number = entry
+                        .get("blockNumber")
+                        .and_then(parse_quantity)
+                        .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+                    if block_number < chunk_start || block_number > chunk_end {
+                        return Err(RpcPositionHistoryError::MalformedResponse);
+                    }
+                    let block_hash = entry
+                        .get("blockHash")
+                        .and_then(Value::as_str)
+                        .and_then(normalize_hash)
+                        .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+                    let log = normalize_log(entry, block_number, &block_hash, &holder, direction)
+                        .map_err(map_log_error)?;
+                    let locator = (block_hash, log.log_index());
+                    if block_hashes
+                        .insert(block_number, locator.0.clone())
+                        .is_some_and(|previous| previous != locator.0)
+                    {
+                        return Err(RpcPositionHistoryError::ConflictingHeader);
+                    }
+                    if transaction_hashes
+                        .insert(
+                            (locator.0.clone(), log.transaction_index()),
+                            log.transaction_hash().to_owned(),
+                        )
+                        .is_some_and(|previous| previous != log.transaction_hash())
+                    {
                         return Err(RpcPositionHistoryError::ConflictingLocator);
                     }
-                } else {
-                    logs.insert(locator, log);
+                    if let Some(previous) = logs.get(&locator) {
+                        if previous != &log {
+                            return Err(RpcPositionHistoryError::ConflictingLocator);
+                        }
+                    } else {
+                        logs.insert(locator, log);
+                    }
                 }
             }
+            if chunk_end == request.through_block {
+                break;
+            }
+            chunk_start = chunk_end + 1;
         }
         let after = parse_header(
             &self

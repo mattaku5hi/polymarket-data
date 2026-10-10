@@ -1,4 +1,4 @@
-//! Read-only quote smoke: CONDITION_ID ASSET_ID buy|buy-all-in|sell AMOUNT.
+//! Read-only quote smoke: CONDITION_ID ASSET_ID MODE AMOUNT.
 //! BUY is gross notional; BUY-all-in caps gross plus modeled fees.
 
 use std::{error::Error, time::Duration};
@@ -6,7 +6,8 @@ use std::{error::Error, time::Duration};
 use polymarket_data::clob::{
     execution_context::{ClobExecutionContextReader, ExecutionContextRequest},
     execution_quote::{
-        ExecutionQuoteSide, estimate_all_in_buy_execution_quote, estimate_execution_quote,
+        ExecutionQuoteSide, MarketBuyBudget, estimate_all_in_buy_execution_quote,
+        estimate_execution_quote, estimate_normalized_market_buy_quote,
     },
 };
 use rust_decimal::Decimal;
@@ -16,13 +17,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() != 4 {
         return Err(
-            "usage: execution_quote CONDITION_ID ASSET_ID buy|buy-all-in|sell AMOUNT".into(),
+            "usage: execution_quote CONDITION_ID ASSET_ID buy|buy-all-in|buy-normalized|buy-all-in-normalized|sell AMOUNT".into(),
         );
     }
     let side = match args[2].as_str() {
-        "buy" | "buy-all-in" => ExecutionQuoteSide::Buy,
+        "buy" | "buy-all-in" | "buy-normalized" | "buy-all-in-normalized" => {
+            ExecutionQuoteSide::Buy
+        }
         "sell" => ExecutionQuoteSide::Sell,
-        _ => return Err("mode must be buy, buy-all-in or sell".into()),
+        _ => return Err("unsupported quote mode".into()),
     };
     let amount = Decimal::from_str_exact(&args[3])?;
     let reader = ClobExecutionContextReader::with_client_builder(
@@ -38,12 +41,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
             total_timeout: Duration::from_secs(5),
         })
         .await?;
-    let quote = if args[2] == "buy-all-in" {
+    let max_age = Duration::from_secs(10);
+    let normalized = match args[2].as_str() {
+        "buy-normalized" => Some(estimate_normalized_market_buy_quote(
+            &context,
+            MarketBuyBudget::GrossNotional(amount),
+            max_age,
+        )?),
+        "buy-all-in-normalized" => Some(estimate_normalized_market_buy_quote(
+            &context,
+            MarketBuyBudget::AllInCash(amount),
+            max_age,
+        )?),
+        _ => None,
+    };
+    let quote = if let Some(normalized) = &normalized {
+        normalized.quote().clone()
+    } else if args[2] == "buy-all-in" {
         estimate_all_in_buy_execution_quote(&context, amount, Duration::from_secs(10))?
     } else {
         estimate_execution_quote(&context, side, amount, Duration::from_secs(10))?
     };
     quote.check_validity()?;
+    if let Some(normalized) = &normalized {
+        println!(
+            "normalized_maker_notional={} reserved_buy_cash={} maker_policy={}",
+            normalized.normalized_maker_notional(),
+            normalized.reserved_buy_cash(),
+            normalized.maker_amount_policy_version(),
+        );
+    }
     println!(
         "protocol={:?} side={:?} amount_kind={:?} shares={} gross={} estimated_fee={} buy_total={:?} sell_net={:?} unspent_buy_budget={:?} cash_unit={:?} fee_model={} client_minimum={:?} minimum_basis={:?} minimum_check_amount={} venue_minimum={:?} local_ttl_ms={}",
         quote.protocol_version(),
