@@ -180,6 +180,8 @@ const MAX_RECORDED_RECEIPT_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_RECORDED_RECEIPT_REQUESTS: usize = 16;
 const MAX_RECORDED_RECEIPT_REQUEST_BYTES: usize = 4096;
 const MAX_RECORDED_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_CHAIN_LOG_RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+pub const MAX_CHAIN_LOG_RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const BOR_FEE_LOG_ADDRESS: &str = "0x0000000000000000000000000000000000001010";
 const BOR_FEE_LOG_TOPIC: &str =
     "0x4dfe1bbbcf077ddc3e01291eea2d5c70c2b422b415d95645b9adcfd678cb1d63";
@@ -3353,12 +3355,7 @@ impl ChainLogVerifier {
         {
             return Err(ChainLogAuditError::InvalidInput);
         }
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
-            .map_err(|_| ChainLogAuditError::InvalidInput)?;
+        let client = Self::build_rpc_client(DEFAULT_CHAIN_LOG_RPC_HTTP_TIMEOUT)?;
         Ok(Self {
             client: Some(client),
             primary: primary.to_owned(),
@@ -3368,6 +3365,26 @@ impl ChainLogVerifier {
             rpc_execution: RpcExecution::Network,
             full_block_hash_lookup: false,
         })
+    }
+
+    fn build_rpc_client(timeout: Duration) -> Result<reqwest::Client, ChainLogAuditError> {
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| ChainLogAuditError::InvalidInput)
+    }
+
+    /// Set an explicit per-request HTTP timeout. This is distinct from each
+    /// bounded operation's overall deadline. The default [`new`](Self::new)
+    /// constructor retains its 20-second timeout.
+    pub fn with_rpc_http_timeout(mut self, timeout: Duration) -> Result<Self, ChainLogAuditError> {
+        if timeout.is_zero() || timeout > MAX_CHAIN_LOG_RPC_HTTP_TIMEOUT {
+            return Err(ChainLogAuditError::InvalidInput);
+        }
+        self.client = Some(Self::build_rpc_client(timeout)?);
+        Ok(self)
     }
 
     /// Fetch full signed transaction blocks by their already checked hash.
