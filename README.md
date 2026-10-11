@@ -306,6 +306,27 @@ chunks. The example accepts an optional fifth span argument and then uses the
 same30-second/32MiB limits with512 calls. This enables bounded windows, not an
 automatic full-genesis scan or a claim of provider/source completeness.
 
+With `chain-audit`, `position_history_receipts::validate_position_history_source_agreement`
+checks two sealed RPC observations for the same holder, interval, terminal roots
+and canonical event set before a caller starts receipt I/O. Different page widths
+or JSON-RPC IDs do not change agreement. The caller chooses the sources; this
+check does not establish their independence or consensus finality.
+`bind_position_history_receipts(first, second, receipts)` repeats that shared
+check and joins every source event to its exact root-derived transaction/log
+locator and raw bytes in an existing sealed receipt observation. It requires
+exactly one receipt per hinted transaction, with no extras or duplicates, and
+uses the existing strict ERC1155 decoder. Within those verified receipts, the
+reverse check refuses any holder transfer omitted by both source scans.
+
+The sealed result exposes sorted candidate IDs with ledger and original event
+locators. Equal raw integers in CTF and PositionManager remain different
+candidates. It is an observation of a partial interval: opening inventory is
+unknown, and `complete_wallet_history()` / `qualification()` remain false,
+including an empty interval. Matching hints cannot detect transfers in unhinted
+transactions, certify token/market authority, or create balances, basis or P&L.
+Acquisition budgets, one overall deadline and raw capture persistence remain
+caller-owned; the shared agreement/binding functions perform no I/O.
+
 With `chain-audit`, `verify_known_position_balances_bounded` proves an explicit
 set of up to 2,048 full-width CTF/PositionManager IDs at one caller block/hash.
 The same integer in both ledgers remains two assets. It shares code/header

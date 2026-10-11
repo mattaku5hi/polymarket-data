@@ -43,6 +43,9 @@ pub mod market_stream;
 pub mod chain_log_audit;
 
 #[cfg(feature = "chain-audit")]
+pub mod position_history_receipts;
+
+#[cfg(feature = "chain-audit")]
 pub mod activity_hints;
 pub mod resolutions;
 pub mod v2_reconciliation;
