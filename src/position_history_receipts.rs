@@ -14,7 +14,7 @@ use crate::rpc_position_history::{
 use crate::{
     chain_log_audit::{
         ChainReceiptLog, ChainTransactionReceiptEvidence, MovementObservationStatus,
-        ObservedAssetMovement, RawMovementObservation,
+        ObservedAssetMovement, RawMovementObservation, RecordedChainTransactionReceiptEvidence,
     },
     position_history::{
         CTF_EMITTER, POSITION_MANAGER_EMITTER, PositionLedger, PositionTransferLog,
@@ -111,6 +111,7 @@ impl PositionHistoryCandidateId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionHistoryReceiptObservation {
     source_kind: PositionHistoryReceiptSourceKind,
+    rooted_receipt_source_kind: PositionHistoryRootedReceiptSourceKind,
     holder_address: String,
     from_block: u64,
     through_block: u64,
@@ -131,10 +132,21 @@ pub enum PositionHistoryReceiptSourceKind {
     RecordedTranscript,
 }
 
+/// Identifies whether rooted transaction receipts came from online reads or recorded transcripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionHistoryRootedReceiptSourceKind {
+    NetworkObservation,
+    RecordedTranscript,
+}
+
 impl PositionHistoryReceiptObservation {
     #[must_use]
     pub const fn source_kind(&self) -> PositionHistoryReceiptSourceKind {
         self.source_kind
+    }
+    #[must_use]
+    pub const fn rooted_receipt_source_kind(&self) -> PositionHistoryRootedReceiptSourceKind {
+        self.rooted_receipt_source_kind
     }
     #[must_use]
     pub fn holder_address(&self) -> &str {
@@ -224,6 +236,49 @@ struct ReceiptJoinContext<'a> {
     terminal_transactions_root: &'a str,
     terminal_receipts_root: &'a str,
     source_kind: PositionHistoryReceiptSourceKind,
+    rooted_receipt_source_kind: PositionHistoryRootedReceiptSourceKind,
+}
+
+#[derive(Clone, Copy)]
+struct ReceiptContentView<'a> {
+    chain_id: u64,
+    transaction_hash: &'a str,
+    block_number: u64,
+    block_hash: &'a str,
+    transaction_index: u64,
+    receipt_status: u64,
+    receipt_logs: &'a [ChainReceiptLog],
+    movement_observations: &'a [RawMovementObservation],
+}
+
+impl<'a> From<&'a ChainTransactionReceiptEvidence> for ReceiptContentView<'a> {
+    fn from(receipt: &'a ChainTransactionReceiptEvidence) -> Self {
+        Self {
+            chain_id: receipt.chain_id(),
+            transaction_hash: receipt.transaction_hash(),
+            block_number: receipt.block_number(),
+            block_hash: receipt.block_hash(),
+            transaction_index: receipt.transaction_index(),
+            receipt_status: receipt.receipt_status(),
+            receipt_logs: receipt.receipt_logs(),
+            movement_observations: receipt.movement_observations(),
+        }
+    }
+}
+
+impl<'a> From<&'a RecordedChainTransactionReceiptEvidence> for ReceiptContentView<'a> {
+    fn from(receipt: &'a RecordedChainTransactionReceiptEvidence) -> Self {
+        Self {
+            chain_id: receipt.chain_id(),
+            transaction_hash: receipt.transaction_hash(),
+            block_number: receipt.block_number(),
+            block_hash: receipt.block_hash(),
+            transaction_index: receipt.transaction_index(),
+            receipt_status: receipt.receipt_status(),
+            receipt_logs: receipt.receipt_logs(),
+            movement_observations: receipt.movement_observations(),
+        }
+    }
 }
 
 impl From<&PositionTransferLog> for CanonicalEvent {
@@ -303,6 +358,21 @@ fn agreeing_source_events(
     Ok(events)
 }
 
+fn agreeing_recorded_source_events(
+    source_a: &RecordedRpcPositionHistorySegmentObservation,
+    source_b: &RecordedRpcPositionHistorySegmentObservation,
+) -> Result<Vec<CanonicalEvent>, PositionHistoryReceiptJoinError> {
+    validate_recorded_position_history_segment_source_agreement(source_a, source_b)?;
+    let mut events = source_a
+        .logs()
+        .iter()
+        .map(CanonicalEvent::from)
+        .collect::<Vec<_>>();
+    events.sort();
+    validate_canonical_event_set(&events, source_a.from_block(), source_a.through_block())?;
+    Ok(events)
+}
+
 fn validate_canonical_event_set(
     events: &[CanonicalEvent],
     from_block: u64,
@@ -327,6 +397,10 @@ pub fn bind_position_history_receipts(
     receipts: &[ChainTransactionReceiptEvidence],
 ) -> Result<PositionHistoryReceiptObservation, PositionHistoryReceiptJoinError> {
     let events = agreeing_source_events(source_a, source_b)?;
+    let receipts = receipts
+        .iter()
+        .map(ReceiptContentView::from)
+        .collect::<Vec<_>>();
     bind_position_history_events(
         ReceiptJoinContext {
             holder: source_a.holder_address(),
@@ -337,9 +411,10 @@ pub fn bind_position_history_receipts(
             terminal_transactions_root: source_a.terminal_transactions_root(),
             terminal_receipts_root: source_a.terminal_receipts_root(),
             source_kind: PositionHistoryReceiptSourceKind::NetworkObservation,
+            rooted_receipt_source_kind: PositionHistoryRootedReceiptSourceKind::NetworkObservation,
         },
         &events,
-        receipts,
+        &receipts,
     )
 }
 
@@ -350,14 +425,11 @@ pub fn bind_recorded_position_history_receipts(
     source_b: &RecordedRpcPositionHistorySegmentObservation,
     receipts: &[ChainTransactionReceiptEvidence],
 ) -> Result<PositionHistoryReceiptObservation, PositionHistoryReceiptJoinError> {
-    validate_recorded_position_history_segment_source_agreement(source_a, source_b)?;
-    let mut events = source_a
-        .logs()
+    let events = agreeing_recorded_source_events(source_a, source_b)?;
+    let receipts = receipts
         .iter()
-        .map(CanonicalEvent::from)
+        .map(ReceiptContentView::from)
         .collect::<Vec<_>>();
-    events.sort();
-    validate_canonical_event_set(&events, source_a.from_block(), source_a.through_block())?;
     bind_position_history_events(
         ReceiptJoinContext {
             holder: source_a.holder_address(),
@@ -368,16 +440,46 @@ pub fn bind_recorded_position_history_receipts(
             terminal_transactions_root: source_a.terminal_transactions_root(),
             terminal_receipts_root: source_a.terminal_receipts_root(),
             source_kind: PositionHistoryReceiptSourceKind::RecordedTranscript,
+            rooted_receipt_source_kind: PositionHistoryRootedReceiptSourceKind::NetworkObservation,
         },
         &events,
-        receipts,
+        &receipts,
+    )
+}
+
+/// Joins agreeing history transcripts to exactly the supplied offline-reverified rooted receipts.
+/// Reverification binds content; it does not establish source identity or that an RPC occurred.
+pub fn bind_recorded_position_history_recorded_receipts(
+    source_a: &RecordedRpcPositionHistorySegmentObservation,
+    source_b: &RecordedRpcPositionHistorySegmentObservation,
+    receipts: &[RecordedChainTransactionReceiptEvidence],
+) -> Result<PositionHistoryReceiptObservation, PositionHistoryReceiptJoinError> {
+    let events = agreeing_recorded_source_events(source_a, source_b)?;
+    let receipts = receipts
+        .iter()
+        .map(ReceiptContentView::from)
+        .collect::<Vec<_>>();
+    bind_position_history_events(
+        ReceiptJoinContext {
+            holder: source_a.holder_address(),
+            from_block: source_a.from_block(),
+            through_block: source_a.through_block(),
+            terminal_hash: source_a.terminal_hash(),
+            terminal_state_root: source_a.terminal_state_root(),
+            terminal_transactions_root: source_a.terminal_transactions_root(),
+            terminal_receipts_root: source_a.terminal_receipts_root(),
+            source_kind: PositionHistoryReceiptSourceKind::RecordedTranscript,
+            rooted_receipt_source_kind: PositionHistoryRootedReceiptSourceKind::RecordedTranscript,
+        },
+        &events,
+        &receipts,
     )
 }
 
 fn bind_position_history_events(
     context: ReceiptJoinContext<'_>,
     events: &[CanonicalEvent],
-    receipts: &[ChainTransactionReceiptEvidence],
+    receipts: &[ReceiptContentView<'_>],
 ) -> Result<PositionHistoryReceiptObservation, PositionHistoryReceiptJoinError> {
     let holder = context.holder.to_owned();
     let holder_topic = format!("0x{:0>64}", &holder[2..]);
@@ -393,7 +495,7 @@ fn bind_position_history_events(
     let mut receipts_by_transaction = BTreeMap::new();
     for receipt in receipts {
         if receipts_by_transaction
-            .insert(receipt.transaction_hash(), receipt)
+            .insert(receipt.transaction_hash, receipt)
             .is_some()
         {
             return Err(PositionHistoryReceiptJoinError::DuplicateReceipt);
@@ -413,28 +515,28 @@ fn bind_position_history_events(
         let receipt = receipts_by_transaction
             .get(transaction_hash)
             .ok_or(PositionHistoryReceiptJoinError::ReceiptSetMismatch)?;
-        if receipt.chain_id() != 137 {
+        if receipt.chain_id != 137 {
             return Err(PositionHistoryReceiptJoinError::ReceiptLocatorMismatch);
         }
-        if receipt.receipt_status() != 1 {
+        if receipt.receipt_status != 1 {
             return Err(PositionHistoryReceiptJoinError::FailedReceipt);
         }
 
         if transaction_events.iter().any(|event| {
-            event.block_number != receipt.block_number()
-                || event.block_hash != receipt.block_hash()
-                || event.transaction_hash != receipt.transaction_hash()
-                || event.transaction_index != receipt.transaction_index()
+            event.block_number != receipt.block_number
+                || event.block_hash != receipt.block_hash
+                || event.transaction_hash != receipt.transaction_hash
+                || event.transaction_index != receipt.transaction_index
         }) {
             return Err(PositionHistoryReceiptJoinError::ReceiptLocatorMismatch);
         }
         let rooted_logs = receipt
-            .receipt_logs()
+            .receipt_logs
             .iter()
             .map(|log| (log.block_log_index(), log))
             .collect::<BTreeMap<_, _>>();
         let movements = receipt
-            .movement_observations()
+            .movement_observations
             .iter()
             .map(|movement| (movement.log_index(), movement))
             .collect::<BTreeMap<_, _>>();
@@ -466,7 +568,7 @@ fn bind_position_history_events(
             validate_holder_direction(&holder, movement)?;
         }
 
-        for rooted in receipt.receipt_logs() {
+        for rooted in receipt.receipt_logs {
             let Some(topic) = rooted.topics().first() else {
                 continue;
             };
@@ -517,6 +619,7 @@ fn bind_position_history_events(
 
     Ok(PositionHistoryReceiptObservation {
         source_kind: context.source_kind,
+        rooted_receipt_source_kind: context.rooted_receipt_source_kind,
         holder_address: holder,
         from_block: context.from_block,
         through_block: context.through_block,

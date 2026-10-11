@@ -7,14 +7,18 @@ use alloy_rlp::Header as RlpHeader;
 use alloy_trie::root::ordered_trie_root_encoded;
 use axum::{Json, Router, extract::State};
 use polymarket_data::{
-    chain_log_audit::{ChainLogVerifier, ChainTransactionReceiptEvidence},
+    chain_log_audit::{
+        ChainLogVerifier, ChainTransactionReceiptEvidence, TransactionRequestBudget,
+        reverify_recorded_transaction_receipt_observation_bounded,
+    },
     position_history::{
         CTF_EMITTER, POSITION_MANAGER_EMITTER, PositionLedger, TRANSFER_BATCH_TOPIC,
         TRANSFER_SINGLE_TOPIC,
     },
     position_history_receipts::{
         PositionHistoryReceiptJoinError, PositionHistoryReceiptSourceKind,
-        bind_position_history_receipts, bind_recorded_position_history_receipts,
+        PositionHistoryRootedReceiptSourceKind, bind_position_history_receipts,
+        bind_recorded_position_history_receipts, bind_recorded_position_history_recorded_receipts,
         validate_position_history_source_agreement,
     },
     rpc_position_history::{
@@ -619,6 +623,40 @@ async fn rooted_receipt(fixture: &Value, tx_hash: &str) -> ChainTransactionRecei
     evidence
 }
 
+async fn captured_and_recorded_rooted_receipts(
+    fixture: &Value,
+    tx_hash: &str,
+) -> (
+    ChainTransactionReceiptEvidence,
+    polymarket_data::chain_log_audit::RecordedChainTransactionReceiptEvidence,
+) {
+    let (primary, primary_task) = start_replay(fixture.clone()).await;
+    let (secondary, secondary_task) = start_replay(fixture.clone()).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
+    let budget = TransactionRequestBudget::new(128);
+    let captured = verifier
+        .capture_transaction_receipt_observation_bounded(
+            tx_hash,
+            &budget,
+            32 * 1024 * 1024,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    let online = captured.evidence().clone();
+    let recorded = reverify_recorded_transaction_receipt_observation_bounded(
+        tx_hash,
+        captured.transcript(),
+        32 * 1024 * 1024,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    primary_task.abort();
+    secondary_task.abort();
+    (online, recorded)
+}
+
 fn unrelated_transaction_hash(fixture: &Value, selected_hash: &str) -> String {
     fixture["rpc_responses"]
         .as_array()
@@ -764,6 +802,10 @@ async fn joins_two_public_history_observations_to_a_rooted_single_receipt() {
     assert_eq!(joined.source_event_count(), 2);
     assert_eq!(joined.unique_transaction_count(), 1);
     assert_eq!(joined.receipt_count(), 1);
+    assert_eq!(
+        joined.rooted_receipt_source_kind(),
+        PositionHistoryRootedReceiptSourceKind::NetworkObservation
+    );
     assert_eq!(joined.candidate_ids().len(), 2);
     assert!(joined.candidate_ids().iter().all(|candidate| {
         candidate.ledger() == PositionLedger::PositionManager && candidate.locators().len() == 1
@@ -1000,7 +1042,136 @@ async fn recorded_receipt_join_matches_live_ids_and_locators_with_recorded_prove
             recorded.source_kind(),
             PositionHistoryReceiptSourceKind::RecordedTranscript
         );
+        assert_eq!(
+            recorded.rooted_receipt_source_kind(),
+            PositionHistoryRootedReceiptSourceKind::NetworkObservation
+        );
     }
+}
+
+#[tokio::test]
+async fn recorded_rooted_receipt_join_matches_live_candidates_and_receipt_provenance() {
+    for fixture in [
+        fixture(),
+        synthetic_ctf_batch_fixture(false, false),
+        synthetic_ctf_batch_fixture(false, true),
+    ] {
+        let (_, tx_hash) = fixture_receipt_and_hash(&fixture);
+        let (network_receipt, recorded_receipt) =
+            captured_and_recorded_rooted_receipts(&fixture, &tx_hash).await;
+        let capture_a =
+            history_segment_and_recorded(&fixture, SourceVariant::Exact, 1, OWNER, 99, 100).await;
+        let capture_b =
+            history_segment_and_recorded(&fixture, SourceVariant::Exact, 2, OWNER, 99, 100).await;
+
+        let live = bind_position_history_receipts(
+            capture_a.online.history(),
+            capture_b.online.history(),
+            std::slice::from_ref(&network_receipt),
+        )
+        .unwrap();
+        let recorded = bind_recorded_position_history_recorded_receipts(
+            &capture_a.recorded,
+            &capture_b.recorded,
+            std::slice::from_ref(&recorded_receipt),
+        )
+        .unwrap();
+
+        assert_eq!(live.candidate_ids(), recorded.candidate_ids());
+        assert_eq!(live.source_event_count(), recorded.source_event_count());
+        assert_eq!(
+            live.unique_transaction_count(),
+            recorded.unique_transaction_count()
+        );
+        assert_eq!(live.receipt_count(), recorded.receipt_count());
+        assert_eq!(live.holder_address(), recorded.holder_address());
+        assert_eq!(live.from_block(), recorded.from_block());
+        assert_eq!(live.through_block(), recorded.through_block());
+        assert_eq!(live.terminal_hash(), recorded.terminal_hash());
+        assert_eq!(
+            live.terminal_receipts_root(),
+            recorded.terminal_receipts_root()
+        );
+        assert_eq!(
+            live.rooted_receipt_source_kind(),
+            PositionHistoryRootedReceiptSourceKind::NetworkObservation
+        );
+        assert_eq!(
+            recorded.rooted_receipt_source_kind(),
+            PositionHistoryRootedReceiptSourceKind::RecordedTranscript
+        );
+        assert_eq!(
+            recorded.source_kind(),
+            PositionHistoryReceiptSourceKind::RecordedTranscript
+        );
+        assert_eq!(recorded.opening_inventory(), "unknown");
+        assert!(!recorded.complete_wallet_history());
+        assert!(!recorded.qualification());
+    }
+}
+
+#[tokio::test]
+async fn recorded_rooted_receipt_join_rejects_incomplete_and_omitted_holder_logs() {
+    let fixture = fixture();
+    let (_, tx_hash) = fixture_receipt_and_hash(&fixture);
+    let (_, receipt) = captured_and_recorded_rooted_receipts(&fixture, &tx_hash).await;
+    let extra_hash = unrelated_transaction_hash(&fixture, &tx_hash);
+    let (_, extra_receipt) = captured_and_recorded_rooted_receipts(&fixture, &extra_hash).await;
+    let exact_a =
+        history_segment_and_recorded(&fixture, SourceVariant::Exact, 1, OWNER, 99, 100).await;
+    let exact_b =
+        history_segment_and_recorded(&fixture, SourceVariant::Exact, 2, OWNER, 99, 100).await;
+    assert_eq!(
+        bind_recorded_position_history_recorded_receipts(&exact_a.recorded, &exact_b.recorded, &[])
+            .unwrap_err(),
+        PositionHistoryReceiptJoinError::ReceiptSetMismatch
+    );
+    assert_eq!(
+        bind_recorded_position_history_recorded_receipts(
+            &exact_a.recorded,
+            &exact_b.recorded,
+            &[receipt.clone(), receipt.clone()]
+        )
+        .unwrap_err(),
+        PositionHistoryReceiptJoinError::DuplicateReceipt
+    );
+    assert_eq!(
+        bind_recorded_position_history_recorded_receipts(
+            &exact_a.recorded,
+            &exact_b.recorded,
+            &[receipt.clone(), extra_receipt]
+        )
+        .unwrap_err(),
+        PositionHistoryReceiptJoinError::ReceiptSetMismatch
+    );
+
+    let omitted_a = history_segment_and_recorded(
+        &fixture,
+        SourceVariant::OmitOneMatchingLog,
+        1,
+        OWNER,
+        99,
+        100,
+    )
+    .await;
+    let omitted_b = history_segment_and_recorded(
+        &fixture,
+        SourceVariant::OmitOneMatchingLog,
+        2,
+        OWNER,
+        99,
+        100,
+    )
+    .await;
+    assert_eq!(
+        bind_recorded_position_history_recorded_receipts(
+            &omitted_a.recorded,
+            &omitted_b.recorded,
+            std::slice::from_ref(&receipt)
+        )
+        .unwrap_err(),
+        PositionHistoryReceiptJoinError::MissingRootedLog
+    );
 }
 
 #[tokio::test]
@@ -1069,11 +1240,22 @@ async fn recorded_receipt_join_preserves_empty_scope_and_refuses_start_header_di
     let recorded =
         bind_recorded_position_history_receipts(&capture_a.recorded, &capture_b.recorded, &[])
             .unwrap();
+    let recorded_receipts = bind_recorded_position_history_recorded_receipts(
+        &capture_a.recorded,
+        &capture_b.recorded,
+        &[],
+    )
+    .unwrap();
     assert!(recorded.candidate_ids().is_empty());
+    assert!(recorded_receipts.candidate_ids().is_empty());
     assert_eq!(live.candidate_ids(), recorded.candidate_ids());
     assert_eq!(
         recorded.source_kind(),
         PositionHistoryReceiptSourceKind::RecordedTranscript
+    );
+    assert_eq!(
+        recorded_receipts.rooted_receipt_source_kind(),
+        PositionHistoryRootedReceiptSourceKind::RecordedTranscript
     );
     assert_eq!(recorded.opening_inventory(), "unknown");
     assert!(!recorded.complete_wallet_history());

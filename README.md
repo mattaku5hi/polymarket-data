@@ -365,11 +365,27 @@ exactly one receipt per hinted transaction, with no extras or duplicates, and
 uses the existing strict ERC1155 decoder. Within those verified receipts, the
 reverse check refuses any holder transfer omitted by both source scans.
 
+`ChainLogVerifier::capture_transaction_receipt_observation_bounded` returns the
+ordinary live receipt observation together with exact ordered request/response
+JSON bodies tagged by primary or secondary source. The raw transcript is
+untrusted portable data. `reverify_recorded_transaction_receipt_observation_bounded`
+replays it offline through the same receipt-root, signed-transaction and
+movement checks and returns `RecordedChainTransactionReceiptEvidence`, which
+does not claim current provider finality. Capture and replay cap each operation
+at 16 requests, 128 MiB of response bodies, 4 KiB per request and 8 MiB per
+response, with a caller deadline no longer than 30 minutes.
+
 `bind_recorded_position_history_receipts(first, second, receipts)` applies the
 same join to two offline-reverified recorded history segments. Its result reports
 `PositionHistoryReceiptSourceKind::RecordedTranscript`; the live binder reports
 `NetworkObservation`. Recorded re-verification checks saved transcript content,
 not whether an RPC occurred or who supplied it.
+
+`bind_recorded_position_history_recorded_receipts(first, second, receipts)` also
+accepts two recorded history segments and offline-reverified recorded receipt
+evidence. Its `rooted_receipt_source_kind()` getter reports
+`PositionHistoryReceiptSourceKind::RecordedTranscript`; this records the
+evidence path, not the identity or independence of the transcript supplier.
 
 The sealed result exposes sorted candidate IDs with ledger and original event
 locators. Equal raw integers in CTF and PositionManager remain different

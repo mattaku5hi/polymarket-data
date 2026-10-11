@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 mod header_binding;
 use header_binding::bind_header;
@@ -176,6 +176,10 @@ const MAX_BLOCKS: u64 = 16;
 const MAX_BRIDGE_BLOCKS: u64 = 64;
 const MAX_VERSION_TRACE_BLOCKS: u64 = 4096;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RECORDED_RECEIPT_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_RECORDED_RECEIPT_REQUESTS: usize = 16;
+const MAX_RECORDED_RECEIPT_REQUEST_BYTES: usize = 4096;
+const MAX_RECORDED_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const BOR_FEE_LOG_ADDRESS: &str = "0x0000000000000000000000000000000000001010";
 const BOR_FEE_LOG_TOPIC: &str =
     "0x4dfe1bbbcf077ddc3e01291eea2d5c70c2b422b415d95645b9adcfd678cb1d63";
@@ -2561,11 +2565,96 @@ pub enum MovementObservationStatus {
     Unsupported(UnsupportedMovementReason),
 }
 
+/// Which configured endpoint produced one request/response pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainRpcSourceRole {
+    Primary,
+    Secondary,
+}
+
+/// Exact receipt-verification HTTP JSON bodies. Deserialized pages are untrusted input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedChainTransactionReceiptRpcPage {
+    source: ChainRpcSourceRole,
+    request_json: String,
+    response_json: String,
+}
+
+impl RecordedChainTransactionReceiptRpcPage {
+    #[must_use]
+    pub const fn source(&self) -> ChainRpcSourceRole {
+        self.source
+    }
+    #[must_use]
+    pub fn request_json(&self) -> &str {
+        &self.request_json
+    }
+    #[must_use]
+    pub fn response_json(&self) -> &str {
+        &self.response_json
+    }
+}
+
+/// Portable raw receipt RPC frames. Serde input is not authority until reverified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedChainTransactionReceiptRpcTranscript {
+    pages: Vec<RecordedChainTransactionReceiptRpcPage>,
+}
+
+impl RecordedChainTransactionReceiptRpcTranscript {
+    #[must_use]
+    pub fn pages(&self) -> &[RecordedChainTransactionReceiptRpcPage] {
+        &self.pages
+    }
+    #[must_use]
+    pub fn request_count(&self) -> usize {
+        self.pages.len()
+    }
+    #[must_use]
+    pub fn response_bytes(&self) -> usize {
+        self.pages.iter().fold(0_usize, |sum, page| {
+            sum.saturating_add(page.response_json.len())
+        })
+    }
+    #[must_use]
+    pub const fn policy_version(&self) -> &'static str {
+        RECORDED_RECEIPT_REVERIFICATION_POLICY_VERSION
+    }
+}
+
+/// Successful online result paired with its exact, bounded raw RPC transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedChainTransactionReceiptObservation {
+    evidence: ChainTransactionReceiptEvidence,
+    transcript: RecordedChainTransactionReceiptRpcTranscript,
+}
+
+impl CapturedChainTransactionReceiptObservation {
+    #[must_use]
+    pub const fn evidence(&self) -> &ChainTransactionReceiptEvidence {
+        &self.evidence
+    }
+    #[must_use]
+    pub const fn transcript(&self) -> &RecordedChainTransactionReceiptRpcTranscript {
+        &self.transcript
+    }
+}
+
 /// Receipt-root-bound transaction observation without decoded order fills.
 /// Raw logs and movements remain untrusted structure; provider-attested finality
 /// is not canonical acceptance, economic activity, or qualification evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainTransactionReceiptEvidence {
+    content: ChainTransactionReceiptContent,
+    finality_attestation: ProviderFinalityAttestation,
+}
+
+/// Content shared by online and offline-reverified receipt observations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainTransactionReceiptContent {
     chain_id: u64,
     transaction_hash: String,
     block_number: u64,
@@ -2575,69 +2664,101 @@ pub struct ChainTransactionReceiptEvidence {
     receipt_status: u64,
     receipt_evidence: ChainReceiptEvidence,
     transactions_root: String,
-    finality_attestation: ProviderFinalityAttestation,
     observer_policy_version: &'static str,
     movement_decoder_policy_version: &'static str,
     receipt_logs: Vec<ChainReceiptLog>,
     movement_observations: Vec<RawMovementObservation>,
 }
 
+/// Offline-reverified receipt content; it makes no current provider-finality claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedChainTransactionReceiptEvidence {
+    content: ChainTransactionReceiptContent,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BoundedRecordedReceiptVerificationError {
+    #[error("transaction verification RPC request budget exhausted")]
+    RequestBudgetExceeded,
+    #[error("transaction verification exceeded its total deadline")]
+    Timeout,
+    #[error(transparent)]
+    Verification(ChainLogAuditError),
+}
+
+macro_rules! receipt_content_getters {
+    ($observation:ident, $content:ident) => {
+        impl $observation {
+            #[must_use]
+            pub fn chain_id(&self) -> u64 {
+                self.$content.chain_id
+            }
+            #[must_use]
+            pub fn transaction_hash(&self) -> &str {
+                &self.$content.transaction_hash
+            }
+            #[must_use]
+            pub fn block_number(&self) -> u64 {
+                self.$content.block_number
+            }
+            #[must_use]
+            pub fn block_hash(&self) -> &str {
+                &self.$content.block_hash
+            }
+            #[must_use]
+            pub fn block_timestamp(&self) -> u64 {
+                self.$content.block_timestamp
+            }
+            #[must_use]
+            pub fn transaction_index(&self) -> u64 {
+                self.$content.transaction_index
+            }
+            #[must_use]
+            pub fn receipt_status(&self) -> u64 {
+                self.$content.receipt_status
+            }
+            #[must_use]
+            pub fn receipt_evidence(&self) -> &ChainReceiptEvidence {
+                &self.$content.receipt_evidence
+            }
+            #[must_use]
+            pub fn transactions_root(&self) -> &str {
+                &self.$content.transactions_root
+            }
+            #[must_use]
+            pub fn observer_policy_version(&self) -> &str {
+                self.$content.observer_policy_version
+            }
+            #[must_use]
+            pub fn movement_decoder_policy_version(&self) -> &str {
+                self.$content.movement_decoder_policy_version
+            }
+            #[must_use]
+            pub fn receipt_logs(&self) -> &[ChainReceiptLog] {
+                &self.$content.receipt_logs
+            }
+            #[must_use]
+            pub fn movement_observations(&self) -> &[RawMovementObservation] {
+                &self.$content.movement_observations
+            }
+        }
+    };
+}
+
+receipt_content_getters!(ChainTransactionReceiptEvidence, content);
+receipt_content_getters!(RecordedChainTransactionReceiptEvidence, content);
+
+impl RecordedChainTransactionReceiptEvidence {
+    #[must_use]
+    pub const fn reverified_policy_version(&self) -> &'static str {
+        RECORDED_RECEIPT_REVERIFICATION_POLICY_VERSION
+    }
+}
+
 impl ChainTransactionReceiptEvidence {
-    #[must_use]
-    pub fn chain_id(&self) -> u64 {
-        self.chain_id
-    }
-    #[must_use]
-    pub fn transaction_hash(&self) -> &str {
-        &self.transaction_hash
-    }
-    #[must_use]
-    pub fn block_number(&self) -> u64 {
-        self.block_number
-    }
-    #[must_use]
-    pub fn block_hash(&self) -> &str {
-        &self.block_hash
-    }
-    #[must_use]
-    pub fn block_timestamp(&self) -> u64 {
-        self.block_timestamp
-    }
-    #[must_use]
-    pub fn transaction_index(&self) -> u64 {
-        self.transaction_index
-    }
-    #[must_use]
-    pub fn receipt_status(&self) -> u64 {
-        self.receipt_status
-    }
-    #[must_use]
-    pub fn receipt_evidence(&self) -> &ChainReceiptEvidence {
-        &self.receipt_evidence
-    }
-    #[must_use]
-    pub fn transactions_root(&self) -> &str {
-        &self.transactions_root
-    }
     #[must_use]
     pub fn finality_attestation(&self) -> ProviderFinalityAttestation {
         self.finality_attestation
-    }
-    #[must_use]
-    pub fn observer_policy_version(&self) -> &str {
-        self.observer_policy_version
-    }
-    #[must_use]
-    pub fn movement_decoder_policy_version(&self) -> &str {
-        self.movement_decoder_policy_version
-    }
-    #[must_use]
-    pub fn receipt_logs(&self) -> &[ChainReceiptLog] {
-        &self.receipt_logs
-    }
-    #[must_use]
-    pub fn movement_observations(&self) -> &[RawMovementObservation] {
-        &self.movement_observations
     }
 }
 
@@ -3015,13 +3136,133 @@ pub const ORDER_OWNER_FILL_DECODER_POLICY_VERSION: &str = "ctf-order-owner-v1-v2
 pub const MOVEMENT_DECODER_POLICY_VERSION: &str = "erc20-transfer-erc1155-single-batch-strict/1";
 pub const RECEIPT_OBSERVER_POLICY_VERSION: &str = "root-bound-raw-receipt-movements/2";
 pub const RECEIPT_INTERVAL_POLICY_VERSION: &str = "root-bound-complete-raw-receipt-interval/2";
+pub const RECORDED_RECEIPT_REVERIFICATION_POLICY_VERSION: &str =
+    "recorded-rooted-transaction-receipt-rpc-transcript/1";
+
+#[derive(Clone)]
+enum RpcExecution {
+    Network,
+    Capture(Arc<Mutex<RpcCaptureState>>),
+    Recorded(Arc<Mutex<RpcReplayState>>),
+}
+
+struct RpcCaptureState {
+    max_response_bytes: usize,
+    response_bytes: usize,
+    pages: Vec<Option<RecordedChainTransactionReceiptRpcPage>>,
+}
+
+impl RpcCaptureState {
+    fn reserve_page(
+        &mut self,
+        source: ChainRpcSourceRole,
+        request_json: String,
+    ) -> Result<usize, ChainLogAuditError> {
+        if self.pages.len() >= MAX_RECORDED_RECEIPT_REQUESTS
+            || request_json.len() > MAX_RECORDED_RECEIPT_REQUEST_BYTES
+        {
+            return Err(ChainLogAuditError::Unverified);
+        }
+        let index = self.pages.len();
+        self.pages
+            .push(Some(RecordedChainTransactionReceiptRpcPage {
+                source,
+                request_json,
+                response_json: String::new(),
+            }));
+        Ok(index)
+    }
+
+    fn retain_response_chunk(&mut self, length: usize) -> Result<(), ChainLogAuditError> {
+        let new_total = self
+            .response_bytes
+            .checked_add(length)
+            .ok_or(ChainLogAuditError::Unverified)?;
+        if new_total > self.max_response_bytes {
+            return Err(ChainLogAuditError::Unverified);
+        }
+        self.response_bytes = new_total;
+        Ok(())
+    }
+
+    fn check_declared_response(&self, length: usize) -> Result<(), ChainLogAuditError> {
+        if self
+            .response_bytes
+            .checked_add(length)
+            .is_none_or(|total| total > self.max_response_bytes)
+        {
+            return Err(ChainLogAuditError::Unverified);
+        }
+        Ok(())
+    }
+
+    fn finish_page(
+        &mut self,
+        index: usize,
+        response_json: String,
+    ) -> Result<(), ChainLogAuditError> {
+        let page = self
+            .pages
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .ok_or(ChainLogAuditError::Unverified)?;
+        page.response_json = response_json;
+        Ok(())
+    }
+}
+
+struct RpcReplayState {
+    primary_pages: Vec<RecordedChainTransactionReceiptRpcPage>,
+    secondary_pages: Vec<RecordedChainTransactionReceiptRpcPage>,
+    primary_cursor: usize,
+    secondary_cursor: usize,
+    max_response_bytes: usize,
+    response_bytes: usize,
+}
+
+impl RpcReplayState {
+    fn next_response(
+        &mut self,
+        source: ChainRpcSourceRole,
+        request_json: &str,
+    ) -> Result<Vec<u8>, ChainLogAuditError> {
+        let (pages, cursor) = match source {
+            ChainRpcSourceRole::Primary => (&self.primary_pages, &mut self.primary_cursor),
+            ChainRpcSourceRole::Secondary => (&self.secondary_pages, &mut self.secondary_cursor),
+        };
+        let page = pages.get(*cursor).ok_or(ChainLogAuditError::Unverified)?;
+        if page.source != source
+            || page.request_json.as_bytes() != request_json.as_bytes()
+            || page.response_json.len() > MAX_RESPONSE_BYTES
+        {
+            return Err(ChainLogAuditError::Unverified);
+        }
+        let response_bytes = page.response_json.as_bytes();
+        let new_total = self
+            .response_bytes
+            .checked_add(response_bytes.len())
+            .ok_or(ChainLogAuditError::Unverified)?;
+        if new_total > self.max_response_bytes {
+            return Err(ChainLogAuditError::Unverified);
+        }
+        self.response_bytes = new_total;
+        *cursor += 1;
+        Ok(response_bytes.to_vec())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.primary_cursor == self.primary_pages.len()
+            && self.secondary_cursor == self.secondary_pages.len()
+    }
+}
 
 pub struct ChainLogVerifier {
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
     primary: String,
     secondary: String,
     request_budget: Option<Arc<OperationRequestBudget>>,
     scoped_call_targets: Option<[Address; 3]>,
+    rpc_execution: RpcExecution,
 }
 
 impl ChainLogVerifier {
@@ -3054,11 +3295,12 @@ impl ChainLogVerifier {
             .build()
             .map_err(|_| ChainLogAuditError::InvalidInput)?;
         Ok(Self {
-            client,
+            client: Some(client),
             primary: primary.to_owned(),
             secondary: secondary.to_owned(),
             request_budget: None,
             scoped_call_targets: None,
+            rpc_execution: RpcExecution::Network,
         })
     }
 
@@ -3870,6 +4112,7 @@ impl ChainLogVerifier {
             secondary: self.secondary.clone(),
             request_budget: Some(budget),
             scoped_call_targets: self.scoped_call_targets,
+            rpc_execution: self.rpc_execution.clone(),
         }
     }
 
@@ -3888,6 +4131,7 @@ impl ChainLogVerifier {
                     .expect("source-pinned pUSD proxy address"),
                 module,
             ]),
+            rpc_execution: self.rpc_execution.clone(),
         }
     }
 
@@ -4053,6 +4297,75 @@ impl ChainLogVerifier {
         }
     }
 
+    /// Verify a transaction receipt and retain the exact bounded RPC frames for offline replay.
+    pub async fn capture_transaction_receipt_observation_bounded(
+        &self,
+        transaction_hash: &str,
+        budget: &TransactionRequestBudget,
+        max_total_response_bytes: usize,
+        total_timeout: Duration,
+    ) -> Result<CapturedChainTransactionReceiptObservation, BoundedRecordedReceiptVerificationError>
+    {
+        if max_total_response_bytes == 0
+            || max_total_response_bytes > MAX_RECORDED_RECEIPT_RESPONSE_BYTES
+            || total_timeout.is_zero()
+            || total_timeout > MAX_RECORDED_RECEIPT_TIMEOUT
+        {
+            return Err(BoundedRecordedReceiptVerificationError::Verification(
+                ChainLogAuditError::InvalidInput,
+            ));
+        }
+        let deadline_at = tokio::time::Instant::now() + total_timeout;
+        let capture = Arc::new(Mutex::new(RpcCaptureState {
+            max_response_bytes: max_total_response_bytes,
+            response_bytes: 0,
+            pages: Vec::new(),
+        }));
+        let mut scoped = self.with_request_budget(budget.inner());
+        scoped.rpc_execution = RpcExecution::Capture(Arc::clone(&capture));
+        let mut exhaustion = budget.0.exhaustion.subscribe();
+        let verification = scoped.verify_transaction_receipt_observation_inner(transaction_hash);
+        tokio::pin!(verification);
+        let deadline = tokio::time::sleep_until(deadline_at);
+        tokio::pin!(deadline);
+        let evidence = tokio::select! {
+            biased;
+            _ = exhaustion.wait_for(|is_exhausted| *is_exhausted) => {
+                return Err(BoundedRecordedReceiptVerificationError::RequestBudgetExceeded);
+            }
+            () = &mut deadline => {
+                return if budget.is_exhausted() {
+                    Err(BoundedRecordedReceiptVerificationError::RequestBudgetExceeded)
+                } else {
+                    Err(BoundedRecordedReceiptVerificationError::Timeout)
+                };
+            }
+            result = &mut verification => {
+                if budget.is_exhausted() {
+                    return Err(BoundedRecordedReceiptVerificationError::RequestBudgetExceeded);
+                }
+                result.map_err(BoundedRecordedReceiptVerificationError::Verification)?
+            }
+        };
+        if tokio::time::Instant::now() >= deadline_at {
+            return Err(BoundedRecordedReceiptVerificationError::Timeout);
+        }
+        let mut state = capture.lock().await;
+        let pages = std::mem::take(&mut state.pages)
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(BoundedRecordedReceiptVerificationError::Verification(
+                ChainLogAuditError::Unverified,
+            ))?;
+        if tokio::time::Instant::now() >= deadline_at {
+            return Err(BoundedRecordedReceiptVerificationError::Timeout);
+        }
+        Ok(CapturedChainTransactionReceiptObservation {
+            evidence,
+            transcript: RecordedChainTransactionReceiptRpcTranscript { pages },
+        })
+    }
+
     /// Verify a receipt using the caller's shared actual-send budget. The caller
     /// owns any larger operation deadline and cancels by dropping this future.
     pub async fn verify_transaction_receipt_observation_with_budget(
@@ -4087,6 +4400,7 @@ impl ChainLogVerifier {
             .verify_transaction_receipt_observation_inner(transaction_hash)
             .await?;
         let fills = receipt
+            .content
             .receipt_logs
             .iter()
             .filter(|log| is_supported_exchange_fill(log))
@@ -4096,17 +4410,17 @@ impl ChainLogVerifier {
             return Err(ChainLogAuditError::Unverified);
         }
         Ok(ChainTransactionEvidence {
-            chain_id: receipt.chain_id,
-            transaction_hash: receipt.transaction_hash,
-            block_timestamp: receipt.block_timestamp,
-            transaction_index: receipt.transaction_index,
-            receipt_status: receipt.receipt_status,
-            receipt_evidence: receipt.receipt_evidence,
-            transactions_root: receipt.transactions_root,
+            chain_id: receipt.content.chain_id,
+            transaction_hash: receipt.content.transaction_hash,
+            block_timestamp: receipt.content.block_timestamp,
+            transaction_index: receipt.content.transaction_index,
+            receipt_status: receipt.content.receipt_status,
+            receipt_evidence: receipt.content.receipt_evidence,
+            transactions_root: receipt.content.transactions_root,
             finality_attestation: receipt.finality_attestation,
             decoder_policy_version: ORDER_OWNER_FILL_DECODER_POLICY_VERSION,
-            receipt_logs: receipt.receipt_logs,
-            movement_observations: receipt.movement_observations,
+            receipt_logs: receipt.content.receipt_logs,
+            movement_observations: receipt.content.movement_observations,
             fills,
         })
     }
@@ -4979,20 +5293,22 @@ impl ChainLogVerifier {
             &requested_hash,
         );
         Ok(ChainTransactionReceiptEvidence {
-            chain_id: CHAIN_ID,
-            transaction_hash: requested_hash,
-            block_number: left.block_number,
-            block_hash: left.block_hash,
-            block_timestamp: verified.block_timestamp,
-            transaction_index: left.transaction_index,
-            receipt_status: left.status,
-            receipt_evidence: verified.evidence,
-            transactions_root: primary,
+            content: ChainTransactionReceiptContent {
+                chain_id: CHAIN_ID,
+                transaction_hash: requested_hash,
+                block_number: left.block_number,
+                block_hash: left.block_hash,
+                block_timestamp: verified.block_timestamp,
+                transaction_index: left.transaction_index,
+                receipt_status: left.status,
+                receipt_evidence: verified.evidence,
+                transactions_root: primary,
+                observer_policy_version: RECEIPT_OBSERVER_POLICY_VERSION,
+                movement_decoder_policy_version: MOVEMENT_DECODER_POLICY_VERSION,
+                movement_observations: decode_movement_observations(&receipt_logs),
+                receipt_logs,
+            },
             finality_attestation: ProviderFinalityAttestation::BothProvidersReportFinalized,
-            observer_policy_version: RECEIPT_OBSERVER_POLICY_VERSION,
-            movement_decoder_policy_version: MOVEMENT_DECODER_POLICY_VERSION,
-            movement_observations: decode_movement_observations(&receipt_logs),
-            receipt_logs,
         })
     }
 
@@ -6203,52 +6519,192 @@ impl ChainLogVerifier {
         method: &str,
         params: Value,
     ) -> Result<Value, ChainLogAuditError> {
-        if let Some(budget) = &self.request_budget {
-            budget
-                .reserve()
-                .map_err(|()| ChainLogAuditError::Unavailable)?;
-        }
-        let mut response = self
-            .client
-            .post(endpoint)
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-            .send()
-            .await
-            .map_err(|_| ChainLogAuditError::Unavailable)?;
-        if !response.status().is_success() {
-            return Err(ChainLogAuditError::Unavailable);
-        }
-        if response
-            .content_length()
-            .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
-        {
+        let source = if endpoint == self.primary {
+            ChainRpcSourceRole::Primary
+        } else if endpoint == self.secondary {
+            ChainRpcSourceRole::Secondary
+        } else {
             return Err(ChainLogAuditError::Unverified);
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| ChainLogAuditError::Unavailable)?
-        {
-            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                return Err(ChainLogAuditError::Unverified);
+        };
+        let request_body =
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+                .map_err(|_| ChainLogAuditError::Unverified)?;
+        let request_json =
+            std::str::from_utf8(&request_body).map_err(|_| ChainLogAuditError::Unverified)?;
+        let mut capture_ticket = None;
+        let response_bytes = match &self.rpc_execution {
+            RpcExecution::Recorded(replay) => {
+                replay.lock().await.next_response(source, request_json)?
             }
-            bytes.extend_from_slice(&chunk);
-        }
+            RpcExecution::Network | RpcExecution::Capture(_) => {
+                if let RpcExecution::Capture(capture) = &self.rpc_execution {
+                    let page_index = capture
+                        .lock()
+                        .await
+                        .reserve_page(source, request_json.to_owned())?;
+                    capture_ticket = Some((Arc::clone(capture), page_index));
+                }
+                if let Some(budget) = &self.request_budget {
+                    budget
+                        .reserve()
+                        .map_err(|()| ChainLogAuditError::Unavailable)?;
+                }
+                let client = self
+                    .client
+                    .as_ref()
+                    .ok_or(ChainLogAuditError::Unavailable)?;
+                let mut response = client
+                    .post(endpoint)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(request_body)
+                    .send()
+                    .await
+                    .map_err(|_| ChainLogAuditError::Unavailable)?;
+                if !response.status().is_success() {
+                    return Err(ChainLogAuditError::Unavailable);
+                }
+                if response
+                    .content_length()
+                    .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
+                {
+                    return Err(ChainLogAuditError::Unverified);
+                }
+                if let (Some((capture, _)), Some(content_length)) =
+                    (&capture_ticket, response.content_length())
+                {
+                    capture.lock().await.check_declared_response(
+                        usize::try_from(content_length)
+                            .map_err(|_| ChainLogAuditError::Unverified)?,
+                    )?;
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| ChainLogAuditError::Unavailable)?
+                {
+                    if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                        return Err(ChainLogAuditError::Unverified);
+                    }
+                    if let Some((capture, _)) = &capture_ticket {
+                        capture.lock().await.retain_response_chunk(chunk.len())?;
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                bytes
+            }
+        };
         let payload: Value =
-            serde_json::from_slice(&bytes).map_err(|_| ChainLogAuditError::Unverified)?;
+            serde_json::from_slice(&response_bytes).map_err(|_| ChainLogAuditError::Unverified)?;
         if payload.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
             || payload.get("id") != Some(&json!(1))
             || payload.get("error").is_some_and(|error| !error.is_null())
         {
             return Err(ChainLogAuditError::Unverified);
         }
-        payload
+        let result = payload
             .get("result")
             .filter(|result| !result.is_null())
             .cloned()
-            .ok_or(ChainLogAuditError::Unverified)
+            .ok_or(ChainLogAuditError::Unverified)?;
+        if let Some((capture, page_index)) = capture_ticket {
+            let response_json =
+                String::from_utf8(response_bytes).map_err(|_| ChainLogAuditError::Unverified)?;
+            capture
+                .lock()
+                .await
+                .finish_page(page_index, response_json)?;
+        }
+        Ok(result)
     }
+}
+
+/// Reverify a bounded saved receipt transcript without selecting or contacting any RPC endpoint.
+pub async fn reverify_recorded_transaction_receipt_observation_bounded(
+    transaction_hash: &str,
+    transcript: &RecordedChainTransactionReceiptRpcTranscript,
+    max_total_response_bytes: usize,
+    total_timeout: Duration,
+) -> Result<RecordedChainTransactionReceiptEvidence, BoundedRecordedReceiptVerificationError> {
+    if max_total_response_bytes == 0
+        || max_total_response_bytes > MAX_RECORDED_RECEIPT_RESPONSE_BYTES
+        || total_timeout.is_zero()
+        || total_timeout > MAX_RECORDED_RECEIPT_TIMEOUT
+        || transcript.pages.is_empty()
+        || transcript.pages.len() > MAX_RECORDED_RECEIPT_REQUESTS
+    {
+        return Err(BoundedRecordedReceiptVerificationError::Verification(
+            ChainLogAuditError::InvalidInput,
+        ));
+    }
+    let started_at = tokio::time::Instant::now();
+    let deadline_at = started_at + total_timeout;
+    let mut response_bytes = 0_usize;
+    let mut primary_pages = Vec::new();
+    let mut secondary_pages = Vec::new();
+    for page in &transcript.pages {
+        if page.request_json.len() > MAX_RECORDED_RECEIPT_REQUEST_BYTES
+            || page.response_json.len() > MAX_RESPONSE_BYTES
+        {
+            return Err(BoundedRecordedReceiptVerificationError::Verification(
+                ChainLogAuditError::Unverified,
+            ));
+        }
+        response_bytes = response_bytes.checked_add(page.response_json.len()).ok_or(
+            BoundedRecordedReceiptVerificationError::Verification(ChainLogAuditError::Unverified),
+        )?;
+        if response_bytes > max_total_response_bytes {
+            return Err(BoundedRecordedReceiptVerificationError::Verification(
+                ChainLogAuditError::Unverified,
+            ));
+        }
+        match page.source {
+            ChainRpcSourceRole::Primary => primary_pages.push(page.clone()),
+            ChainRpcSourceRole::Secondary => secondary_pages.push(page.clone()),
+        }
+    }
+    if tokio::time::Instant::now() >= deadline_at {
+        return Err(BoundedRecordedReceiptVerificationError::Timeout);
+    }
+    let replay = Arc::new(Mutex::new(RpcReplayState {
+        primary_pages,
+        secondary_pages,
+        primary_cursor: 0,
+        secondary_cursor: 0,
+        max_response_bytes: max_total_response_bytes,
+        response_bytes: 0,
+    }));
+    let verifier = ChainLogVerifier {
+        client: None,
+        primary: "recorded-receipt-primary".to_owned(),
+        secondary: "recorded-receipt-secondary".to_owned(),
+        request_budget: None,
+        scoped_call_targets: None,
+        rpc_execution: RpcExecution::Recorded(Arc::clone(&replay)),
+    };
+    let verification = verifier.verify_transaction_receipt_observation_inner(transaction_hash);
+    tokio::pin!(verification);
+    let deadline = tokio::time::sleep_until(deadline_at);
+    tokio::pin!(deadline);
+    let evidence = tokio::select! {
+        biased;
+        () = &mut deadline => return Err(BoundedRecordedReceiptVerificationError::Timeout),
+        result = &mut verification => {
+            result.map_err(BoundedRecordedReceiptVerificationError::Verification)?
+        }
+    };
+    let replay_state = replay.lock().await;
+    if !replay_state.is_complete() {
+        return Err(BoundedRecordedReceiptVerificationError::Verification(
+            ChainLogAuditError::Unverified,
+        ));
+    }
+    if tokio::time::Instant::now() >= deadline_at {
+        return Err(BoundedRecordedReceiptVerificationError::Timeout);
+    }
+    Ok(RecordedChainTransactionReceiptEvidence {
+        content: evidence.content,
+    })
 }
 
 fn proxy_version_trace(
@@ -10125,6 +10581,10 @@ mod receipt_tests {
     use alloy_trie::{EMPTY_ROOT_HASH, HashBuilder, proof::ProofRetainer};
     use axum::{Json, Router, extract::State, routing::post};
     use k256::ecdsa::SigningKey;
+
+    mod recorded_receipt_transcript_tests {
+        include!("chain_log_audit/recorded_receipt_transcript_tests.rs");
+    }
 
     mod native_trade_branches {
         include!("chain_log_audit/native_trade_branch_tests.rs");
