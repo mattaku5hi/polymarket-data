@@ -374,6 +374,10 @@ movement checks and returns `RecordedChainTransactionReceiptEvidence`, which
 does not claim current provider finality. Capture and replay cap each operation
 at 16 requests, 128 MiB of response bodies, 4 KiB per request and 8 MiB per
 response, with a caller deadline no longer than 30 minutes.
+Call `ChainLogVerifier::with_full_block_hash_lookup()` to request the full
+transaction objects by the already checked block hash. Number lookup remains
+the default; recorded replay accepts either exact lookup shape and never falls
+back between them.
 
 `bind_recorded_position_history_receipts(first, second, receipts)` applies the
 same join to two offline-reverified recorded history segments. Its result reports

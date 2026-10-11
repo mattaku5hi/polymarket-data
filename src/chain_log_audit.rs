@@ -3211,6 +3211,70 @@ impl RpcCaptureState {
     }
 }
 
+fn recorded_full_block_hash_lookup(
+    pages: &[RecordedChainTransactionReceiptRpcPage],
+) -> Result<bool, ChainLogAuditError> {
+    let mut modes = [None; 2];
+    let mut counts = [0_usize; 2];
+    for page in pages {
+        let request: Value =
+            serde_json::from_str(&page.request_json).map_err(|_| ChainLogAuditError::Unverified)?;
+        let Some(method) = request.get("method").and_then(Value::as_str) else {
+            continue;
+        };
+        let source_index = match page.source {
+            ChainRpcSourceRole::Primary => 0,
+            ChainRpcSourceRole::Secondary => 1,
+        };
+        let Some(params) = request.get("params").and_then(Value::as_array) else {
+            if matches!(method, "eth_getBlockByNumber" | "eth_getBlockByHash") {
+                return Err(ChainLogAuditError::Unverified);
+            }
+            continue;
+        };
+        let full_block_hash_lookup = match method {
+            "eth_getBlockByNumber" => {
+                if params.len() != 2
+                    || params[0].as_str().is_none()
+                    || params[1].as_bool().is_none()
+                {
+                    return Err(ChainLogAuditError::Unverified);
+                }
+                if params[1] == true {
+                    parse_hex_u64(params[0].as_str().unwrap())?;
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            "eth_getBlockByHash" => {
+                if params.len() != 2 || params[1] != true {
+                    return Err(ChainLogAuditError::Unverified);
+                }
+                validate_hex(
+                    params[0].as_str().ok_or(ChainLogAuditError::Unverified)?,
+                    32,
+                )?;
+                Some(true)
+            }
+            _ => None,
+        };
+        if let Some(mode) = full_block_hash_lookup {
+            counts[source_index] = counts[source_index]
+                .checked_add(1)
+                .ok_or(ChainLogAuditError::Unverified)?;
+            if modes[source_index].is_some_and(|previous| previous != mode) {
+                return Err(ChainLogAuditError::Unverified);
+            }
+            modes[source_index] = Some(mode);
+        }
+    }
+    if counts != [1, 1] || modes[0].is_none() || modes[0] != modes[1] {
+        return Err(ChainLogAuditError::Unverified);
+    }
+    modes[0].ok_or(ChainLogAuditError::Unverified)
+}
+
 struct RpcReplayState {
     primary_pages: Vec<RecordedChainTransactionReceiptRpcPage>,
     secondary_pages: Vec<RecordedChainTransactionReceiptRpcPage>,
@@ -3263,6 +3327,7 @@ pub struct ChainLogVerifier {
     request_budget: Option<Arc<OperationRequestBudget>>,
     scoped_call_targets: Option<[Address; 3]>,
     rpc_execution: RpcExecution,
+    full_block_hash_lookup: bool,
 }
 
 impl ChainLogVerifier {
@@ -3301,7 +3366,16 @@ impl ChainLogVerifier {
             request_budget: None,
             scoped_call_targets: None,
             rpc_execution: RpcExecution::Network,
+            full_block_hash_lookup: false,
         })
+    }
+
+    /// Fetch full signed transaction blocks by their already checked hash.
+    /// All default callers continue to use `eth_getBlockByNumber`.
+    #[must_use]
+    pub fn with_full_block_hash_lookup(mut self) -> Self {
+        self.full_block_hash_lookup = true;
+        self
     }
 
     /// Every block in the requested interval must be finalized on both chains.
@@ -4113,6 +4187,7 @@ impl ChainLogVerifier {
             request_budget: Some(budget),
             scoped_call_targets: self.scoped_call_targets,
             rpc_execution: self.rpc_execution.clone(),
+            full_block_hash_lookup: self.full_block_hash_lookup,
         }
     }
 
@@ -4132,6 +4207,7 @@ impl ChainLogVerifier {
                 module,
             ]),
             rpc_execution: self.rpc_execution.clone(),
+            full_block_hash_lookup: self.full_block_hash_lookup,
         }
     }
 
@@ -5319,13 +5395,15 @@ impl ChainLogVerifier {
         expected_block_hash: &str,
         verified: &VerifiedReceiptBlock,
     ) -> Result<(String, Vec<RootBoundTransactionCallContext>), ChainLogAuditError> {
-        let block_value = self
-            .rpc(
-                endpoint,
+        let (method, params) = if self.full_block_hash_lookup {
+            ("eth_getBlockByHash", json!([expected_block_hash, true]))
+        } else {
+            (
                 "eth_getBlockByNumber",
                 json!([format!("{number:#x}"), true]),
             )
-            .await?;
+        };
+        let block_value = self.rpc(endpoint, method, params).await?;
         let block = bind_header(&block_value)?;
         if block.number != number
             || block.hash != expected_block_hash
@@ -6663,6 +6741,8 @@ pub async fn reverify_recorded_transaction_receipt_observation_bounded(
             ChainRpcSourceRole::Secondary => secondary_pages.push(page.clone()),
         }
     }
+    let full_block_hash_lookup = recorded_full_block_hash_lookup(&transcript.pages)
+        .map_err(BoundedRecordedReceiptVerificationError::Verification)?;
     if tokio::time::Instant::now() >= deadline_at {
         return Err(BoundedRecordedReceiptVerificationError::Timeout);
     }
@@ -6681,6 +6761,7 @@ pub async fn reverify_recorded_transaction_receipt_observation_bounded(
         request_budget: None,
         scoped_call_targets: None,
         rpc_execution: RpcExecution::Recorded(Arc::clone(&replay)),
+        full_block_hash_lookup,
     };
     let verification = verifier.verify_transaction_receipt_observation_inner(transaction_hash);
     tokio::pin!(verification);

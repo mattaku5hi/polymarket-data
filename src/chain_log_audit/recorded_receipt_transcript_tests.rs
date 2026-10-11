@@ -118,6 +118,62 @@ async fn late_failure_provider(fixture: CtfInventoryFixture, fail_late: bool) ->
     url
 }
 
+#[derive(Clone)]
+struct HashLookupRpcState {
+    fixture: CtfInventoryFixture,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    refuse_hash: bool,
+}
+
+async fn hash_lookup_rpc(
+    State(state): State<HashLookupRpcState>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    if request["method"] == "eth_getBlockByHash" {
+        state
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let result = if state.refuse_hash {
+            Value::Null
+        } else {
+            let (opening, header, _) = ctf_inventory_headers(&state.fixture);
+            let full =
+                ctf_inventory_header(100, opening["hash"].as_str().unwrap(), &state.fixture, true);
+            if request["params"][0] == header["hash"] {
+                full
+            } else {
+                Value::Null
+            }
+        };
+        return Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}));
+    }
+    receipt_transcript_rpc(State(state.fixture), Json(request)).await
+}
+
+async fn hash_lookup_provider(
+    fixture: CtfInventoryFixture,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    refuse_hash: bool,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/", post(hash_lookup_rpc))
+                .with_state(HashLookupRpcState {
+                    fixture,
+                    requests,
+                    refuse_hash,
+                }),
+        )
+        .await
+        .unwrap();
+    });
+    url
+}
+
 fn receipt_transcript_fixture() -> (CtfInventoryFixture, String) {
     let (transaction, _) = signed_polygon_native_gas_transaction(
         0,
@@ -176,7 +232,7 @@ fn mutate_response(value: &mut Value, method: &str, mutate: impl FnOnce(&mut Val
 async fn captured_receipt_replays_offline_with_identical_rooted_content() {
     let (fixture, transaction_hash) = receipt_transcript_fixture();
     let primary = receipt_transcript_provider(fixture.clone()).await;
-    let secondary = receipt_transcript_provider(fixture).await;
+    let secondary = receipt_transcript_provider(fixture.clone()).await;
     let verifier = ChainLogVerifier::new(&primary, &secondary).unwrap();
     let budget = TransactionRequestBudget::new(16);
     let captured = verifier
@@ -197,6 +253,12 @@ async fn captured_receipt_replays_offline_with_identical_rooted_content() {
     assert_eq!(
         budget.reserved_requests(),
         captured.transcript().request_count()
+    );
+    assert_eq!(
+        fixture
+            .full_block_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
     );
     assert_eq!(
         captured.transcript().policy_version(),
@@ -541,4 +603,208 @@ async fn capture_deadline_cancellation_and_late_validation_failure_return_no_suc
         )
         .await;
     assert!(late_failure.is_err());
+}
+
+#[tokio::test]
+async fn explicit_hash_lookup_captures_sixteen_sends_and_replays_same_content() {
+    let (fixture, transaction_hash) = receipt_transcript_fixture();
+    let primary_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let secondary_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let primary = hash_lookup_provider(fixture.clone(), primary_requests.clone(), false).await;
+    let secondary = hash_lookup_provider(fixture.clone(), secondary_requests.clone(), false).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .with_full_block_hash_lookup();
+    let budget = TransactionRequestBudget::new(MAX_RECORDED_RECEIPT_REQUESTS);
+    let captured = verifier
+        .capture_transaction_receipt_observation_bounded(
+            &transaction_hash,
+            &budget,
+            MAX_RECORDED_RECEIPT_RESPONSE_BYTES,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+    let full_block_requests = captured
+        .transcript()
+        .pages()
+        .iter()
+        .filter(|page| {
+            serde_json::from_str::<Value>(page.request_json()).unwrap()["method"]
+                == "eth_getBlockByHash"
+        })
+        .count();
+    assert_eq!(captured.transcript().request_count(), 16);
+    assert_eq!(budget.reserved_requests(), 16);
+    assert_eq!(
+        primary_requests.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        secondary_requests.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(full_block_requests, 2);
+    assert_eq!(
+        fixture
+            .full_block_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    let replayed = reverify_recorded_transaction_receipt_observation_bounded(
+        &transaction_hash,
+        captured.transcript(),
+        MAX_RECORDED_RECEIPT_RESPONSE_BYTES,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replayed.chain_id(), captured.evidence().chain_id());
+    assert_eq!(
+        replayed.transaction_hash(),
+        captured.evidence().transaction_hash()
+    );
+    assert_eq!(replayed.block_hash(), captured.evidence().block_hash());
+    assert_eq!(
+        replayed.receipt_evidence(),
+        captured.evidence().receipt_evidence()
+    );
+    assert_eq!(
+        replayed.transactions_root(),
+        captured.evidence().transactions_root()
+    );
+    assert_eq!(replayed.receipt_logs(), captured.evidence().receipt_logs());
+    assert_eq!(
+        replayed.movement_observations(),
+        captured.evidence().movement_observations()
+    );
+    assert_eq!(
+        replayed.reverified_policy_version(),
+        RECORDED_RECEIPT_REVERIFICATION_POLICY_VERSION
+    );
+}
+
+#[tokio::test]
+async fn hash_lookup_refusal_does_not_fall_back_to_block_number() {
+    let (fixture, transaction_hash) = receipt_transcript_fixture();
+    let hash_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let primary = hash_lookup_provider(fixture.clone(), hash_requests.clone(), true).await;
+    let secondary = hash_lookup_provider(fixture.clone(), hash_requests.clone(), true).await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .with_full_block_hash_lookup();
+
+    assert!(
+        verifier
+            .capture_transaction_receipt_observation_bounded(
+                &transaction_hash,
+                &TransactionRequestBudget::new(MAX_RECORDED_RECEIPT_REQUESTS),
+                MAX_RECORDED_RECEIPT_RESPONSE_BYTES,
+                Duration::from_secs(30),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(hash_requests.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(
+        fixture
+            .full_block_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn hash_lookup_replay_rejects_wrong_context_and_rooted_content_mutations() {
+    let (fixture, transaction_hash) = receipt_transcript_fixture();
+    let primary = hash_lookup_provider(
+        fixture.clone(),
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        false,
+    )
+    .await;
+    let secondary = hash_lookup_provider(
+        fixture,
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        false,
+    )
+    .await;
+    let verifier = ChainLogVerifier::new(&primary, &secondary)
+        .unwrap()
+        .with_full_block_hash_lookup();
+    let captured = verifier
+        .capture_transaction_receipt_observation_bounded(
+            &transaction_hash,
+            &TransactionRequestBudget::new(MAX_RECORDED_RECEIPT_REQUESTS),
+            MAX_RECORDED_RECEIPT_RESPONSE_BYTES,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    let original = serde_json::to_value(captured.transcript()).unwrap();
+    let hash_page = page_for_method(&original, "eth_getBlockByHash");
+    let mut mutations = Vec::new();
+
+    let mut wrong_requested_hash = original.clone();
+    let request = wrong_requested_hash["pages"][hash_page]["request_json"]
+        .as_str()
+        .unwrap();
+    let mut request: Value = serde_json::from_str(request).unwrap();
+    request["params"][0] = json!(format!("0x{}", "dd".repeat(32)));
+    wrong_requested_hash["pages"][hash_page]["request_json"] = json!(request.to_string());
+    mutations.push(wrong_requested_hash);
+
+    let mut inconsistent_modes = original.clone();
+    let request = inconsistent_modes["pages"][hash_page]["request_json"]
+        .as_str()
+        .unwrap();
+    let mut request: Value = serde_json::from_str(request).unwrap();
+    request["method"] = json!("eth_getBlockByNumber");
+    request["params"] = json!(["0x64", true]);
+    inconsistent_modes["pages"][hash_page]["request_json"] = json!(request.to_string());
+    mutations.push(inconsistent_modes);
+
+    let mut wrong_hash_flag = original.clone();
+    let request = wrong_hash_flag["pages"][hash_page]["request_json"]
+        .as_str()
+        .unwrap();
+    let mut request: Value = serde_json::from_str(request).unwrap();
+    request["params"][1] = json!(false);
+    wrong_hash_flag["pages"][hash_page]["request_json"] = json!(request.to_string());
+    mutations.push(wrong_hash_flag);
+
+    for (field, value) in [
+        ("hash", json!(format!("0x{}", "ee".repeat(32)))),
+        ("number", json!("0x65")),
+        ("receiptsRoot", json!(format!("0x{}", "aa".repeat(32)))),
+        ("transactionsRoot", json!(format!("0x{}", "bb".repeat(32)))),
+    ] {
+        let mut mutation = original.clone();
+        mutate_response(&mut mutation, "eth_getBlockByHash", |response| {
+            response["result"][field] = value;
+        });
+        mutations.push(mutation);
+    }
+
+    let mut altered_transaction = original;
+    mutate_response(&mut altered_transaction, "eth_getBlockByHash", |response| {
+        response["result"]["transactions"][0]["r"] = json!("0x01")
+    });
+    mutations.push(altered_transaction);
+
+    for mutation in mutations {
+        let transcript = replay_transcript(mutation);
+        assert!(
+            reverify_recorded_transaction_receipt_observation_bounded(
+                &transaction_hash,
+                &transcript,
+                MAX_RECORDED_RECEIPT_RESPONSE_BYTES,
+                Duration::from_secs(30),
+            )
+            .await
+            .is_err()
+        );
+    }
 }
