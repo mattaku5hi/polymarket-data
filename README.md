@@ -306,6 +306,28 @@ chunks. The example accepts an optional fifth span argument and then uses the
 same30-second/32MiB limits with512 calls. This enables bounded windows, not an
 automatic full-genesis scan or a claim of provider/source completeness.
 
+For caller-managed backward capture, the additive
+`read_history_segment_paginated(request, max_blocks_per_log_query)` also reads
+the provider-reported header at the interval's start. Its sealed result exposes
+`history()` and start number/hash/parent-hash getters. The same request, byte and
+deadline limits cover all calls: five context calls plus two per log chunk,
+so at most253 chunks fit the512-call cap. Start/terminal boundary log hashes
+must match those headers; existing methods keep their four-context-call behavior.
+With `chain-audit`, `rpc_position_history::validate_position_history_segment_source_agreement`
+compares complete start-header fields and reuses the existing source agreement
+check. The caller can use the agreed start parent as the next lower interval's
+terminal anchor. This is source-reported boundary continuity; headers remain
+structurally parsed and neither interior ancestry nor omission completeness is
+proved. Durable progress, cumulative budgets and saved-capture validation remain
+caller-owned. Saved JSON cannot construct a sealed SDK observation.
+
+`RpcPositionHistoryReader::new_with_request_interval(builder, endpoint, interval)`
+adds explicit pacing between request launches on the same reader, including
+successive or concurrent reads. Waiting uses each operation's existing deadline;
+cancellation or expiry starts no later request. It adds no retry or extra call.
+The ordinary `new` constructor retains zero spacing. Provider method costs,
+other clients' traffic and account-wide quotas remain caller-owned.
+
 With `chain-audit`, `position_history_receipts::validate_position_history_source_agreement`
 checks two sealed RPC observations for the same holder, interval, terminal roots
 and canonical event set before a caller starts receipt I/O. Different page widths
