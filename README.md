@@ -339,7 +339,12 @@ check. The caller can use the agreed start parent as the next lower interval's
 terminal anchor. This is source-reported boundary continuity; headers remain
 structurally parsed and neither interior ancestry nor omission completeness is
 proved. Durable progress, cumulative budgets and saved-capture validation remain
-caller-owned. Saved JSON cannot construct a sealed SDK observation.
+caller-owned. `reverify_recorded_rpc_position_history_segment` validates an
+ordered list of saved request/response JSON pages against the same generated
+methods, filters, IDs, bounds and response checks without making network calls.
+Its distinct sealed result has no acquisition-clock data or network conversion;
+it verifies transcript consistency, not provider identity, that calls occurred,
+or source completeness.
 
 `RpcPositionHistoryReader::new_with_request_interval(builder, endpoint, interval)`
 adds explicit pacing between request launches on the same reader, including

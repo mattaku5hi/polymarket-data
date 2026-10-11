@@ -19,6 +19,7 @@ use crate::position_history::{
 const RPC_CHAIN_ID: u64 = 137;
 const RPC_CONTEXT_CALLS: u128 = 4;
 const RPC_SEGMENT_CONTEXT_CALLS: u128 = 5;
+const MAX_RECORDED_REQUEST_BYTES: usize = 4096;
 
 /// Structural source capture with an extra start-header observation; no ancestry proof.
 pub const RPC_POSITION_HISTORY_SEGMENT_POLICY_VERSION: &str =
@@ -82,6 +83,13 @@ pub struct RpcPositionHistoryPage {
     response_json: String,
 }
 
+/// Untrusted raw JSON-RPC frames retained by the host capture journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedRpcPositionHistoryPage {
+    pub request_json: String,
+    pub response_json: String,
+}
+
 impl RpcPositionHistoryPage {
     #[must_use]
     pub fn method(&self) -> &str {
@@ -110,6 +118,14 @@ struct RpcBlockHeader {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcPositionHistoryObservation {
+    content: RpcPositionHistoryContent,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    elapsed: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RpcPositionHistoryContent {
     holder_address: String,
     from_block: u64,
     through_block: u64,
@@ -117,9 +133,6 @@ pub struct RpcPositionHistoryObservation {
     terminal_header: RpcBlockHeader,
     logs: Vec<PositionTransferLog>,
     pages: Vec<RpcPositionHistoryPage>,
-    started_at: DateTime<Utc>,
-    completed_at: DateTime<Utc>,
-    elapsed: Duration,
     request_count: usize,
     response_bytes: usize,
 }
@@ -127,47 +140,47 @@ pub struct RpcPositionHistoryObservation {
 impl RpcPositionHistoryObservation {
     #[must_use]
     pub fn holder_address(&self) -> &str {
-        &self.holder_address
+        &self.content.holder_address
     }
     #[must_use]
     pub const fn from_block(&self) -> u64 {
-        self.from_block
+        self.content.from_block
     }
     #[must_use]
     pub const fn through_block(&self) -> u64 {
-        self.through_block
+        self.content.through_block
     }
     #[must_use]
     pub fn expected_through_hash(&self) -> &str {
-        &self.expected_through_hash
+        &self.content.expected_through_hash
     }
     #[must_use]
     pub const fn terminal_number(&self) -> u64 {
-        self.terminal_header.number
+        self.content.terminal_header.number
     }
     #[must_use]
     pub fn terminal_hash(&self) -> &str {
-        &self.terminal_header.hash
+        &self.content.terminal_header.hash
     }
     #[must_use]
     pub fn terminal_state_root(&self) -> &str {
-        &self.terminal_header.state_root
+        &self.content.terminal_header.state_root
     }
     #[must_use]
     pub fn terminal_transactions_root(&self) -> &str {
-        &self.terminal_header.transactions_root
+        &self.content.terminal_header.transactions_root
     }
     #[must_use]
     pub fn terminal_receipts_root(&self) -> &str {
-        &self.terminal_header.receipts_root
+        &self.content.terminal_header.receipts_root
     }
     #[must_use]
     pub fn logs(&self) -> &[PositionTransferLog] {
-        &self.logs
+        &self.content.logs
     }
     #[must_use]
     pub fn pages(&self) -> &[RpcPositionHistoryPage] {
-        &self.pages
+        &self.content.pages
     }
     #[must_use]
     pub const fn started_at(&self) -> DateTime<Utc> {
@@ -183,11 +196,11 @@ impl RpcPositionHistoryObservation {
     }
     #[must_use]
     pub const fn request_count(&self) -> usize {
-        self.request_count
+        self.content.request_count
     }
     #[must_use]
     pub const fn response_bytes(&self) -> usize {
-        self.response_bytes
+        self.content.response_bytes
     }
 }
 
@@ -195,6 +208,13 @@ impl RpcPositionHistoryObservation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcPositionHistorySegmentObservation {
     history: RpcPositionHistoryObservation,
+    start_header: RpcBlockHeader,
+}
+
+/// Offline-reverified content from a bounded ordered RPC transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedRpcPositionHistorySegmentObservation {
+    content: RpcPositionHistoryContent,
     start_header: RpcBlockHeader,
 }
 
@@ -220,6 +240,73 @@ impl RpcPositionHistorySegmentObservation {
     }
 }
 
+impl RecordedRpcPositionHistorySegmentObservation {
+    #[must_use]
+    pub fn holder_address(&self) -> &str {
+        &self.content.holder_address
+    }
+    #[must_use]
+    pub const fn from_block(&self) -> u64 {
+        self.content.from_block
+    }
+    #[must_use]
+    pub const fn through_block(&self) -> u64 {
+        self.content.through_block
+    }
+    #[must_use]
+    pub fn expected_through_hash(&self) -> &str {
+        &self.content.expected_through_hash
+    }
+    #[must_use]
+    pub const fn start_block_number(&self) -> u64 {
+        self.start_header.number
+    }
+    #[must_use]
+    pub fn start_block_hash(&self) -> &str {
+        &self.start_header.hash
+    }
+    #[must_use]
+    pub fn start_parent_hash(&self) -> &str {
+        &self.start_header.parent_hash
+    }
+    #[must_use]
+    pub const fn terminal_number(&self) -> u64 {
+        self.content.terminal_header.number
+    }
+    #[must_use]
+    pub fn terminal_hash(&self) -> &str {
+        &self.content.terminal_header.hash
+    }
+    #[must_use]
+    pub fn terminal_state_root(&self) -> &str {
+        &self.content.terminal_header.state_root
+    }
+    #[must_use]
+    pub fn terminal_transactions_root(&self) -> &str {
+        &self.content.terminal_header.transactions_root
+    }
+    #[must_use]
+    pub fn terminal_receipts_root(&self) -> &str {
+        &self.content.terminal_header.receipts_root
+    }
+    #[must_use]
+    pub fn logs(&self) -> &[PositionTransferLog] {
+        &self.content.logs
+    }
+    #[must_use]
+    pub fn pages(&self) -> &[RpcPositionHistoryPage] {
+        &self.content.pages
+    }
+    #[must_use]
+    pub const fn request_count(&self) -> usize {
+        self.content.request_count
+    }
+    #[must_use]
+    pub const fn response_bytes(&self) -> usize {
+        self.content.response_bytes
+    }
+}
+
 /// Validates matching source events and complete provider-reported start headers.
 #[cfg(feature = "chain-audit")]
 pub fn validate_position_history_segment_source_agreement(
@@ -230,6 +317,45 @@ pub fn validate_position_history_segment_source_agreement(
         source_a.history(),
         source_b.history(),
     )?;
+    if source_a.start_header != source_b.start_header {
+        return Err(
+            crate::position_history_receipts::PositionHistoryReceiptJoinError::SourceMismatch,
+        );
+    }
+    Ok(())
+}
+
+/// Validates matching content and complete start headers from two stored transcripts.
+#[cfg(feature = "chain-audit")]
+pub fn validate_recorded_position_history_segment_source_agreement(
+    source_a: &RecordedRpcPositionHistorySegmentObservation,
+    source_b: &RecordedRpcPositionHistorySegmentObservation,
+) -> Result<(), crate::position_history_receipts::PositionHistoryReceiptJoinError> {
+    let a = &source_a.content;
+    let b = &source_b.content;
+    if a.from_block > a.through_block
+        || a.holder_address != b.holder_address
+        || a.from_block != b.from_block
+        || a.through_block != b.through_block
+        || a.expected_through_hash != b.expected_through_hash
+        || a.terminal_header.number != a.through_block
+        || b.terminal_header.number != b.through_block
+        || a.terminal_header.hash != a.expected_through_hash
+        || b.terminal_header.hash != b.expected_through_hash
+        || a.terminal_header.hash != b.terminal_header.hash
+        || a.terminal_header.state_root != b.terminal_header.state_root
+        || a.terminal_header.transactions_root != b.terminal_header.transactions_root
+        || a.terminal_header.receipts_root != b.terminal_header.receipts_root
+    {
+        return Err(
+            crate::position_history_receipts::PositionHistoryReceiptJoinError::InvalidInput,
+        );
+    }
+    if a.logs != b.logs {
+        return Err(
+            crate::position_history_receipts::PositionHistoryReceiptJoinError::SourceMismatch,
+        );
+    }
     if source_a.start_header != source_b.start_header {
         return Err(
             crate::position_history_receipts::PositionHistoryReceiptJoinError::SourceMismatch,
@@ -305,9 +431,10 @@ impl RpcPositionHistoryReader {
         &self,
         request: &RpcPositionHistoryRequest,
     ) -> Result<RpcPositionHistoryObservation, RpcPositionHistoryError> {
-        self.read_history_inner(request, None, false)
-            .await
-            .map(|(observation, _)| observation)
+        let mut source = RpcCallSource::Network(self);
+        Self::read_history_inner(request, None, false, &mut source)
+            .await?
+            .into_network_observation()
     }
 
     /// Reads one finite interval using caller-sized inclusive `eth_getLogs` ranges.
@@ -322,9 +449,10 @@ impl RpcPositionHistoryReader {
         if max_blocks_per_log_query == 0 {
             return Err(RpcPositionHistoryError::InvalidInput);
         }
-        self.read_history_inner(request, Some(max_blocks_per_log_query), false)
-            .await
-            .map(|(observation, _)| observation)
+        let mut source = RpcCallSource::Network(self);
+        Self::read_history_inner(request, Some(max_blocks_per_log_query), false, &mut source)
+            .await?
+            .into_network_observation()
     }
 
     /// Reads a bounded interval and captures its provider-reported start header under the same
@@ -337,23 +465,26 @@ impl RpcPositionHistoryReader {
         if max_blocks_per_log_query == 0 {
             return Err(RpcPositionHistoryError::InvalidInput);
         }
-        let (history, start_header) = self
-            .read_history_inner(request, Some(max_blocks_per_log_query), true)
-            .await?;
-        let start_header = start_header.ok_or(RpcPositionHistoryError::MalformedResponse)?;
+        let mut source = RpcCallSource::Network(self);
+        let output =
+            Self::read_history_inner(request, Some(max_blocks_per_log_query), true, &mut source)
+                .await?;
+        let start_header = output
+            .start_header
+            .clone()
+            .ok_or(RpcPositionHistoryError::MalformedResponse)?;
         Ok(RpcPositionHistorySegmentObservation {
-            history,
+            history: output.into_network_observation()?,
             start_header,
         })
     }
 
     async fn read_history_inner(
-        &self,
         request: &RpcPositionHistoryRequest,
         max_blocks_per_log_query: Option<u64>,
         include_start_header: bool,
-    ) -> Result<(RpcPositionHistoryObservation, Option<RpcBlockHeader>), RpcPositionHistoryError>
-    {
+        source: &mut RpcCallSource<'_>,
+    ) -> Result<ReadOutput, RpcPositionHistoryError> {
         let holder = normalize_address(&request.holder_address)
             .ok_or(RpcPositionHistoryError::InvalidInput)?;
         if holder == format!("0x{}", "00".repeat(20)) {
@@ -387,8 +518,9 @@ impl RpcPositionHistoryReader {
         if planned_calls > request.max_requests as u128 {
             return Err(RpcPositionHistoryError::RequestBudgetExceeded);
         }
+        source.validate_count(planned_calls)?;
 
-        let started_at = Utc::now();
+        let started_at = source.is_network().then(Utc::now);
         let start = tokio::time::Instant::now();
         let deadline = start
             .checked_add(request.total_timeout)
@@ -398,13 +530,13 @@ impl RpcPositionHistoryReader {
             response_bytes: 0,
             next_id: 1,
         };
-        let chain = self
+        let chain = source
             .call("eth_chainId", json!([]), deadline, request, &mut state)
             .await?;
         if parse_quantity(&chain) != Some(RPC_CHAIN_ID) {
             return Err(RpcPositionHistoryError::WrongChain);
         }
-        let finalized = self
+        let finalized = source
             .call(
                 "eth_getBlockByNumber",
                 json!(["finalized", false]),
@@ -419,7 +551,7 @@ impl RpcPositionHistoryReader {
         }
         let through_tag = quantity(request.through_block);
         let before = parse_header(
-            &self
+            &source
                 .call(
                     "eth_getBlockByNumber",
                     json!([through_tag, false]),
@@ -437,7 +569,7 @@ impl RpcPositionHistoryReader {
         }
         let start_header = if include_start_header {
             let header = parse_header(
-                &self
+                &source
                     .call(
                         "eth_getBlockByNumber",
                         json!([quantity(request.from_block), false]),
@@ -487,7 +619,7 @@ impl RpcPositionHistoryReader {
                 };
                 let filter = json!({"fromBlock": quantity(chunk_start), "toBlock": quantity(chunk_end),
                     "address": [CTF_EMITTER, POSITION_MANAGER_EMITTER], "topics": topics});
-                let result = self
+                let result = source
                     .call(
                         "eth_getLogs",
                         json!([filter]),
@@ -559,7 +691,7 @@ impl RpcPositionHistoryReader {
             chunk_start = chunk_end + 1;
         }
         let after = parse_header(
-            &self
+            &source
                 .call(
                     "eth_getBlockByNumber",
                     json!([through_tag, false]),
@@ -578,8 +710,8 @@ impl RpcPositionHistoryReader {
         let mut ordered_logs: Vec<_> = logs.into_values().collect();
         ordered_logs
             .sort_by_key(|log| (log.block_number(), log.transaction_index(), log.log_index()));
-        Ok((
-            RpcPositionHistoryObservation {
+        Ok(ReadOutput {
+            content: RpcPositionHistoryContent {
                 holder_address: holder,
                 from_block: request.from_block,
                 through_block: request.through_block,
@@ -587,17 +719,19 @@ impl RpcPositionHistoryReader {
                 terminal_header: before,
                 logs: ordered_logs,
                 pages: state.pages,
-                started_at,
-                completed_at: Utc::now(),
-                elapsed: start.elapsed(),
                 request_count: state.next_id.saturating_sub(1) as usize,
                 response_bytes: state.response_bytes,
             },
             start_header,
-        ))
+            network_timing: started_at.map(|started_at| NetworkTiming {
+                started_at,
+                completed_at: Utc::now(),
+                elapsed: start.elapsed(),
+            }),
+        })
     }
 
-    async fn call(
+    async fn call_network(
         &self,
         method: &str,
         params: Value,
@@ -678,30 +812,7 @@ impl RpcPositionHistoryReader {
         state.response_bytes += body.len();
         let response_json =
             String::from_utf8(body).map_err(|_| RpcPositionHistoryError::MalformedResponse)?;
-        let envelope: Value = serde_json::from_str(&response_json)
-            .map_err(|_| RpcPositionHistoryError::MalformedResponse)?;
-        if envelope.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-            || envelope.get("id").and_then(Value::as_u64) != Some(id)
-        {
-            return Err(RpcPositionHistoryError::MalformedResponse);
-        }
-        if let Some(error) = envelope.get("error") {
-            if envelope.get("result").is_some() {
-                return Err(RpcPositionHistoryError::MalformedResponse);
-            }
-            let code = error
-                .get("code")
-                .and_then(Value::as_i64)
-                .ok_or(RpcPositionHistoryError::MalformedResponse)?;
-            return Err(RpcPositionHistoryError::RpcError { code });
-        }
-        if envelope.get("result").is_none_or(Value::is_null) {
-            return Err(RpcPositionHistoryError::MalformedResponse);
-        }
-        let result = envelope
-            .get("result")
-            .cloned()
-            .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+        let result = parse_rpc_response(&response_json, id)?;
         state.pages.push(RpcPositionHistoryPage {
             method: method.to_owned(),
             request_json,
@@ -737,10 +848,205 @@ impl RpcPositionHistoryReader {
     }
 }
 
+/// Re-verifies a saved ordered transcript without constructing a network client.
+pub async fn reverify_recorded_rpc_position_history_segment(
+    request: &RpcPositionHistoryRequest,
+    max_blocks_per_log_query: u64,
+    pages: &[RecordedRpcPositionHistoryPage],
+) -> Result<RecordedRpcPositionHistorySegmentObservation, RpcPositionHistoryError> {
+    if max_blocks_per_log_query == 0 {
+        return Err(RpcPositionHistoryError::InvalidInput);
+    }
+    let mut source = RpcCallSource::Recorded {
+        pages,
+        next_page: 0,
+    };
+    let output = RpcPositionHistoryReader::read_history_inner(
+        request,
+        Some(max_blocks_per_log_query),
+        true,
+        &mut source,
+    )
+    .await?;
+    source.finish()?;
+    let start_header = output
+        .start_header
+        .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+    Ok(RecordedRpcPositionHistorySegmentObservation {
+        content: output.content,
+        start_header,
+    })
+}
+
+fn recorded_call(
+    pages: &[RecordedRpcPositionHistoryPage],
+    next_page: &mut usize,
+    method: &str,
+    params: Value,
+    deadline: tokio::time::Instant,
+    request: &RpcPositionHistoryRequest,
+    state: &mut ReadState,
+) -> Result<Value, RpcPositionHistoryError> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(RpcPositionHistoryError::Timeout);
+    }
+    if state.next_id.saturating_sub(1) as usize >= request.max_requests {
+        return Err(RpcPositionHistoryError::RequestBudgetExceeded);
+    }
+    let page = pages
+        .get(*next_page)
+        .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+    if page.request_json.len() > MAX_RECORDED_REQUEST_BYTES {
+        return Err(RpcPositionHistoryError::BodyBudgetExceeded);
+    }
+    let expected_id = state.next_id;
+    let expected_request = json!({
+        "jsonrpc":"2.0",
+        "id":expected_id,
+        "method":method,
+        "params":params,
+    });
+    let expected_request_json = expected_request.to_string();
+    if page.request_json != expected_request_json {
+        return Err(RpcPositionHistoryError::MalformedResponse);
+    }
+    let response_bytes = page.response_json.len();
+    if response_bytes > MAX_HISTORY_RESPONSE_BYTES
+        || response_bytes
+            > request
+                .max_total_response_bytes
+                .saturating_sub(state.response_bytes)
+    {
+        return Err(RpcPositionHistoryError::BodyBudgetExceeded);
+    }
+    let result = parse_rpc_response(&page.response_json, expected_id)?;
+    state.next_id += 1;
+    *next_page += 1;
+    state.response_bytes += response_bytes;
+    state.pages.push(RpcPositionHistoryPage {
+        method: method.to_owned(),
+        request_json: page.request_json.clone(),
+        response_json: page.response_json.clone(),
+    });
+    Ok(result)
+}
+
+fn parse_rpc_response(response_json: &str, id: u64) -> Result<Value, RpcPositionHistoryError> {
+    let envelope: Value = serde_json::from_str(response_json)
+        .map_err(|_| RpcPositionHistoryError::MalformedResponse)?;
+    if envelope.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || envelope.get("id").and_then(Value::as_u64) != Some(id)
+    {
+        return Err(RpcPositionHistoryError::MalformedResponse);
+    }
+    if let Some(error) = envelope.get("error") {
+        if envelope.get("result").is_some() {
+            return Err(RpcPositionHistoryError::MalformedResponse);
+        }
+        let code = error
+            .get("code")
+            .and_then(Value::as_i64)
+            .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+        return Err(RpcPositionHistoryError::RpcError { code });
+    }
+    if envelope.get("result").is_none_or(Value::is_null) {
+        return Err(RpcPositionHistoryError::MalformedResponse);
+    }
+    envelope
+        .get("result")
+        .cloned()
+        .ok_or(RpcPositionHistoryError::MalformedResponse)
+}
+
 struct ReadState {
     pages: Vec<RpcPositionHistoryPage>,
     response_bytes: usize,
     next_id: u64,
+}
+
+struct ReadOutput {
+    content: RpcPositionHistoryContent,
+    start_header: Option<RpcBlockHeader>,
+    network_timing: Option<NetworkTiming>,
+}
+
+struct NetworkTiming {
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    elapsed: Duration,
+}
+
+impl ReadOutput {
+    fn into_network_observation(
+        self,
+    ) -> Result<RpcPositionHistoryObservation, RpcPositionHistoryError> {
+        let timing = self
+            .network_timing
+            .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+        Ok(RpcPositionHistoryObservation {
+            content: self.content,
+            started_at: timing.started_at,
+            completed_at: timing.completed_at,
+            elapsed: timing.elapsed,
+        })
+    }
+}
+
+enum RpcCallSource<'a> {
+    Network(&'a RpcPositionHistoryReader),
+    Recorded {
+        pages: &'a [RecordedRpcPositionHistoryPage],
+        next_page: usize,
+    },
+}
+
+impl RpcCallSource<'_> {
+    fn is_network(&self) -> bool {
+        matches!(self, Self::Network(_))
+    }
+
+    async fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: tokio::time::Instant,
+        request: &RpcPositionHistoryRequest,
+        state: &mut ReadState,
+    ) -> Result<Value, RpcPositionHistoryError> {
+        match self {
+            Self::Network(reader) => {
+                reader
+                    .call_network(method, params, deadline, request, state)
+                    .await
+            }
+            Self::Recorded { pages, next_page } => {
+                recorded_call(pages, next_page, method, params, deadline, request, state)
+            }
+        }
+    }
+
+    fn finish(&self) -> Result<(), RpcPositionHistoryError> {
+        match self {
+            Self::Network(_) => Ok(()),
+            Self::Recorded { pages, next_page } if *next_page == pages.len() => Ok(()),
+            Self::Recorded { .. } => Err(RpcPositionHistoryError::MalformedResponse),
+        }
+    }
+
+    fn validate_count(&self, planned_calls: u128) -> Result<(), RpcPositionHistoryError> {
+        match self {
+            Self::Network(_) => Ok(()),
+            Self::Recorded { pages, .. } => {
+                if pages.len() > MAX_HISTORY_REQUESTS {
+                    return Err(RpcPositionHistoryError::RequestBudgetExceeded);
+                }
+                if pages.len() as u128 != planned_calls {
+                    return Err(RpcPositionHistoryError::MalformedResponse);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 fn parse_header(value: &Value) -> Result<RpcBlockHeader, RpcPositionHistoryError> {
