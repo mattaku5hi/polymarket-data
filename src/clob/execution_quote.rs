@@ -16,6 +16,9 @@ use serde_json::value::RawValue;
 
 use super::{BookLevel, execution_context::ExecutionContextObservation};
 
+mod protected_market_buy;
+pub use protected_market_buy::{ProtectedMarketBuyQuote, estimate_protected_market_buy_quote};
+
 const FEE_DECIMAL_PLACES: u32 = 5;
 const MAX_SUPPORTED_EXPONENT: u32 = 8;
 const BUY_SHARE_DECIMAL_PLACES: u32 = 18;
@@ -102,6 +105,12 @@ pub enum ExecutionQuoteError {
     BuyQuantityPrecision,
     #[error("normalized market BUY maker cash is below the supported minimum")]
     BelowMarketBuyCashMinimum,
+    #[error("protected BUY max price is outside the supported tick grid or range")]
+    InvalidProtectedMarketBuyPrice,
+    #[error("protected BUY market tick is not in the supported SDK tick table")]
+    UnsupportedProtectedMarketBuyTick,
+    #[error("six-decimal BUY amounts cannot satisfy the protected next-tick guard")]
+    ProtectedPricePrecision,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

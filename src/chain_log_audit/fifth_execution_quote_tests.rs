@@ -14,7 +14,7 @@ use crate::{
         execution_quote::{
             ExecutionQuote, ExecutionQuoteError, ExecutionQuoteFeeCurrency, ExecutionQuoteFeeKind,
             ExecutionQuoteSide, MarketBuyBudget, estimate_execution_quote,
-            estimate_normalized_market_buy_quote,
+            estimate_normalized_market_buy_quote, estimate_protected_market_buy_quote,
         },
     },
 };
@@ -361,6 +361,41 @@ async fn normalized_buy_reuses_native_binding_without_io_or_new_expiry() {
             context.local_valid_until(max_age).unwrap()
         );
         assert_eq!(profile.quote(), normalized.quote());
+        let protected = estimate_protected_market_buy_quote(
+            &context,
+            MarketBuyBudget::AllInCash(rust_decimal::Decimal::new(10025, 4)),
+            rust_decimal::Decimal::new(5, 1),
+            max_age,
+        )
+        .unwrap();
+        let protected_profile =
+            bind_fifth_native_execution_quote(&assets, protected.quote()).unwrap();
+        assert_eq!(protected.maker_cash_base_units(), 1_000_000);
+        assert_eq!(protected.taker_share_base_units(), 2_000_000);
+        assert_eq!(
+            protected.reserved_buy_cash(),
+            normalized.reserved_buy_cash()
+        );
+        assert_eq!(
+            protected_profile.quote_cash_unit(),
+            FifthNativeQuoteCashUnit::Pusd
+        );
+        assert_eq!(
+            protected_profile.selected_native_outcome_index(),
+            selected_index
+        );
+        assert_eq!(
+            protected_profile.selected_native_position_id(),
+            native.position_ids()[selected_index]
+        );
+        assert_eq!(
+            protected_profile.exact_modeled_share_base_units(),
+            Some(alloy_primitives::U256::from(
+                protected.taker_share_base_units()
+            ))
+        );
+        assert_eq!(protected_profile.quote(), protected.quote());
+        assert_eq!(protected_profile.valid_until(), profile.valid_until());
         assert_eq!(sends.load(Ordering::Relaxed), 3);
         task.abort();
     }

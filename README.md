@@ -250,6 +250,39 @@ operator fee ceiling. Shares retain the18-decimal estimate grid; no signed
 taker normalization or protected-price order is constructed. Complete venue
 eligibility remains unverified. Existing estimators/getters keep their behavior.
 
+For a cent-normalized BUY with a caller-supplied maximum price, use
+`execution_quote::estimate_protected_market_buy_quote(context, MarketBuyBudget::AllInCash(cap), max_price, max_age)`
+or `GrossNotional(amount)`. The sealed result exposes normalized maker cash,
+six-decimal `maker_cash_base_units()` / `taker_share_base_units()`, unchanged
+`max_price()`, `reserved_buy_cash()` and the underlying modeled `quote()`.
+The cap must lie on the observed supported tick grid. Taker amounts use the
+pinned py-sdk tick-dependent precision; an exact integer guard refuses a ratio
+at or above cap + .0001. No price snapping, signing or submission occurs.
+`required_maker_minimum()` reports the source-backed maker cash floor1. The
+underlying quote's legacy client-minimum getters retain their conservative
+estimate semantics and may check modeled gross below1; they do not replace the
+protected result's normalized maker check or certify full venue eligibility.
+
+Only asks at or below the original cap can cover the fixed taker share target.
+Better prices leave modeled cash unspent rather than enlarge that target.
+The all-in path selects the greatest depth/reserve-feasible, encoding-safe whole
+cent maker amount, reserving the entire maker leg plus modeled fees. It uses a
+bounded binary search and at most nine coarse-tick guard checks. This path can
+return a smaller valid target when the entire cash ceiling lacks eligible depth;
+it still requires complete coverage of the selected target and maker cash at
+least1. The legacy normalized estimator keeps its full-budget depth behavior.
+All-in residual is cash ceiling minus modeled executed gross and fee; gross
+residual excludes fee. Full maker reserve is distinct from modeled executed cash.
+
+For maker1/cap.07, the amount legs are `(1,000,000 / 14,285,700)`;
+14.2857 displayed shares at.07 model gross.999999. The source/policy getters
+identify py-sdk merge24e34637. Fee aggregation remains the documented merged
+price-level model, not a venue fee ceiling or fill guarantee. The native quote
+binder accepts `protected.quote()` under its existing asset/identity/unit checks;
+neither binding nor amount normalization promotes whole venue eligibility.
+Use example mode `buy-protected AMOUNT MAX_PRICE` or
+`buy-all-in-protected CASH_CAP MAX_PRICE` for this read-only path.
+
 `position_history::SqdPositionHistoryReader` captures both ERC-1155 holder
 directions from the Polygon finalized stream, retaining sparse-page cursors and
 raw bodies until the fixed caller anchor is reached. `rpc_position_history::`

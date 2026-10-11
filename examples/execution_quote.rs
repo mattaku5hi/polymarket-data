@@ -1,4 +1,4 @@
-//! Read-only quote smoke: CONDITION_ID ASSET_ID MODE AMOUNT.
+//! Read-only quote smoke: CONDITION_ID ASSET_ID MODE AMOUNT [MAX_PRICE].
 //! BUY is gross notional; BUY-all-in caps gross plus modeled fees.
 
 use std::{error::Error, time::Duration};
@@ -8,6 +8,7 @@ use polymarket_data::clob::{
     execution_quote::{
         ExecutionQuoteSide, MarketBuyBudget, estimate_all_in_buy_execution_quote,
         estimate_execution_quote, estimate_normalized_market_buy_quote,
+        estimate_protected_market_buy_quote,
     },
 };
 use rust_decimal::Decimal;
@@ -15,19 +16,29 @@ use rust_decimal::Decimal;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 4 {
+    if !matches!(args.len(), 4 | 5) {
         return Err(
-            "usage: execution_quote CONDITION_ID ASSET_ID buy|buy-all-in|buy-normalized|buy-all-in-normalized|sell AMOUNT".into(),
+            "usage: execution_quote CONDITION_ID ASSET_ID buy|buy-all-in|buy-normalized|buy-all-in-normalized|buy-protected|buy-all-in-protected|sell AMOUNT [MAX_PRICE]".into(),
         );
     }
     let side = match args[2].as_str() {
-        "buy" | "buy-all-in" | "buy-normalized" | "buy-all-in-normalized" => {
-            ExecutionQuoteSide::Buy
-        }
+        "buy"
+        | "buy-all-in"
+        | "buy-normalized"
+        | "buy-all-in-normalized"
+        | "buy-protected"
+        | "buy-all-in-protected" => ExecutionQuoteSide::Buy,
         "sell" => ExecutionQuoteSide::Sell,
         _ => return Err("unsupported quote mode".into()),
     };
     let amount = Decimal::from_str_exact(&args[3])?;
+    let protected_mode = matches!(args[2].as_str(), "buy-protected" | "buy-all-in-protected");
+    let max_price = match (protected_mode, args.get(4)) {
+        (true, Some(value)) => Some(Decimal::from_str_exact(value)?),
+        (true, None) => return Err("protected BUY requires MAX_PRICE".into()),
+        (false, Some(_)) => return Err("MAX_PRICE is only valid for protected BUY".into()),
+        (false, None) => None,
+    };
     let reader = ClobExecutionContextReader::with_client_builder(
         reqwest::Client::builder().user_agent("polymarket-data-readonly-quote-example/1"),
         "https://clob.polymarket.com",
@@ -55,7 +66,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )?),
         _ => None,
     };
-    let quote = if let Some(normalized) = &normalized {
+    let protected = if let Some(max_price) = max_price {
+        let budget = if args[2] == "buy-all-in-protected" {
+            MarketBuyBudget::AllInCash(amount)
+        } else {
+            MarketBuyBudget::GrossNotional(amount)
+        };
+        Some(estimate_protected_market_buy_quote(
+            &context, budget, max_price, max_age,
+        )?)
+    } else {
+        None
+    };
+    let quote = if let Some(protected) = &protected {
+        protected.quote().clone()
+    } else if let Some(normalized) = &normalized {
         normalized.quote().clone()
     } else if args[2] == "buy-all-in" {
         estimate_all_in_buy_execution_quote(&context, amount, Duration::from_secs(10))?
@@ -69,6 +94,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             normalized.normalized_maker_notional(),
             normalized.reserved_buy_cash(),
             normalized.maker_amount_policy_version(),
+        );
+    }
+    if let Some(protected) = &protected {
+        println!(
+            "normalized_maker_notional={} maker_cash_base_units={} taker_share_base_units={} max_price={} reserved_buy_cash={} amount_policy={}",
+            protected.normalized_maker_notional(),
+            protected.maker_cash_base_units(),
+            protected.taker_share_base_units(),
+            protected.max_price(),
+            protected.reserved_buy_cash(),
+            protected.order_amount_policy_version(),
         );
     }
     println!(
