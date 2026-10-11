@@ -13,10 +13,14 @@ use polymarket_data::{
         TRANSFER_SINGLE_TOPIC,
     },
     position_history_receipts::{
-        PositionHistoryReceiptJoinError, bind_position_history_receipts,
+        PositionHistoryReceiptJoinError, PositionHistoryReceiptSourceKind,
+        bind_position_history_receipts, bind_recorded_position_history_receipts,
         validate_position_history_source_agreement,
     },
-    rpc_position_history::{RpcPositionHistoryReader, RpcPositionHistoryRequest},
+    rpc_position_history::{
+        RecordedRpcPositionHistoryPage, RpcPositionHistoryReader, RpcPositionHistoryRequest,
+        reverify_recorded_rpc_position_history_segment,
+    },
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -671,6 +675,59 @@ async fn history_observation(
     observation
 }
 
+struct HistorySegmentCapture {
+    online: polymarket_data::rpc_position_history::RpcPositionHistorySegmentObservation,
+    recorded: polymarket_data::rpc_position_history::RecordedRpcPositionHistorySegmentObservation,
+    pages: Vec<RecordedRpcPositionHistoryPage>,
+    request: RpcPositionHistoryRequest,
+}
+
+async fn history_segment_and_recorded(
+    fixture: &Value,
+    variant: SourceVariant,
+    width: u64,
+    holder: &str,
+    from_block: u64,
+    through_block: u64,
+) -> HistorySegmentCapture {
+    let state = source_state(fixture, variant);
+    let (endpoint, task) = serve(state, axum::routing::post(source_rpc)).await;
+    let reader = RpcPositionHistoryReader::new(reqwest::Client::builder(), &endpoint).unwrap();
+    let header = fixture_header(fixture, through_block);
+    let request = RpcPositionHistoryRequest {
+        holder_address: holder.to_owned(),
+        from_block,
+        through_block,
+        expected_through_hash: header["hash"].as_str().unwrap().to_owned(),
+        max_requests: 16,
+        max_total_response_bytes: 32 * 1024 * 1024,
+        total_timeout: Duration::from_secs(5),
+    };
+    let online = reader
+        .read_history_segment_paginated(&request, width)
+        .await
+        .unwrap();
+    task.abort();
+    let pages = online
+        .history()
+        .pages()
+        .iter()
+        .map(|page| RecordedRpcPositionHistoryPage {
+            request_json: page.request_json().to_owned(),
+            response_json: page.response_json().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let recorded = reverify_recorded_rpc_position_history_segment(&request, width, &pages)
+        .await
+        .unwrap();
+    HistorySegmentCapture {
+        online,
+        recorded,
+        pages,
+        request,
+    }
+}
+
 fn parse_quantity(value: &str) -> Option<u64> {
     u64::from_str_radix(value.strip_prefix("0x")?, 16).ok()
 }
@@ -898,5 +955,154 @@ async fn empty_interval_returns_empty_candidates_and_other_holder_is_rechecked_f
     assert_eq!(
         bind_position_history_receipts(&omitted_a, &omitted_b, &[receipt]).unwrap_err(),
         PositionHistoryReceiptJoinError::MissingRootedLog
+    );
+}
+
+#[tokio::test]
+async fn recorded_receipt_join_matches_live_ids_and_locators_with_recorded_provenance() {
+    for fixture in [
+        fixture(),
+        synthetic_ctf_batch_fixture(false, false),
+        synthetic_ctf_batch_fixture(false, true),
+    ] {
+        let (_, tx_hash) = fixture_receipt_and_hash(&fixture);
+        let receipt = rooted_receipt(&fixture, &tx_hash).await;
+        let capture_a =
+            history_segment_and_recorded(&fixture, SourceVariant::Exact, 1, OWNER, 99, 100).await;
+        let capture_b =
+            history_segment_and_recorded(&fixture, SourceVariant::Exact, 2, OWNER, 99, 100).await;
+
+        let live = bind_position_history_receipts(
+            capture_a.online.history(),
+            capture_b.online.history(),
+            std::slice::from_ref(&receipt),
+        )
+        .unwrap();
+        let recorded = bind_recorded_position_history_receipts(
+            &capture_a.recorded,
+            &capture_b.recorded,
+            std::slice::from_ref(&receipt),
+        )
+        .unwrap();
+
+        assert_eq!(live.candidate_ids(), recorded.candidate_ids());
+        assert_eq!(live.source_event_count(), recorded.source_event_count());
+        assert_eq!(
+            live.unique_transaction_count(),
+            recorded.unique_transaction_count()
+        );
+        assert_eq!(live.receipt_count(), recorded.receipt_count());
+        assert_eq!(
+            live.source_kind(),
+            PositionHistoryReceiptSourceKind::NetworkObservation
+        );
+        assert_eq!(
+            recorded.source_kind(),
+            PositionHistoryReceiptSourceKind::RecordedTranscript
+        );
+    }
+}
+
+#[tokio::test]
+async fn recorded_receipt_join_refuses_missing_duplicate_and_incomplete_receipts() {
+    let fixture = fixture();
+    let (_, tx_hash) = fixture_receipt_and_hash(&fixture);
+    let receipt = rooted_receipt(&fixture, &tx_hash).await;
+    let exact_a =
+        history_segment_and_recorded(&fixture, SourceVariant::Exact, 1, OWNER, 99, 100).await;
+    let exact_b =
+        history_segment_and_recorded(&fixture, SourceVariant::Exact, 2, OWNER, 99, 100).await;
+    assert_eq!(
+        bind_recorded_position_history_receipts(&exact_a.recorded, &exact_b.recorded, &[])
+            .unwrap_err(),
+        PositionHistoryReceiptJoinError::ReceiptSetMismatch
+    );
+    assert_eq!(
+        bind_recorded_position_history_receipts(
+            &exact_a.recorded,
+            &exact_b.recorded,
+            &[receipt.clone(), receipt.clone()]
+        )
+        .unwrap_err(),
+        PositionHistoryReceiptJoinError::DuplicateReceipt
+    );
+
+    let omitted_a = history_segment_and_recorded(
+        &fixture,
+        SourceVariant::OmitOneMatchingLog,
+        1,
+        OWNER,
+        99,
+        100,
+    )
+    .await;
+    let omitted_b = history_segment_and_recorded(
+        &fixture,
+        SourceVariant::OmitOneMatchingLog,
+        2,
+        OWNER,
+        99,
+        100,
+    )
+    .await;
+    assert_eq!(
+        bind_recorded_position_history_receipts(
+            &omitted_a.recorded,
+            &omitted_b.recorded,
+            std::slice::from_ref(&receipt)
+        )
+        .unwrap_err(),
+        PositionHistoryReceiptJoinError::MissingRootedLog
+    );
+}
+
+#[tokio::test]
+async fn recorded_receipt_join_preserves_empty_scope_and_refuses_start_header_disagreement() {
+    let fixture = fixture();
+    let capture_a =
+        history_segment_and_recorded(&fixture, SourceVariant::Exact, 1, OWNER, 99, 99).await;
+    let capture_b =
+        history_segment_and_recorded(&fixture, SourceVariant::Exact, 3, OWNER, 99, 99).await;
+    let live =
+        bind_position_history_receipts(capture_a.online.history(), capture_b.online.history(), &[])
+            .unwrap();
+    let recorded =
+        bind_recorded_position_history_receipts(&capture_a.recorded, &capture_b.recorded, &[])
+            .unwrap();
+    assert!(recorded.candidate_ids().is_empty());
+    assert_eq!(live.candidate_ids(), recorded.candidate_ids());
+    assert_eq!(
+        recorded.source_kind(),
+        PositionHistoryReceiptSourceKind::RecordedTranscript
+    );
+    assert_eq!(recorded.opening_inventory(), "unknown");
+    assert!(!recorded.complete_wallet_history());
+    assert!(!recorded.qualification());
+
+    let mut start_capture =
+        history_segment_and_recorded(&fixture, SourceVariant::Exact, 1, OWNER, 99, 100).await;
+    assert_eq!(start_capture.recorded.start_block_number(), 99);
+    let start_page = start_capture
+        .pages
+        .iter_mut()
+        .find(|page| {
+            let request: Value = serde_json::from_str(&page.request_json).unwrap();
+            request["method"] == "eth_getBlockByNumber" && request["params"][0] == "0x63"
+        })
+        .unwrap();
+    let mut response: Value = serde_json::from_str(&start_page.response_json).unwrap();
+    response["result"]["parentHash"] = json!(format!("0x{:064x}", 123_456));
+    start_page.response_json = response.to_string();
+    let changed_start = reverify_recorded_rpc_position_history_segment(
+        &start_capture.request,
+        1,
+        &start_capture.pages,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bind_recorded_position_history_receipts(&start_capture.recorded, &changed_start, &[])
+            .unwrap_err(),
+        PositionHistoryReceiptJoinError::SourceMismatch
     );
 }

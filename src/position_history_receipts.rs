@@ -7,6 +7,10 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::U256;
 
+use crate::rpc_position_history::{
+    RecordedRpcPositionHistorySegmentObservation,
+    validate_recorded_position_history_segment_source_agreement,
+};
 use crate::{
     chain_log_audit::{
         ChainReceiptLog, ChainTransactionReceiptEvidence, MovementObservationStatus,
@@ -106,6 +110,7 @@ impl PositionHistoryCandidateId {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionHistoryReceiptObservation {
+    source_kind: PositionHistoryReceiptSourceKind,
     holder_address: String,
     from_block: u64,
     through_block: u64,
@@ -119,7 +124,18 @@ pub struct PositionHistoryReceiptObservation {
     candidate_ids: Vec<PositionHistoryCandidateId>,
 }
 
+/// Identifies whether the joined history content came from online reads or recorded transcripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionHistoryReceiptSourceKind {
+    NetworkObservation,
+    RecordedTranscript,
+}
+
 impl PositionHistoryReceiptObservation {
+    #[must_use]
+    pub const fn source_kind(&self) -> PositionHistoryReceiptSourceKind {
+        self.source_kind
+    }
     #[must_use]
     pub fn holder_address(&self) -> &str {
         &self.holder_address
@@ -199,6 +215,17 @@ struct CanonicalEvent {
     data: String,
 }
 
+struct ReceiptJoinContext<'a> {
+    holder: &'a str,
+    from_block: u64,
+    through_block: u64,
+    terminal_hash: &'a str,
+    terminal_state_root: &'a str,
+    terminal_transactions_root: &'a str,
+    terminal_receipts_root: &'a str,
+    source_kind: PositionHistoryReceiptSourceKind,
+}
+
 impl From<&PositionTransferLog> for CanonicalEvent {
     fn from(log: &PositionTransferLog) -> Self {
         Self {
@@ -272,14 +299,23 @@ fn agreeing_source_events(
     if events != second_events {
         return Err(PositionHistoryReceiptJoinError::SourceMismatch);
     }
+    validate_canonical_event_set(&events, source_a.from_block(), source_a.through_block())?;
+    Ok(events)
+}
+
+fn validate_canonical_event_set(
+    events: &[CanonicalEvent],
+    from_block: u64,
+    through_block: u64,
+) -> Result<(), PositionHistoryReceiptJoinError> {
     if events.windows(2).any(|pair| pair[0] == pair[1])
-        || events.iter().any(|event| {
-            !(source_a.from_block()..=source_a.through_block()).contains(&event.block_number)
-        })
+        || events
+            .iter()
+            .any(|event| !(from_block..=through_block).contains(&event.block_number))
     {
         return Err(PositionHistoryReceiptJoinError::InvalidInput);
     }
-    Ok(events)
+    Ok(())
 }
 
 /// Joins two agreeing bounded source scans to exactly the supplied verified transaction receipts.
@@ -291,11 +327,63 @@ pub fn bind_position_history_receipts(
     receipts: &[ChainTransactionReceiptEvidence],
 ) -> Result<PositionHistoryReceiptObservation, PositionHistoryReceiptJoinError> {
     let events = agreeing_source_events(source_a, source_b)?;
-    let holder = source_a.holder_address().to_owned();
+    bind_position_history_events(
+        ReceiptJoinContext {
+            holder: source_a.holder_address(),
+            from_block: source_a.from_block(),
+            through_block: source_a.through_block(),
+            terminal_hash: source_a.terminal_hash(),
+            terminal_state_root: source_a.terminal_state_root(),
+            terminal_transactions_root: source_a.terminal_transactions_root(),
+            terminal_receipts_root: source_a.terminal_receipts_root(),
+            source_kind: PositionHistoryReceiptSourceKind::NetworkObservation,
+        },
+        &events,
+        receipts,
+    )
+}
+
+/// Joins two agreeing offline-reverified transcripts to exactly the supplied verified receipts.
+/// Reverification establishes transcript content consistency, not that an RPC occurred.
+pub fn bind_recorded_position_history_receipts(
+    source_a: &RecordedRpcPositionHistorySegmentObservation,
+    source_b: &RecordedRpcPositionHistorySegmentObservation,
+    receipts: &[ChainTransactionReceiptEvidence],
+) -> Result<PositionHistoryReceiptObservation, PositionHistoryReceiptJoinError> {
+    validate_recorded_position_history_segment_source_agreement(source_a, source_b)?;
+    let mut events = source_a
+        .logs()
+        .iter()
+        .map(CanonicalEvent::from)
+        .collect::<Vec<_>>();
+    events.sort();
+    validate_canonical_event_set(&events, source_a.from_block(), source_a.through_block())?;
+    bind_position_history_events(
+        ReceiptJoinContext {
+            holder: source_a.holder_address(),
+            from_block: source_a.from_block(),
+            through_block: source_a.through_block(),
+            terminal_hash: source_a.terminal_hash(),
+            terminal_state_root: source_a.terminal_state_root(),
+            terminal_transactions_root: source_a.terminal_transactions_root(),
+            terminal_receipts_root: source_a.terminal_receipts_root(),
+            source_kind: PositionHistoryReceiptSourceKind::RecordedTranscript,
+        },
+        &events,
+        receipts,
+    )
+}
+
+fn bind_position_history_events(
+    context: ReceiptJoinContext<'_>,
+    events: &[CanonicalEvent],
+    receipts: &[ChainTransactionReceiptEvidence],
+) -> Result<PositionHistoryReceiptObservation, PositionHistoryReceiptJoinError> {
+    let holder = context.holder.to_owned();
     let holder_topic = format!("0x{:0>64}", &holder[2..]);
 
     let mut events_by_transaction: BTreeMap<&str, Vec<&CanonicalEvent>> = BTreeMap::new();
-    for event in &events {
+    for event in events {
         events_by_transaction
             .entry(event.transaction_hash.as_str())
             .or_default()
@@ -428,13 +516,14 @@ pub fn bind_position_history_receipts(
         .collect();
 
     Ok(PositionHistoryReceiptObservation {
+        source_kind: context.source_kind,
         holder_address: holder,
-        from_block: source_a.from_block(),
-        through_block: source_a.through_block(),
-        terminal_hash: source_a.terminal_hash().to_owned(),
-        terminal_state_root: source_a.terminal_state_root().to_owned(),
-        terminal_transactions_root: source_a.terminal_transactions_root().to_owned(),
-        terminal_receipts_root: source_a.terminal_receipts_root().to_owned(),
+        from_block: context.from_block,
+        through_block: context.through_block,
+        terminal_hash: context.terminal_hash.to_owned(),
+        terminal_state_root: context.terminal_state_root.to_owned(),
+        terminal_transactions_root: context.terminal_transactions_root.to_owned(),
+        terminal_receipts_root: context.terminal_receipts_root.to_owned(),
         source_event_count: events.len(),
         unique_transaction_count: events_by_transaction.len(),
         receipt_count: receipts.len(),

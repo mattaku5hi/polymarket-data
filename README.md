@@ -365,6 +365,12 @@ exactly one receipt per hinted transaction, with no extras or duplicates, and
 uses the existing strict ERC1155 decoder. Within those verified receipts, the
 reverse check refuses any holder transfer omitted by both source scans.
 
+`bind_recorded_position_history_receipts(first, second, receipts)` applies the
+same join to two offline-reverified recorded history segments. Its result reports
+`PositionHistoryReceiptSourceKind::RecordedTranscript`; the live binder reports
+`NetworkObservation`. Recorded re-verification checks saved transcript content,
+not whether an RPC occurred or who supplied it.
+
 The sealed result exposes sorted candidate IDs with ledger and original event
 locators. Equal raw integers in CTF and PositionManager remain different
 candidates. It is an observation of a partial interval: opening inventory is
