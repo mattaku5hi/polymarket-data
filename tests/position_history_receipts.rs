@@ -796,7 +796,8 @@ async fn refuses_receipt_cardinality_source_disagreement_and_root_log_mismatch()
     let changed_source =
         history_observation(&fixture, SourceVariant::ChangedData, 2, OWNER, 99, 100).await;
     assert_eq!(
-        bind_position_history_receipts(&exact_a, &changed_source, &[receipt.clone()]).unwrap_err(),
+        bind_position_history_receipts(&exact_a, &changed_source, std::slice::from_ref(&receipt))
+            .unwrap_err(),
         PositionHistoryReceiptJoinError::SourceMismatch
     );
     assert_eq!(
@@ -806,15 +807,23 @@ async fn refuses_receipt_cardinality_source_disagreement_and_root_log_mismatch()
     let changed_root_log =
         history_observation(&fixture, SourceVariant::ChangedData, 1, OWNER, 99, 100).await;
     assert_eq!(
-        bind_position_history_receipts(&changed_root_log, &changed_root_log, &[receipt.clone()])
-            .unwrap_err(),
+        bind_position_history_receipts(
+            &changed_root_log,
+            &changed_root_log,
+            std::slice::from_ref(&receipt)
+        )
+        .unwrap_err(),
         PositionHistoryReceiptJoinError::RootLogMismatch
     );
     let changed_locator =
         history_observation(&fixture, SourceVariant::ChangedLocator, 1, OWNER, 99, 100).await;
     assert_eq!(
-        bind_position_history_receipts(&changed_locator, &changed_locator, &[receipt.clone()])
-            .unwrap_err(),
+        bind_position_history_receipts(
+            &changed_locator,
+            &changed_locator,
+            std::slice::from_ref(&receipt)
+        )
+        .unwrap_err(),
         PositionHistoryReceiptJoinError::MissingRootedLog
     );
     let changed_index = history_observation(
