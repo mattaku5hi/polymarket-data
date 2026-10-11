@@ -28,7 +28,7 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 alloy-primitives = { version = "1.7", features = ["k256"], optional = true }
 alloy-rlp = { version = "0.3", optional = true }
-alloy-trie = { version = "0.9", features = ["ethereum"], optional = true }
+alloy-trie = { version = "0.9.7", features = ["ethereum"], optional = true }
 hex = { version = "0.4", optional = true }
 num-bigint-dig = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }

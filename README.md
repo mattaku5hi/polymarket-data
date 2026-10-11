@@ -105,7 +105,8 @@ The allocation reconstructs state root `0x654f28d19b44239d1012f27038f1f71b3d4465
 and the resulting header hash matches Bor's pinned mainnet genesis hash
 `0xa9c28ce2141b56c474f1dc504bee9b01eb1bd7d1a507580d5519d4437a97de1b`.
 The SDK rechecks both anchors and both fixed-address proofs before returning
-the sealed result.
+the sealed result. The `chain-audit` dependency floor is Alloy Trie 0.9.7 because
+0.9.0 accepts a truncated version of the pinned CTF absence proof.
 
 The sealed fifth Exchange code-context observation also binds the source/build
 `MAX_FEE_RATE` immutable for the exact Current641b and Prior7345 runtime hashes.
