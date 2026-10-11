@@ -64,6 +64,76 @@ pub enum RpcPositionHistoryError {
     ConflictingLocator,
 }
 
+/// Fixed whitelist of JSON-RPC methods issued by this reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpcPositionHistoryRequestMethod {
+    ChainId,
+    GetBlockByNumber,
+    GetLogs,
+}
+
+/// Fixed reader phase for a planned JSON-RPC call; contains no raw request values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpcPositionHistoryRequestPhase {
+    Chain,
+    Finalized,
+    TerminalBefore,
+    StartHeader,
+    Logs {
+        direction: PositionHistoryDirection,
+        from_block: u64,
+        through_block: u64,
+    },
+    TerminalAfter,
+}
+
+/// Per-read locator for a failed network call; this is not a consensus proof.
+///
+/// The ordinal identifies this reader's planned dispatch order. It does not prove the provider
+/// received the request; for example, request pacing may time out before an HTTP send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpcPositionHistoryRequestLocator {
+    request_ordinal: u64,
+    method: RpcPositionHistoryRequestMethod,
+    phase: RpcPositionHistoryRequestPhase,
+}
+
+impl RpcPositionHistoryRequestLocator {
+    #[must_use]
+    pub const fn request_ordinal(&self) -> u64 {
+        self.request_ordinal
+    }
+
+    #[must_use]
+    pub const fn method(&self) -> RpcPositionHistoryRequestMethod {
+        self.method
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> RpcPositionHistoryRequestPhase {
+        self.phase
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("RPC position-history request failed during {request:?}: {error}")]
+pub struct RpcPositionHistoryFailure {
+    error: RpcPositionHistoryError,
+    request: Option<RpcPositionHistoryRequestLocator>,
+}
+
+impl RpcPositionHistoryFailure {
+    #[must_use]
+    pub const fn error(&self) -> RpcPositionHistoryError {
+        self.error
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> Option<RpcPositionHistoryRequestLocator> {
+        self.request
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcPositionHistoryRequest {
     pub holder_address: String,
@@ -431,7 +501,7 @@ impl RpcPositionHistoryReader {
         &self,
         request: &RpcPositionHistoryRequest,
     ) -> Result<RpcPositionHistoryObservation, RpcPositionHistoryError> {
-        let mut source = RpcCallSource::Network(self);
+        let mut source = RpcCallSource::network(self, false);
         Self::read_history_inner(request, None, false, &mut source)
             .await?
             .into_network_observation()
@@ -449,7 +519,7 @@ impl RpcPositionHistoryReader {
         if max_blocks_per_log_query == 0 {
             return Err(RpcPositionHistoryError::InvalidInput);
         }
-        let mut source = RpcCallSource::Network(self);
+        let mut source = RpcCallSource::network(self, false);
         Self::read_history_inner(request, Some(max_blocks_per_log_query), false, &mut source)
             .await?
             .into_network_observation()
@@ -465,7 +535,7 @@ impl RpcPositionHistoryReader {
         if max_blocks_per_log_query == 0 {
             return Err(RpcPositionHistoryError::InvalidInput);
         }
-        let mut source = RpcCallSource::Network(self);
+        let mut source = RpcCallSource::network(self, false);
         let output =
             Self::read_history_inner(request, Some(max_blocks_per_log_query), true, &mut source)
                 .await?;
@@ -476,6 +546,46 @@ impl RpcPositionHistoryReader {
         Ok(RpcPositionHistorySegmentObservation {
             history: output.into_network_observation()?,
             start_header,
+        })
+    }
+
+    /// Reads a bounded interval and includes a sanitized locator when an RPC call fails.
+    ///
+    /// The locator reports the planned call phase and ordinal only. It does not establish that
+    /// the provider received the request or that any partial history is valid.
+    pub async fn read_history_segment_paginated_with_failure_context(
+        &self,
+        request: &RpcPositionHistoryRequest,
+        max_blocks_per_log_query: u64,
+    ) -> Result<RpcPositionHistorySegmentObservation, RpcPositionHistoryFailure> {
+        if max_blocks_per_log_query == 0 {
+            return Err(RpcPositionHistoryFailure {
+                error: RpcPositionHistoryError::InvalidInput,
+                request: None,
+            });
+        }
+        let mut source = RpcCallSource::network(self, true);
+        let result = async {
+            let output = Self::read_history_inner(
+                request,
+                Some(max_blocks_per_log_query),
+                true,
+                &mut source,
+            )
+            .await?;
+            let start_header = output
+                .start_header
+                .clone()
+                .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+            Ok(RpcPositionHistorySegmentObservation {
+                history: output.into_network_observation()?,
+                start_header,
+            })
+        }
+        .await;
+        result.map_err(|error| RpcPositionHistoryFailure {
+            error,
+            request: source.last_failure(),
         })
     }
 
@@ -531,7 +641,14 @@ impl RpcPositionHistoryReader {
             next_id: 1,
         };
         let chain = source
-            .call("eth_chainId", json!([]), deadline, request, &mut state)
+            .call(
+                "eth_chainId",
+                json!([]),
+                RpcPositionHistoryRequestPhase::Chain,
+                deadline,
+                request,
+                &mut state,
+            )
             .await?;
         if parse_quantity(&chain) != Some(RPC_CHAIN_ID) {
             return Err(RpcPositionHistoryError::WrongChain);
@@ -540,6 +657,7 @@ impl RpcPositionHistoryReader {
             .call(
                 "eth_getBlockByNumber",
                 json!(["finalized", false]),
+                RpcPositionHistoryRequestPhase::Finalized,
                 deadline,
                 request,
                 &mut state,
@@ -555,6 +673,7 @@ impl RpcPositionHistoryReader {
                 .call(
                     "eth_getBlockByNumber",
                     json!([through_tag, false]),
+                    RpcPositionHistoryRequestPhase::TerminalBefore,
                     deadline,
                     request,
                     &mut state,
@@ -573,6 +692,7 @@ impl RpcPositionHistoryReader {
                     .call(
                         "eth_getBlockByNumber",
                         json!([quantity(request.from_block), false]),
+                        RpcPositionHistoryRequestPhase::StartHeader,
                         deadline,
                         request,
                         &mut state,
@@ -623,6 +743,11 @@ impl RpcPositionHistoryReader {
                     .call(
                         "eth_getLogs",
                         json!([filter]),
+                        RpcPositionHistoryRequestPhase::Logs {
+                            direction,
+                            from_block: chunk_start,
+                            through_block: chunk_end,
+                        },
                         deadline,
                         request,
                         &mut state,
@@ -695,6 +820,7 @@ impl RpcPositionHistoryReader {
                 .call(
                     "eth_getBlockByNumber",
                     json!([through_tag, false]),
+                    RpcPositionHistoryRequestPhase::TerminalAfter,
                     deadline,
                     request,
                     &mut state,
@@ -993,7 +1119,11 @@ impl ReadOutput {
 }
 
 enum RpcCallSource<'a> {
-    Network(&'a RpcPositionHistoryReader),
+    Network {
+        reader: &'a RpcPositionHistoryReader,
+        capture_failure_context: bool,
+        last_failure: Option<RpcPositionHistoryRequestLocator>,
+    },
     Recorded {
         pages: &'a [RecordedRpcPositionHistoryPage],
         next_page: usize,
@@ -1001,23 +1131,62 @@ enum RpcCallSource<'a> {
 }
 
 impl RpcCallSource<'_> {
+    fn network(
+        reader: &RpcPositionHistoryReader,
+        capture_failure_context: bool,
+    ) -> RpcCallSource<'_> {
+        RpcCallSource::Network {
+            reader,
+            capture_failure_context,
+            last_failure: None,
+        }
+    }
+
     fn is_network(&self) -> bool {
-        matches!(self, Self::Network(_))
+        matches!(self, Self::Network { .. })
+    }
+
+    fn last_failure(&self) -> Option<RpcPositionHistoryRequestLocator> {
+        match self {
+            Self::Network { last_failure, .. } => *last_failure,
+            Self::Recorded { .. } => None,
+        }
     }
 
     async fn call(
         &mut self,
         method: &str,
         params: Value,
+        phase: RpcPositionHistoryRequestPhase,
         deadline: tokio::time::Instant,
         request: &RpcPositionHistoryRequest,
         state: &mut ReadState,
     ) -> Result<Value, RpcPositionHistoryError> {
         match self {
-            Self::Network(reader) => {
-                reader
+            Self::Network {
+                reader,
+                capture_failure_context,
+                last_failure,
+            } => {
+                let locator = RpcPositionHistoryRequestLocator {
+                    request_ordinal: state.next_id,
+                    method: match method {
+                        "eth_chainId" => RpcPositionHistoryRequestMethod::ChainId,
+                        "eth_getBlockByNumber" => RpcPositionHistoryRequestMethod::GetBlockByNumber,
+                        "eth_getLogs" => RpcPositionHistoryRequestMethod::GetLogs,
+                        _ => unreachable!("only fixed position-history methods are dispatched"),
+                    },
+                    phase,
+                };
+                let result = reader
                     .call_network(method, params, deadline, request, state)
-                    .await
+                    .await;
+                *last_failure = if *capture_failure_context && result.is_err() {
+                    Some(locator)
+                } else {
+                    None
+                };
+                result
             }
             Self::Recorded { pages, next_page } => {
                 recorded_call(pages, next_page, method, params, deadline, request, state)
@@ -1027,7 +1196,7 @@ impl RpcCallSource<'_> {
 
     fn finish(&self) -> Result<(), RpcPositionHistoryError> {
         match self {
-            Self::Network(_) => Ok(()),
+            Self::Network { .. } => Ok(()),
             Self::Recorded { pages, next_page } if *next_page == pages.len() => Ok(()),
             Self::Recorded { .. } => Err(RpcPositionHistoryError::MalformedResponse),
         }
@@ -1035,7 +1204,7 @@ impl RpcCallSource<'_> {
 
     fn validate_count(&self, planned_calls: u128) -> Result<(), RpcPositionHistoryError> {
         match self {
-            Self::Network(_) => Ok(()),
+            Self::Network { .. } => Ok(()),
             Self::Recorded { pages, .. } => {
                 if pages.len() > MAX_HISTORY_REQUESTS {
                     return Err(RpcPositionHistoryError::RequestBudgetExceeded);
