@@ -88,6 +88,25 @@ a shared budget and deadline. Its sealed context can be reused internally;
 rooted current/prior fixtures cover exact limits, cancellation and malformed
 proofs. Current point state does not establish control state at a trade call.
 
+`chain_log_audit::polygon_genesis_position_opening()` verifies an embedded
+offline account-trie non-inclusion proof for the fixed CTF and PositionManager
+emitters at Polygon block zero. The sealed result establishes only zero ledger
+balance namespaces at genesis; it does not establish wallet history completeness
+or later balances. Its reference header and proofs use Bor revision
+[`9c445ef603e71469e1c176d8e57e7cf94864ade7`](https://github.com/0xPolygon/bor/tree/9c445ef603e71469e1c176d8e57e7cf94864ade7), including the pinned
+[genesis allocation](https://github.com/0xPolygon/bor/blob/9c445ef603e71469e1c176d8e57e7cf94864ade7/builder/files/genesis-mainnet-v1.json)
+and Bor's [`Genesis.ToBlock` implementation](https://github.com/0xPolygon/bor/blob/9c445ef603e71469e1c176d8e57e7cf94864ade7/core/genesis.go) and
+[`BorMainnetGenesisHash`](https://github.com/0xPolygon/bor/blob/9c445ef603e71469e1c176d8e57e7cf94864ade7/params/config.go).
+The pinned allocation, header-construction source and expected-hash source SHA-256 values are
+`2b2c67557d703ec1eae81785c9521e214a464d1416469caae952de67cca2f8fa`,
+`0ccd5413a1e12a8c89736cdaec58720487da81c789c24c50a6ebac2fb96fa4ab`, and
+`322153f97a16990b37bfc34b03c2d535942cc736caf9d254275b690fbd2ddb57`, respectively.
+The allocation reconstructs state root `0x654f28d19b44239d1012f27038f1f71b3d4465dc415a382fb2b7009cba1527c8`,
+and the resulting header hash matches Bor's pinned mainnet genesis hash
+`0xa9c28ce2141b56c474f1dc504bee9b01eb1bd7d1a507580d5519d4437a97de1b`.
+The SDK rechecks both anchors and both fixed-address proofs before returning
+the sealed result.
+
 The sealed fifth Exchange code-context observation also binds the source/build
 `MAX_FEE_RATE` immutable for the exact Current641b and Prior7345 runtime hashes.
 Both verified source packets bind the constructor value to 1,000 basis points;

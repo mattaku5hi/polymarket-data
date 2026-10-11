@@ -28,6 +28,12 @@ use tokio::sync::watch;
 
 mod header_binding;
 use header_binding::bind_header;
+mod genesis_position_opening;
+pub use genesis_position_opening::{
+    GENESIS_POSITION_OPENING_SOURCE_REVISION, PolygonGenesisPositionOpening,
+    PolygonGenesisPositionOpeningEvidence, polygon_genesis_position_opening,
+    verify_polygon_genesis_position_opening,
+};
 mod ctf_condition_state;
 mod ctf_operations;
 mod ctf_position_identity;
