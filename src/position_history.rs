@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, net::IpAddr, time::Duration};
 use chrono::{DateTime, Utc};
 use reqwest::{Client, ClientBuilder, StatusCode, Url};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 pub const SQD_POLYGON_DATASET_URL: &str = "https://portal.sqd.dev/datasets/polygon-mainnet";
 pub const CTF_EMITTER: &str = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
@@ -19,6 +20,9 @@ pub const TRANSFER_BATCH_TOPIC: &str =
 pub const MAX_HISTORY_REQUESTS: usize = 512;
 pub const MAX_HISTORY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_HISTORY_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+/// Ordered two-direction SQD transcript with a provider-reported start header.
+pub const SQD_POSITION_HISTORY_SEGMENT_POLICY_VERSION: &str =
+    "sqd-position-history-start-boundary-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PositionHistoryDirection {
@@ -193,6 +197,16 @@ pub struct SqdPositionHistoryPage {
     response_body: String,
 }
 
+/// Untrusted raw page strings retained by an offline SQD capture journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedSqdPositionHistoryPage {
+    pub direction: PositionHistoryDirection,
+    pub cursor: u64,
+    pub last_block: u64,
+    pub request_body: String,
+    pub response_body: String,
+}
+
 impl SqdPositionHistoryPage {
     #[must_use]
     pub const fn direction(&self) -> PositionHistoryDirection {
@@ -222,6 +236,7 @@ pub struct SqdPositionHistoryObservation {
     from_block: u64,
     through_block: u64,
     expected_through_hash: String,
+    start_header: SqdBlockHeader,
     from_terminal: SqdBlockHeader,
     to_terminal: SqdBlockHeader,
     /// Deduplicated logs sorted by (block number, transaction index, log index).
@@ -250,6 +265,10 @@ impl SqdPositionHistoryObservation {
     #[must_use]
     pub fn expected_through_hash(&self) -> &str {
         &self.expected_through_hash
+    }
+    #[must_use]
+    pub fn start_header(&self) -> &SqdBlockHeader {
+        &self.start_header
     }
     #[must_use]
     pub fn from_terminal(&self) -> &SqdBlockHeader {
@@ -289,10 +308,79 @@ impl SqdPositionHistoryObservation {
     }
 }
 
+/// Offline-reverified SQD segment contents; acquisition timestamps are intentionally absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedSqdPositionHistorySegmentObservation {
+    holder_address: String,
+    from_block: u64,
+    through_block: u64,
+    expected_through_hash: String,
+    start_header: SqdBlockHeader,
+    from_terminal: SqdBlockHeader,
+    to_terminal: SqdBlockHeader,
+    logs: Vec<PositionTransferLog>,
+    pages: Vec<SqdPositionHistoryPage>,
+    request_count: usize,
+    response_bytes: usize,
+}
+
+impl RecordedSqdPositionHistorySegmentObservation {
+    #[must_use]
+    pub fn holder_address(&self) -> &str {
+        &self.holder_address
+    }
+    #[must_use]
+    pub const fn from_block(&self) -> u64 {
+        self.from_block
+    }
+    #[must_use]
+    pub const fn through_block(&self) -> u64 {
+        self.through_block
+    }
+    #[must_use]
+    pub fn expected_through_hash(&self) -> &str {
+        &self.expected_through_hash
+    }
+    #[must_use]
+    pub fn start_header(&self) -> &SqdBlockHeader {
+        &self.start_header
+    }
+    #[must_use]
+    pub fn from_terminal(&self) -> &SqdBlockHeader {
+        &self.from_terminal
+    }
+    #[must_use]
+    pub fn to_terminal(&self) -> &SqdBlockHeader {
+        &self.to_terminal
+    }
+    #[must_use]
+    pub fn logs(&self) -> &[PositionTransferLog] {
+        &self.logs
+    }
+    #[must_use]
+    pub fn pages(&self) -> &[SqdPositionHistoryPage] {
+        &self.pages
+    }
+    #[must_use]
+    pub const fn request_count(&self) -> usize {
+        self.request_count
+    }
+    #[must_use]
+    pub const fn response_bytes(&self) -> usize {
+        self.response_bytes
+    }
+}
+
 /// Caller-configured, read-only access to SQD's Polygon finalized stream.
 pub struct SqdPositionHistoryReader {
     client: Client,
     endpoint: Url,
+    pacing: Option<SqdRequestPacing>,
+}
+
+struct SqdRequestPacing {
+    minimum_interval: Duration,
+    next_start: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl SqdPositionHistoryReader {
@@ -302,6 +390,21 @@ impl SqdPositionHistoryReader {
         builder: ClientBuilder,
         dataset_base_url: &str,
     ) -> Result<Self, PositionHistoryError> {
+        Self::new_with_request_interval(builder, dataset_base_url, Duration::ZERO)
+    }
+
+    /// Builds a reader with a shared minimum delay between actual request starts.
+    pub fn new_with_request_interval(
+        builder: ClientBuilder,
+        dataset_base_url: &str,
+        minimum_request_interval: Duration,
+    ) -> Result<Self, PositionHistoryError> {
+        if tokio::time::Instant::now()
+            .checked_add(minimum_request_interval)
+            .is_none()
+        {
+            return Err(PositionHistoryError::InvalidInput);
+        }
         let mut endpoint =
             Url::parse(dataset_base_url).map_err(|_| PositionHistoryError::InvalidInput)?;
         let host = endpoint
@@ -327,7 +430,15 @@ impl SqdPositionHistoryReader {
             .retry(reqwest::retry::never())
             .build()
             .map_err(|_| PositionHistoryError::ClientBuild)?;
-        Ok(Self { client, endpoint })
+        let pacing = (!minimum_request_interval.is_zero()).then(|| SqdRequestPacing {
+            minimum_interval: minimum_request_interval,
+            next_start: Mutex::new(None),
+        });
+        Ok(Self {
+            client,
+            endpoint,
+            pacing,
+        })
     }
 
     /// Reads both holder directions to the fixed inclusive terminal block.
@@ -398,6 +509,9 @@ impl SqdPositionHistoryReader {
             from_block: request.from_block,
             through_block: request.through_block,
             expected_through_hash: expected_hash,
+            start_header: state.headers.get(&request.from_block).cloned().ok_or(
+                PositionHistoryError::Incomplete(PositionHistoryDirection::From),
+            )?,
             from_terminal,
             to_terminal,
             logs: {
@@ -412,6 +526,33 @@ impl SqdPositionHistoryReader {
             request_count: state.request_count,
             response_bytes: state.response_bytes,
         })
+    }
+
+    async fn wait_for_request_slot(
+        &self,
+        deadline: tokio::time::Instant,
+        direction: PositionHistoryDirection,
+    ) -> Result<(), PositionHistoryError> {
+        let Some(pacing) = &self.pacing else {
+            return Ok(());
+        };
+        let mut next_start = tokio::time::timeout_at(deadline, pacing.next_start.lock())
+            .await
+            .map_err(|_| PositionHistoryError::Timeout(direction))?;
+        if let Some(next) = *next_start {
+            tokio::time::timeout_at(deadline, tokio::time::sleep_until(next))
+                .await
+                .map_err(|_| PositionHistoryError::Timeout(direction))?;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PositionHistoryError::Timeout(direction));
+        }
+        *next_start = Some(
+            tokio::time::Instant::now()
+                .checked_add(pacing.minimum_interval)
+                .ok_or(PositionHistoryError::InvalidInput)?,
+        );
+        Ok(())
     }
 
     async fn read_direction(
@@ -434,6 +575,7 @@ impl SqdPositionHistoryReader {
             let body_value = query_body(cursor, request.through_block, holder, direction);
             let request_body = serde_json::to_string(&body_value)
                 .map_err(|_| PositionHistoryError::InvalidInput)?;
+            self.wait_for_request_slot(deadline, direction).await?;
             let response = tokio::time::timeout_at(
                 deadline,
                 self.client
@@ -517,66 +659,269 @@ impl SqdPositionHistoryReader {
                 }
                 body.extend_from_slice(&chunk);
             }
-            state.response_bytes += body.len();
             let raw_body = String::from_utf8(body.clone())
                 .map_err(|_| PositionHistoryError::MalformedResponse(direction))?;
             if raw_body.trim().is_empty() {
                 return Err(PositionHistoryError::Incomplete(direction));
             }
-            let headers_and_logs = parse_page(
-                &body,
-                request.from_block,
-                request.through_block,
-                cursor,
+            account_response_bytes(state, body.len(), request.max_total_response_bytes)?;
+            let last = ingest_page(
+                request,
                 holder,
                 direction,
-            )?;
-            let (headers, logs) = headers_and_logs;
-            let first = headers
-                .first()
-                .ok_or(PositionHistoryError::Incomplete(direction))?
-                .number;
-            let last = headers
-                .last()
-                .cloned()
-                .ok_or(PositionHistoryError::Incomplete(direction))?;
-            if first != cursor || last.number < cursor || last.number > request.through_block {
-                return Err(PositionHistoryError::InvalidPageCursor(direction));
-            }
-            for header in headers {
-                register_header(&mut state.headers, header)?;
-            }
-            for log in logs {
-                let locator = (log.block_hash.clone(), log.log_index);
-                if let Some(previous) = state.logs.get(&locator) {
-                    if previous != &log {
-                        return Err(PositionHistoryError::ConflictingLocator);
-                    }
-                } else {
-                    state.logs.insert(locator, log);
-                }
-            }
-            state.pages.push(SqdPositionHistoryPage {
-                direction,
                 cursor,
-                last_block: last.number,
                 request_body,
-                response_body: raw_body,
-            });
+                raw_body,
+                None,
+                state,
+            )?;
             if last.number == request.through_block {
                 break last;
             }
-            let next = last
-                .number
-                .checked_add(1)
+            cursor = next_page_cursor(last.number, cursor, request.through_block, direction)?
                 .ok_or(PositionHistoryError::InvalidPageCursor(direction))?;
-            if next <= cursor {
-                return Err(PositionHistoryError::InvalidPageCursor(direction));
-            }
-            cursor = next;
         };
         Ok(terminal)
     }
+}
+
+/// Re-verifies an ordered saved SQD transcript without constructing a network client.
+pub async fn reverify_recorded_sqd_position_history_segment(
+    request: &SqdPositionHistoryRequest,
+    pages: &[RecordedSqdPositionHistoryPage],
+) -> Result<RecordedSqdPositionHistorySegmentObservation, PositionHistoryError> {
+    let holder =
+        normalize_address(&request.holder_address).ok_or(PositionHistoryError::InvalidInput)?;
+    if holder == "0x0000000000000000000000000000000000000000" {
+        return Err(PositionHistoryError::InvalidInput);
+    }
+    let expected_hash =
+        normalize_hash(&request.expected_through_hash).ok_or(PositionHistoryError::InvalidInput)?;
+    if request.from_block > request.through_block
+        || request.max_requests == 0
+        || request.max_requests > MAX_HISTORY_REQUESTS
+        || request.max_total_response_bytes == 0
+        || request.max_total_response_bytes > MAX_HISTORY_TOTAL_BYTES
+        || request.total_timeout.is_zero()
+    {
+        return Err(PositionHistoryError::InvalidInput);
+    }
+    let start = tokio::time::Instant::now();
+    let deadline = start
+        .checked_add(request.total_timeout)
+        .ok_or(PositionHistoryError::InvalidInput)?;
+    let mut state = ReadState {
+        request_count: 0,
+        response_bytes: 0,
+        pages: Vec::new(),
+        logs: BTreeMap::new(),
+        headers: BTreeMap::new(),
+    };
+    let mut next_page = 0;
+    let from_terminal = reverify_direction(
+        request,
+        &holder,
+        PositionHistoryDirection::From,
+        deadline,
+        pages,
+        &mut next_page,
+        &mut state,
+    )
+    .await?;
+    let to_terminal = reverify_direction(
+        request,
+        &holder,
+        PositionHistoryDirection::To,
+        deadline,
+        pages,
+        &mut next_page,
+        &mut state,
+    )
+    .await?;
+    if next_page != pages.len() {
+        return Err(PositionHistoryError::MalformedResponse(
+            PositionHistoryDirection::To,
+        ));
+    }
+    if from_terminal != to_terminal
+        || from_terminal.hash != expected_hash
+        || to_terminal.hash != expected_hash
+    {
+        return Err(PositionHistoryError::AnchorMismatch);
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(PositionHistoryError::Timeout(PositionHistoryDirection::To));
+    }
+    let start_header =
+        state
+            .headers
+            .get(&request.from_block)
+            .cloned()
+            .ok_or(PositionHistoryError::Incomplete(
+                PositionHistoryDirection::From,
+            ))?;
+    let logs = sorted_logs(state.logs);
+    Ok(RecordedSqdPositionHistorySegmentObservation {
+        holder_address: holder,
+        from_block: request.from_block,
+        through_block: request.through_block,
+        expected_through_hash: expected_hash,
+        start_header,
+        from_terminal,
+        to_terminal,
+        logs,
+        pages: state.pages,
+        request_count: state.request_count,
+        response_bytes: state.response_bytes,
+    })
+}
+
+async fn reverify_direction(
+    request: &SqdPositionHistoryRequest,
+    holder: &str,
+    direction: PositionHistoryDirection,
+    deadline: tokio::time::Instant,
+    pages: &[RecordedSqdPositionHistoryPage],
+    next_page: &mut usize,
+    state: &mut ReadState,
+) -> Result<SqdBlockHeader, PositionHistoryError> {
+    let mut cursor = request.from_block;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PositionHistoryError::Timeout(direction));
+        }
+        if state.request_count >= request.max_requests {
+            return Err(PositionHistoryError::RequestBudgetExceeded);
+        }
+        let recorded = pages
+            .get(*next_page)
+            .ok_or(PositionHistoryError::Incomplete(direction))?;
+        state.request_count += 1;
+        if recorded.direction != direction
+            || recorded.cursor != cursor
+            || recorded.request_body
+                != serde_json::to_string(&query_body(
+                    cursor,
+                    request.through_block,
+                    holder,
+                    direction,
+                ))
+                .map_err(|_| PositionHistoryError::InvalidInput)?
+        {
+            return Err(PositionHistoryError::InvalidPageCursor(direction));
+        }
+        let body = recorded.response_body.as_bytes();
+        account_response_bytes(state, body.len(), request.max_total_response_bytes)?;
+        let last = ingest_page(
+            request,
+            holder,
+            direction,
+            cursor,
+            recorded.request_body.clone(),
+            recorded.response_body.clone(),
+            Some(recorded.last_block),
+            state,
+        )?;
+        *next_page += 1;
+        if last.number == request.through_block {
+            return Ok(last);
+        }
+        cursor = next_page_cursor(last.number, cursor, request.through_block, direction)?
+            .ok_or(PositionHistoryError::InvalidPageCursor(direction))?;
+    }
+}
+
+fn sorted_logs(logs: BTreeMap<(String, u64), PositionTransferLog>) -> Vec<PositionTransferLog> {
+    let mut logs: Vec<_> = logs.into_values().collect();
+    logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+    logs
+}
+
+fn account_response_bytes(
+    state: &mut ReadState,
+    response_bytes: usize,
+    max_total_response_bytes: usize,
+) -> Result<(), PositionHistoryError> {
+    let total = state.response_bytes.saturating_add(response_bytes);
+    if response_bytes > MAX_HISTORY_RESPONSE_BYTES || total > max_total_response_bytes {
+        return Err(PositionHistoryError::BodyBudgetExceeded);
+    }
+    state.response_bytes = total;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_page(
+    request: &SqdPositionHistoryRequest,
+    holder: &str,
+    direction: PositionHistoryDirection,
+    cursor: u64,
+    request_body: String,
+    response_body: String,
+    expected_last_block: Option<u64>,
+    state: &mut ReadState,
+) -> Result<SqdBlockHeader, PositionHistoryError> {
+    let (headers, logs) = parse_page(
+        response_body.as_bytes(),
+        request.from_block,
+        request.through_block,
+        cursor,
+        holder,
+        direction,
+    )?;
+    let first = headers
+        .first()
+        .ok_or(PositionHistoryError::Incomplete(direction))?;
+    let last = headers
+        .last()
+        .cloned()
+        .ok_or(PositionHistoryError::Incomplete(direction))?;
+    if first.number != cursor
+        || last.number < cursor
+        || last.number > request.through_block
+        || expected_last_block.is_some_and(|expected| expected != last.number)
+    {
+        return Err(PositionHistoryError::InvalidPageCursor(direction));
+    }
+    for header in headers {
+        register_header(&mut state.headers, header)?;
+    }
+    for log in logs {
+        let locator = (log.block_hash.clone(), log.log_index);
+        if let Some(previous) = state.logs.get(&locator) {
+            if previous != &log {
+                return Err(PositionHistoryError::ConflictingLocator);
+            }
+        } else {
+            state.logs.insert(locator, log);
+        }
+    }
+    state.pages.push(SqdPositionHistoryPage {
+        direction,
+        cursor,
+        last_block: last.number,
+        request_body,
+        response_body,
+    });
+    Ok(last)
+}
+
+fn next_page_cursor(
+    last_block: u64,
+    cursor: u64,
+    through_block: u64,
+    direction: PositionHistoryDirection,
+) -> Result<Option<u64>, PositionHistoryError> {
+    if last_block == through_block {
+        return Ok(None);
+    }
+    let next = last_block
+        .checked_add(1)
+        .ok_or(PositionHistoryError::InvalidPageCursor(direction))?;
+    if last_block < cursor || last_block > through_block || next <= cursor {
+        return Err(PositionHistoryError::InvalidPageCursor(direction));
+    }
+    Ok(Some(next))
 }
 
 struct ReadState {

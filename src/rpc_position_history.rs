@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use crate::position_history::{
     CTF_EMITTER, MAX_HISTORY_REQUESTS, MAX_HISTORY_RESPONSE_BYTES, MAX_HISTORY_TOTAL_BYTES,
     POSITION_MANAGER_EMITTER, PositionHistoryDirection, PositionHistoryError, PositionTransferLog,
+    RecordedSqdPositionHistorySegmentObservation, SqdPositionHistoryObservation,
     TRANSFER_BATCH_TOPIC, TRANSFER_SINGLE_TOPIC, normalize_address, normalize_hash, normalize_log,
 };
 
@@ -432,6 +433,106 @@ pub fn validate_recorded_position_history_segment_source_agreement(
         );
     }
     Ok(())
+}
+
+/// Compares one live RPC and one live SQD bounded segment as provider-reported observations.
+/// Agreement does not prove either provider complete or establish canonical chain truth.
+#[cfg(feature = "chain-audit")]
+pub fn validate_rpc_sqd_position_history_segment_source_agreement(
+    rpc: &RpcPositionHistorySegmentObservation,
+    sqd: &SqdPositionHistoryObservation,
+) -> Result<(), crate::position_history_receipts::PositionHistoryReceiptJoinError> {
+    validate_rpc_sqd_content(
+        &rpc.history.content,
+        &rpc.start_header,
+        SqdComparison {
+            holder: sqd.holder_address(),
+            from_block: sqd.from_block(),
+            through_block: sqd.through_block(),
+            expected_through_hash: sqd.expected_through_hash(),
+            start_header: sqd.start_header(),
+            from_terminal: sqd.from_terminal(),
+            to_terminal: sqd.to_terminal(),
+            logs: sqd.logs(),
+        },
+    )
+}
+
+/// Compares endpoint-free RPC and SQD transcripts after each SDK parser revalidates its pages.
+#[cfg(feature = "chain-audit")]
+pub fn validate_recorded_rpc_sqd_position_history_segment_source_agreement(
+    rpc: &RecordedRpcPositionHistorySegmentObservation,
+    sqd: &RecordedSqdPositionHistorySegmentObservation,
+) -> Result<(), crate::position_history_receipts::PositionHistoryReceiptJoinError> {
+    validate_rpc_sqd_content(
+        &rpc.content,
+        &rpc.start_header,
+        SqdComparison {
+            holder: sqd.holder_address(),
+            from_block: sqd.from_block(),
+            through_block: sqd.through_block(),
+            expected_through_hash: sqd.expected_through_hash(),
+            start_header: sqd.start_header(),
+            from_terminal: sqd.from_terminal(),
+            to_terminal: sqd.to_terminal(),
+            logs: sqd.logs(),
+        },
+    )
+}
+
+#[cfg(feature = "chain-audit")]
+struct SqdComparison<'a> {
+    holder: &'a str,
+    from_block: u64,
+    through_block: u64,
+    expected_through_hash: &'a str,
+    start_header: &'a crate::position_history::SqdBlockHeader,
+    from_terminal: &'a crate::position_history::SqdBlockHeader,
+    to_terminal: &'a crate::position_history::SqdBlockHeader,
+    logs: &'a [PositionTransferLog],
+}
+
+#[cfg(feature = "chain-audit")]
+fn validate_rpc_sqd_content(
+    rpc: &RpcPositionHistoryContent,
+    rpc_start: &RpcBlockHeader,
+    sqd: SqdComparison<'_>,
+) -> Result<(), crate::position_history_receipts::PositionHistoryReceiptJoinError> {
+    use crate::position_history_receipts::PositionHistoryReceiptJoinError as Error;
+    if rpc.holder_address != sqd.holder
+        || rpc.from_block != sqd.from_block
+        || rpc.through_block != sqd.through_block
+        || rpc.expected_through_hash != sqd.expected_through_hash
+        || rpc.from_block > rpc.through_block
+        || rpc.terminal_header.number != rpc.through_block
+        || rpc.terminal_header.hash != rpc.expected_through_hash
+        || sqd.from_terminal.number() != sqd.through_block
+        || sqd.to_terminal.number() != sqd.through_block
+        || sqd.to_terminal.hash() != sqd.expected_through_hash
+        || sqd.from_terminal != sqd.to_terminal
+        || !rpc_header_matches_sqd(&rpc.terminal_header, sqd.to_terminal)
+        || !rpc_header_matches_sqd(rpc_start, sqd.start_header)
+    {
+        return Err(Error::InvalidInput);
+    }
+    if rpc.logs != sqd.logs {
+        return Err(Error::SourceMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "chain-audit")]
+fn rpc_header_matches_sqd(
+    rpc: &RpcBlockHeader,
+    sqd: &crate::position_history::SqdBlockHeader,
+) -> bool {
+    rpc.number == sqd.number()
+        && rpc.hash == sqd.hash()
+        && rpc.parent_hash == sqd.parent_hash()
+        && rpc.state_root == sqd.state_root()
+        && rpc.transactions_root == sqd.transactions_root()
+        && rpc.receipts_root == sqd.receipts_root()
+        && rpc.logs_bloom == sqd.logs_bloom()
 }
 
 /// Caller-configured JSON-RPC endpoint. No provider URL or credential is selected here.
