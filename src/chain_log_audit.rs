@@ -3326,10 +3326,27 @@ pub struct ChainLogVerifier {
     client: Option<reqwest::Client>,
     primary: String,
     secondary: String,
+    primary_rpc_headers: reqwest::header::HeaderMap,
+    secondary_rpc_headers: reqwest::header::HeaderMap,
     request_budget: Option<Arc<OperationRequestBudget>>,
     scoped_call_targets: Option<[Address; 3]>,
     rpc_execution: RpcExecution,
     full_block_hash_lookup: bool,
+}
+
+fn mark_rpc_provider_headers_sensitive(headers: &mut reqwest::header::HeaderMap) -> bool {
+    if headers.keys().any(|name| {
+        matches!(
+            name.as_str(),
+            "host" | "content-length" | "transfer-encoding" | "connection" | "content-type"
+        )
+    }) {
+        return false;
+    }
+    for value in headers.values_mut() {
+        value.set_sensitive(true);
+    }
+    true
 }
 
 impl ChainLogVerifier {
@@ -3360,6 +3377,8 @@ impl ChainLogVerifier {
             client: Some(client),
             primary: primary.to_owned(),
             secondary: secondary.to_owned(),
+            primary_rpc_headers: reqwest::header::HeaderMap::new(),
+            secondary_rpc_headers: reqwest::header::HeaderMap::new(),
             request_budget: None,
             scoped_call_targets: None,
             rpc_execution: RpcExecution::Network,
@@ -3384,6 +3403,24 @@ impl ChainLogVerifier {
             return Err(ChainLogAuditError::InvalidInput);
         }
         self.client = Some(Self::build_rpc_client(timeout)?);
+        Ok(self)
+    }
+
+    /// Set private headers sent only to their corresponding RPC provider.
+    /// Transport-owned headers are rejected; credential values are marked
+    /// sensitive and are never included in captured request transcripts.
+    pub fn with_rpc_provider_headers(
+        mut self,
+        mut primary: reqwest::header::HeaderMap,
+        mut secondary: reqwest::header::HeaderMap,
+    ) -> Result<Self, ChainLogAuditError> {
+        if !mark_rpc_provider_headers_sensitive(&mut primary)
+            || !mark_rpc_provider_headers_sensitive(&mut secondary)
+        {
+            return Err(ChainLogAuditError::InvalidInput);
+        }
+        self.primary_rpc_headers = primary;
+        self.secondary_rpc_headers = secondary;
         Ok(self)
     }
 
@@ -4201,6 +4238,8 @@ impl ChainLogVerifier {
             client: self.client.clone(),
             primary: self.primary.clone(),
             secondary: self.secondary.clone(),
+            primary_rpc_headers: self.primary_rpc_headers.clone(),
+            secondary_rpc_headers: self.secondary_rpc_headers.clone(),
             request_budget: Some(budget),
             scoped_call_targets: self.scoped_call_targets,
             rpc_execution: self.rpc_execution.clone(),
@@ -4213,6 +4252,8 @@ impl ChainLogVerifier {
             client: self.client.clone(),
             primary: self.primary.clone(),
             secondary: self.secondary.clone(),
+            primary_rpc_headers: self.primary_rpc_headers.clone(),
+            secondary_rpc_headers: self.secondary_rpc_headers.clone(),
             request_budget: self.request_budget.clone(),
             scoped_call_targets: Some([
                 fifth_code_context::POSITION_MANAGER_PROXY
@@ -6621,6 +6662,10 @@ impl ChainLogVerifier {
         } else {
             return Err(ChainLogAuditError::Unverified);
         };
+        let provider_headers = match source {
+            ChainRpcSourceRole::Primary => &self.primary_rpc_headers,
+            ChainRpcSourceRole::Secondary => &self.secondary_rpc_headers,
+        };
         let request_body =
             serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
                 .map_err(|_| ChainLogAuditError::Unverified)?;
@@ -6650,6 +6695,7 @@ impl ChainLogVerifier {
                     .ok_or(ChainLogAuditError::Unavailable)?;
                 let mut response = client
                     .post(endpoint)
+                    .headers(provider_headers.clone())
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(request_body)
                     .send()
@@ -6775,6 +6821,8 @@ pub async fn reverify_recorded_transaction_receipt_observation_bounded(
         client: None,
         primary: "recorded-receipt-primary".to_owned(),
         secondary: "recorded-receipt-secondary".to_owned(),
+        primary_rpc_headers: reqwest::header::HeaderMap::new(),
+        secondary_rpc_headers: reqwest::header::HeaderMap::new(),
         request_budget: None,
         scoped_call_targets: None,
         rpc_execution: RpcExecution::Recorded(Arc::clone(&replay)),
