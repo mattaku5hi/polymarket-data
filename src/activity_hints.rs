@@ -21,6 +21,7 @@ use crate::{
 pub const V2_ACTIVITY_PATH: &str = "/v2/activity";
 pub const ACTIVITY_HINT_POLICY_VERSION: &str = "data-api-v2-activity-default-plus-tip/1";
 pub const MAX_ACTIVITY_PAGE_SIZE: usize = 1_000;
+const API_ONLY_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Shared execution budget/deadline supplied by a larger candidate workflow.
 #[derive(Clone, Copy)]
@@ -188,6 +189,30 @@ pub struct WalletActivityObservationLimits {
     pub deadline: Duration,
 }
 
+/// HTTP-only bounds for acquiring raw `/v2/activity` hints without receipt RPC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalletActivityHintLimits {
+    pub max_pages: usize,
+    pub max_rows: usize,
+    pub page_size: usize,
+    pub max_activity_requests: usize,
+    pub max_response_bytes: usize,
+    pub deadline: Duration,
+}
+
+impl From<WalletActivityObservationLimits> for WalletActivityHintLimits {
+    fn from(limits: WalletActivityObservationLimits) -> Self {
+        Self {
+            max_pages: limits.max_pages,
+            max_rows: limits.max_rows,
+            page_size: limits.page_size,
+            max_activity_requests: limits.max_activity_requests,
+            max_response_bytes: limits.max_response_bytes,
+            deadline: limits.deadline,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReceiptObservationStatus {
     NotStartedActivityIncomplete(ActivityHintIncompleteReason),
@@ -279,6 +304,38 @@ impl PolymarketActivityHintClient {
         Self::new(DEFAULT_BASE_URL).expect("static Data API endpoint is valid")
     }
 
+    /// Acquire bounded API-only activity hints without creating or calling an
+    /// RPC client. The default and explicit TIP passes retain raw row
+    /// occurrences, with at least 500 ms between request starts. Exhausting
+    /// both filters still does not prove complete wallet history or establish
+    /// ROI.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid wallet, time window, limits or endpoint configuration.
+    pub async fn acquire_wallet_activity_hints(
+        &self,
+        wallet: &str,
+        start: i64,
+        end: i64,
+        limits: WalletActivityHintLimits,
+    ) -> Result<ActivityHintAcquisition, ActivityHintInputError> {
+        let wallet = validate_activity_request(wallet, start, end, limits)?;
+        let deadline = Instant::now()
+            .checked_add(limits.deadline)
+            .ok_or(ActivityHintInputError::InvalidRequest)?;
+        Ok(self
+            .acquire_hints_until_with_pacing(
+                wallet,
+                start,
+                end,
+                limits,
+                deadline,
+                Some(API_ONLY_MIN_REQUEST_INTERVAL),
+            )
+            .await)
+    }
+
     /// Walk default (type omitted) and explicit TIP independently, retaining raw
     /// row occurrences and per-pass/page/ordinal provenance. Once both walks
     /// exhaust their filters, verify only distinct transaction hashes through
@@ -316,12 +373,12 @@ impl PolymarketActivityHintClient {
         verifier: &ChainLogVerifier,
         context: ActivityObservationContext<'_>,
     ) -> Result<WalletActivityObservation, ActivityHintInputError> {
-        let wallet = validate_activity_request(wallet, start, end, limits)?;
+        let wallet = validate_observation_request(wallet, start, end, limits)?;
         let budget = context.request_budget;
         let deadline = context.deadline;
         let rpc_request_start = budget.reserved_requests();
         let activity = self
-            .acquire_hints_until(wallet, start, end, limits, deadline)
+            .acquire_hints_until(wallet, start, end, limits.into(), deadline)
             .await;
 
         if let Some(reason) = activity.incomplete_reason {
@@ -383,8 +440,21 @@ impl PolymarketActivityHintClient {
         wallet: String,
         start: i64,
         end: i64,
-        limits: WalletActivityObservationLimits,
+        limits: WalletActivityHintLimits,
         deadline: Instant,
+    ) -> ActivityHintAcquisition {
+        self.acquire_hints_until_with_pacing(wallet, start, end, limits, deadline, None)
+            .await
+    }
+
+    async fn acquire_hints_until_with_pacing(
+        &self,
+        wallet: String,
+        start: i64,
+        end: i64,
+        limits: WalletActivityHintLimits,
+        deadline: Instant,
+        min_request_interval: Option<Duration>,
     ) -> ActivityHintAcquisition {
         let mut activity = ActivityHintAcquisition {
             wallet,
@@ -400,6 +470,7 @@ impl PolymarketActivityHintClient {
             seen_transaction_hashes: HashSet::new(),
             incomplete_reason: None,
         };
+        let mut pacer = ActivityRequestPacer::new(min_request_interval);
         for (pass_index, pass) in [ActivityHintPass::DefaultTypes, ActivityHintPass::Tip]
             .into_iter()
             .enumerate()
@@ -415,7 +486,10 @@ impl PolymarketActivityHintClient {
                     break;
                 }
             }
-            match self.walk_pass(&mut activity, pass, limits, deadline).await {
+            match self
+                .walk_pass(&mut activity, pass, limits, deadline, &mut pacer)
+                .await
+            {
                 Ok(()) => set_pass_status(&mut activity, pass, ActivityHintPassStatus::Complete),
                 Err(reason) => {
                     set_pass_status(
@@ -435,8 +509,9 @@ impl PolymarketActivityHintClient {
         &self,
         acquisition: &mut ActivityHintAcquisition,
         pass: ActivityHintPass,
-        limits: WalletActivityObservationLimits,
+        limits: WalletActivityHintLimits,
         deadline: Instant,
+        pacer: &mut ActivityRequestPacer,
     ) -> Result<(), ActivityHintIncompleteReason> {
         let mut cursor: Option<String> = None;
         let mut used_cursors = HashSet::new();
@@ -456,12 +531,14 @@ impl PolymarketActivityHintClient {
             }
             let page = page_number(acquisition, pass) + 1;
             let url = self.page_url(acquisition, pass, limits.page_size, cursor.as_deref());
+            pacer.wait_until_ready(deadline).await?;
             let response_result = tokio::select! {
                 biased;
                 () = sleep_until(deadline) => return Err(ActivityHintIncompleteReason::DeadlineExceeded),
                 result = async {
                     acquisition.total_requests += 1;
                     increment_pages(acquisition, pass);
+                    pacer.mark_started();
                     self.client.get(url).send().await
                 } => result,
             };
@@ -563,6 +640,50 @@ impl PolymarketActivityHintClient {
     }
 }
 
+struct ActivityRequestPacer {
+    min_interval: Option<Duration>,
+    last_started: Option<Instant>,
+}
+
+impl ActivityRequestPacer {
+    const fn new(min_interval: Option<Duration>) -> Self {
+        Self {
+            min_interval,
+            last_started: None,
+        }
+    }
+
+    async fn wait_until_ready(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ActivityHintIncompleteReason> {
+        let Some(next_start) = self.min_interval.and_then(|interval| {
+            self.last_started
+                .and_then(|last| last.checked_add(interval))
+        }) else {
+            if Instant::now() >= deadline {
+                return Err(ActivityHintIncompleteReason::DeadlineExceeded);
+            }
+            return Ok(());
+        };
+        tokio::select! {
+            biased;
+            () = sleep_until(deadline) => Err(ActivityHintIncompleteReason::DeadlineExceeded),
+            () = sleep_until(next_start) => {
+                if Instant::now() >= deadline {
+                    Err(ActivityHintIncompleteReason::DeadlineExceeded)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn mark_started(&mut self) {
+        self.last_started = Some(Instant::now());
+    }
+}
+
 fn validate_base_url(value: &str) -> Result<Url, ActivityHintInputError> {
     let url = Url::parse(value).map_err(|_| ActivityHintInputError::InvalidEndpoint)?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
@@ -585,19 +706,30 @@ fn validate_request(
     end: i64,
     limits: WalletActivityObservationLimits,
 ) -> Result<(String, Instant), ActivityHintInputError> {
-    validate_activity_request(wallet, start, end, limits).and_then(|wallet| {
-        let deadline = Instant::now()
-            .checked_add(limits.deadline)
-            .ok_or(ActivityHintInputError::InvalidRequest)?;
-        Ok((wallet, deadline))
-    })
+    let wallet = validate_observation_request(wallet, start, end, limits)?;
+    let deadline = Instant::now()
+        .checked_add(limits.deadline)
+        .ok_or(ActivityHintInputError::InvalidRequest)?;
+    Ok((wallet, deadline))
+}
+
+fn validate_observation_request(
+    wallet: &str,
+    start: i64,
+    end: i64,
+    limits: WalletActivityObservationLimits,
+) -> Result<String, ActivityHintInputError> {
+    if limits.max_rpc_requests == 0 {
+        return Err(ActivityHintInputError::InvalidRequest);
+    }
+    validate_activity_request(wallet, start, end, limits.into())
 }
 
 fn validate_activity_request(
     wallet: &str,
     start: i64,
     end: i64,
-    limits: WalletActivityObservationLimits,
+    limits: WalletActivityHintLimits,
 ) -> Result<String, ActivityHintInputError> {
     let wallet = validate_address(wallet).ok_or(ActivityHintInputError::InvalidRequest)?;
     if start < 1
@@ -608,7 +740,6 @@ fn validate_activity_request(
         || limits.page_size > MAX_ACTIVITY_PAGE_SIZE
         || limits.max_activity_requests == 0
         || limits.max_response_bytes == 0
-        || limits.max_rpc_requests == 0
         || limits.deadline.is_zero()
     {
         return Err(ActivityHintInputError::InvalidRequest);
@@ -662,7 +793,7 @@ fn total_pages(acquisition: &ActivityHintAcquisition) -> usize {
 
 fn exhausted_limit(
     acquisition: &ActivityHintAcquisition,
-    limits: WalletActivityObservationLimits,
+    limits: WalletActivityHintLimits,
 ) -> Option<ActivityHintIncompleteReason> {
     if acquisition.total_requests >= limits.max_activity_requests {
         Some(ActivityHintIncompleteReason::ActivityRequestLimit)
@@ -853,6 +984,19 @@ mod tests {
     }
 
     #[test]
+    fn api_only_limits_omit_rpc_and_receipt_limits_still_require_rpc_budget() {
+        let wallet = format!("0x{}", "aa".repeat(20));
+        assert!(validate_activity_request(&wallet, 1, 10, hint_limits()).is_ok());
+        let mut receipt_limits = limits();
+        receipt_limits.max_rpc_requests = 0;
+        assert_eq!(
+            validate_request(&wallet, 1, 10, receipt_limits),
+            Err(ActivityHintInputError::InvalidRequest)
+        );
+        assert!(validate_request(&wallet, 1, 10, limits()).is_ok());
+    }
+
+    #[test]
     fn activity_page_requires_cursor_and_has_more_to_agree() {
         for pagination in [
             serde_json::json!({"limit":2,"offset":0,"has_more":true}),
@@ -884,6 +1028,7 @@ mod tests {
     #[derive(Clone)]
     struct FixtureState {
         requests: Arc<Mutex<Vec<HashMap<String, String>>>>,
+        started_at: Arc<Mutex<Option<Instant>>>,
         cycle: bool,
         delay: Duration,
         oversized_body: Option<usize>,
@@ -893,6 +1038,14 @@ mod tests {
         State(state): State<FixtureState>,
         Query(query): Query<HashMap<String, String>>,
     ) -> Response<Body> {
+        let mut query = query;
+        let now = Instant::now();
+        let elapsed_millis = {
+            let mut started_at = state.started_at.lock().unwrap();
+            let first = *started_at.get_or_insert(now);
+            now.duration_since(first).as_millis().to_string()
+        };
+        query.insert("__elapsed_millis".into(), elapsed_millis);
         state.requests.lock().unwrap().push(query.clone());
         if let Some(size) = state.oversized_body {
             return Response::builder()
@@ -948,6 +1101,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = FixtureState {
             requests: requests.clone(),
+            started_at: Arc::new(Mutex::new(None)),
             cycle,
             delay,
             oversized_body,
@@ -972,14 +1126,17 @@ mod tests {
         let (wallet, deadline) = validate_request(&format!("0x{}", "aa".repeat(20)), 1, 10, limits)
             .expect("valid fixture request");
         client
-            .acquire_hints_until(wallet, 1, 10, limits, deadline)
+            .acquire_hints_until(wallet, 1, 10, limits.into(), deadline)
             .await
     }
 
     #[tokio::test]
     async fn independent_default_and_tip_walks_preserve_occurrences_and_pin_filters() {
         let (client, requests) = fixture_client(false, Duration::ZERO, None).await;
-        let acquisition = acquire_fixture(&client, limits()).await;
+        let acquisition = client
+            .acquire_wallet_activity_hints(&format!("0x{}", "aa".repeat(20)), 1, 10, hint_limits())
+            .await
+            .expect("API-only acquisition needs no receipt verifier");
         assert!(acquisition.is_complete());
         assert_eq!(acquisition.occurrences().len(), 5);
         assert_eq!(acquisition.distinct_transaction_hashes().len(), 2);
@@ -1015,6 +1172,15 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
+        let elapsed_millis: Vec<u128> = requests
+            .iter()
+            .map(|query| query["__elapsed_millis"].parse().unwrap())
+            .collect();
+        assert!(
+            elapsed_millis
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] >= 500)
+        );
         let expected_wallet = format!("0x{}", "aa".repeat(20));
         for (index, query) in requests.iter().enumerate() {
             assert_eq!(
@@ -1104,12 +1270,33 @@ mod tests {
         );
 
         let (client, _) = fixture_client(false, Duration::from_millis(100), None).await;
-        let mut timed = limits();
+        let mut timed = hint_limits();
         timed.deadline = Duration::from_millis(5);
+        let acquisition = client
+            .acquire_wallet_activity_hints(&format!("0x{}", "aa".repeat(20)), 1, 10, timed)
+            .await
+            .expect("valid bounded API-only request");
         assert_eq!(
-            acquire_fixture(&client, timed).await.incomplete_reason(),
+            acquisition.incomplete_reason(),
             Some(ActivityHintIncompleteReason::DeadlineExceeded)
         );
+    }
+
+    #[tokio::test]
+    async fn api_only_deadline_expiring_during_pacing_sends_no_next_request() {
+        let (client, requests) = fixture_client(false, Duration::ZERO, None).await;
+        let mut timed = hint_limits();
+        timed.deadline = Duration::from_millis(100);
+        let acquisition = client
+            .acquire_wallet_activity_hints(&format!("0x{}", "aa".repeat(20)), 1, 10, timed)
+            .await
+            .expect("valid bounded API-only request");
+        assert_eq!(
+            acquisition.incomplete_reason(),
+            Some(ActivityHintIncompleteReason::DeadlineExceeded)
+        );
+        assert_eq!(acquisition.total_requests(), 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1199,5 +1386,9 @@ mod tests {
             max_rpc_requests: 64,
             deadline: Duration::from_secs(5),
         }
+    }
+
+    fn hint_limits() -> WalletActivityHintLimits {
+        limits().into()
     }
 }

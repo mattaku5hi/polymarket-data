@@ -63,6 +63,10 @@ Only first-page requests send `limit`; cursor requests use the provider's encode
 
 A bounded 2026-09-30 public probe found CloudFront `Cache-Control: public, max-age=300`; request `Cache-Control: no-cache` still returned an aged head. It also found enrichment changing between reads (`event_slug`/`outcome_index`). Thus an identical cached head is not a liveness guarantee and a whole-row JSON hash is not stable overlap identity. `RawTradesPage.cache_age_seconds` exposes a parsed HTTP `Age` header; missing or invalid means unknown, never an invented zero/cache miss. The library does not bypass caching, infer a freshness SLA or recover coverage gaps.
 
+## API-only wallet activity hints
+
+With the existing `chain-audit` feature, `activity_hints::PolymarketActivityHintClient::acquire_wallet_activity_hints` walks the default activity filter and explicit `TIP` filter using HTTP-only `WalletActivityHintLimits`. It keeps raw activity rows and per-pass/page/row occurrence positions without constructing a receipt verifier or sending RPC requests. Both filters retain `start`/`end` and other request parameters on cursor pages. Even two exhausted passes are hints, not proof of complete wallet history, balances, or ROI; callers must inspect `is_complete()` and keep venue-reported source semantics explicit.
+
 ## CLOB book snapshot
 
 ```rust,ignore
