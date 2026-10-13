@@ -19,6 +19,8 @@ for observation in page.observations {
 
 The response is capped at 8 MiB before decoding (including chunked responses); the wallet reader rejects any invalid row atomically. Both readers return typed status/transport/body errors without embedding request URLs or response bodies. Numeric `Retry-After` is surfaced as seconds; no retry is performed. HTTPS is required except loopback HTTP for local fixtures. The vendor JSON remains available via `vendor_row()`. The API returns decimal **text** as supplied by JSON representation; it does not calculate fees or fill economics.
 
+For an explicit wallet full-history request mode, use `fetch_v2_trades_page_full_history`; it sends `start=1` on the initial request and every cursor request while keeping the same wallet and `taker_only=false` filters. This selects the provider's full-history mode but does not establish complete history. The existing `fetch_v2_trades_page` leaves `start` unset and keeps its prior behavior.
+
 ## Venue-reported wallet economics
 
 ```rust,ignore
