@@ -2,7 +2,7 @@ use axum::{Router, body::Body, http::StatusCode, routing::get};
 use polymarket_data::{
     PageError, TradeRowError, TradeSide, fetch_v2_global_trades_page,
     fetch_v2_global_trades_page_with_min_size, fetch_v2_trades_page,
-    fetch_v2_trades_page_full_history, parse_v2_trade,
+    fetch_v2_trades_page_full_history, fetch_v2_trades_page_full_history_until, parse_v2_trade,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -104,6 +104,7 @@ async fn full_history_wallet_reader_pins_start_on_each_page_and_preserves_duplic
                     assert_eq!(query["user"], WALLET);
                     assert_eq!(query["taker_only"], "false");
                     assert_eq!(query["start"], "1");
+                    assert!(!query.contains_key("end"));
                     if let Some(cursor) = query.get("cursor") {
                         assert_eq!(cursor, "opaque+/=cursor");
                         assert!(!query.contains_key("limit"));
@@ -138,6 +139,104 @@ async fn full_history_wallet_reader_pins_start_on_each_page_and_preserves_duplic
             .unwrap();
     assert_eq!(next.observations.len(), 2);
     server.abort();
+}
+
+#[tokio::test]
+async fn full_history_until_repeats_inclusive_end_and_wallet_filters_on_cursor_pages() {
+    let expected_rows = vec![row(), row()];
+    let rows_for_server = expected_rows.clone();
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count_for_server = request_count.clone();
+    let app = Router::new().route(
+        "/v2/trades",
+        get(
+            move |axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| {
+                let rows = rows_for_server.clone();
+                let count = count_for_server.clone();
+                async move {
+                    assert_eq!(query["user"], WALLET);
+                    assert_eq!(query["taker_only"], "false");
+                    assert_eq!(query["start"], "1");
+                    assert_eq!(query["end"], "1731489409");
+                    if let Some(cursor) = query.get("cursor") {
+                        assert_eq!(cursor, "opaque+/=cursor");
+                        assert!(!query.contains_key("limit"));
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({
+                            "data": rows,
+                            "pagination": {"next_cursor": null}
+                        }))
+                    } else {
+                        assert_eq!(query["limit"], "2");
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({
+                            "data": rows,
+                            "pagination": {"next_cursor": "opaque+/=cursor"}
+                        }))
+                    }
+                }
+            },
+        ),
+    );
+    let (base, server) = serve(app).await;
+    let client = reqwest::Client::new();
+    let first =
+        fetch_v2_trades_page_full_history_until(&client, &base, WALLET, 2, None, 1_731_489_409)
+            .await
+            .unwrap();
+    assert_eq!(first.observations.len(), 2);
+    assert_eq!(
+        first
+            .observations
+            .iter()
+            .map(|observation| observation.vendor_row())
+            .collect::<Vec<_>>(),
+        expected_rows.iter().collect::<Vec<_>>()
+    );
+    let second = fetch_v2_trades_page_full_history_until(
+        &client,
+        &base,
+        WALLET,
+        2,
+        first.next_cursor.as_deref(),
+        1_731_489_409,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.observations.len(), 2);
+    assert_eq!(
+        second
+            .observations
+            .iter()
+            .map(|observation| observation.vendor_row())
+            .collect::<Vec<_>>(),
+        expected_rows.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(second.next_cursor, None);
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn full_history_until_rejects_zero_and_unrepresentable_end_before_network() {
+    let client = reqwest::Client::new();
+    for end in [0, u64::MAX] {
+        assert_eq!(
+            fetch_v2_trades_page_full_history_until(
+                &client,
+                "http://127.0.0.1:1",
+                WALLET,
+                1,
+                None,
+                end,
+            )
+            .await
+            .unwrap_err(),
+            PageError::InvalidEnd
+        );
+    }
 }
 
 #[tokio::test]

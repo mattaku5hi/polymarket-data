@@ -19,7 +19,20 @@ for observation in page.observations {
 
 The response is capped at 8 MiB before decoding (including chunked responses); the wallet reader rejects any invalid row atomically. Both readers return typed status/transport/body errors without embedding request URLs or response bodies. Numeric `Retry-After` is surfaced as seconds; no retry is performed. HTTPS is required except loopback HTTP for local fixtures. The vendor JSON remains available via `vendor_row()`. The API returns decimal **text** as supplied by JSON representation; it does not calculate fees or fill economics.
 
-For an explicit wallet full-history request mode, use `fetch_v2_trades_page_full_history`; it sends `start=1` on the initial request and every cursor request while keeping the same wallet and `taker_only=false` filters. This selects the provider's full-history mode but does not establish complete history. The existing `fetch_v2_trades_page` leaves `start` unset and keeps its prior behavior.
+For explicit wallet full-history reads, use `fetch_v2_trades_page_full_history`; it sends `start=1` on the initial request and every cursor request while keeping the same wallet and `taker_only=false` filters. For a bounded historical walk, use `fetch_v2_trades_page_full_history_until` with a positive inclusive Unix-second `end`:
+
+```rust,ignore
+let page = polymarket_data::fetch_v2_trades_page_full_history_until(
+    &client,
+    polymarket_data::DEFAULT_BASE_URL,
+    proxy_wallet,
+    100,
+    saved_cursor,
+    end_unix_seconds,
+).await?;
+```
+
+Both `start=1` and the same `end` are sent on every cursor request. The upper event-time bound does not provide snapshot isolation or prove that data through that instant is available; callers must retain page/capture coverage and source freshness evidence. These functions select request modes, not completeness. The existing `fetch_v2_trades_page` leaves `start` and `end` unset and keeps its prior behavior.
 
 ## Venue-reported wallet economics
 
