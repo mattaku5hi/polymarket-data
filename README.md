@@ -19,6 +19,30 @@ for observation in page.observations {
 
 The response is capped at 8 MiB before decoding (including chunked responses); the wallet reader rejects any invalid row atomically. Both readers return typed status/transport/body errors without embedding request URLs or response bodies. Numeric `Retry-After` is surfaced as seconds; no retry is performed. HTTPS is required except loopback HTTP for local fixtures. The vendor JSON remains available via `vendor_row()`. The API returns decimal **text** as supplied by JSON representation; it does not calculate fees or fill economics.
 
+## Venue-reported wallet economics
+
+```rust,ignore
+use polymarket_data::economics::{EconomicsReader, PositionsRequest, UserPnlRequest};
+
+let reader = EconomicsReader::new(client.clone(), polymarket_data::DEFAULT_BASE_URL)?;
+let mut request = PositionsRequest::new(proxy_wallet, 100);
+request.status = Some("CLOSED".to_owned());
+let positions = reader.positions(&request).await?;
+let stats = reader.user_stats(proxy_wallet).await?;
+let pnl = reader.user_pnl(&UserPnlRequest::new(proxy_wallet)).await?;
+// Follow positions.next_cursor using request.with_cursor(cursor).
+// The caller owns full-walk coverage, rate budgets and durable storage.
+```
+
+Each response retains exact raw bytes, query parameters, request/retrieval times
+and HTTP freshness headers. Each request, including its body, has a 30-second
+deadline and an 8 MiB body cap; no automatic retry is performed. Structured
+HTTP errors retain status, Retry-After and the venue error payload. Successful
+DTOs support serde captures, preserving absent versus explicitly null economic
+atoms. Projected JSON numbers remain unvalidated provider values; use raw bytes
+when exact decimal spelling matters. The source is explicitly `venue_reported`.
+These readers do not calculate qualification, historical cost basis or ROI.
+
 ## Global trade page (raw evidence)
 
 ```rust,ignore

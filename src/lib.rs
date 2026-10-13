@@ -3,6 +3,7 @@
 //! No order submission, wallet spending or qualified P&L claims.
 
 pub mod clob;
+pub mod economics;
 pub mod position_history;
 pub mod rpc_position_history;
 
