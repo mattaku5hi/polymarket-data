@@ -221,7 +221,7 @@ exchanges. It ignores unrelated events, but a malformed scoped `OrderFilled`
 rejects the full extraction. It enforces all seven non-indexed words in the
 pinned V2 event ABI and preserves the final `builder` and `metadata` bytes32
 words through getters. Its policy version is
-`ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/2`. Each row preserves
+`ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/3`. Each row preserves
 block/parent/time, transaction index/hash, global log index, and the log's
 ordinal among **all** receipt logs in that transaction. `OrdinaryMaker` versus
 `ExchangeAggregateOwner` is the observable source event shape; equal-valued
@@ -229,6 +229,21 @@ logs remain separate rows. Share, collateral, and fee amounts are gross V2
 event base units (the V2 fee is collateral-denominated); they are not wallet-net
 accounting or RTDS matches. This CTF extractor does not cover the separate fifth
 Exchange.
+
+The decoder policy is `ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/3`.
+`ChainLogVerifier::capture_v2_owner_fill_signals_bounded` captures one explicit
+block with caller-supplied parent/end hashes, shared request budget, response
+byte cap, and total deadline. The returned
+`RecordedV2OwnerFillSignalsPacket` contains the exact RPC transcript and schema,
+capture-policy, and decoder-policy versions. It is untrusted serialized input:
+`reverify_recorded_v2_owner_fill_signals_bounded` contacts no provider and
+replays every frame through the same receipt-root interval verifier, rejecting
+unsupported versions, changed/missing/extra frames, and exceeded bounds.
+Captured rows are marked `OnlineProvidersReportFinalized`; replayed rows are
+marked `RecordedProvidersReportedFinalized`. The latter establishes that the
+saved provider claims passed current local replay checks, not that the block is
+currently finalized. Neither result adds a capture/availability timestamp or
+claims wallet-history completeness.
 
 `FifthReceiptMakerWindow::aggregate_fills()` separately returns fifth-Exchange
 aggregate owner rows only after their `OrderFilled`/`OrdersMatched` pair passes

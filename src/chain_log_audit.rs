@@ -58,6 +58,7 @@ mod fifth_native_two_condition_trades;
 mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
 mod known_position_balances;
+mod recorded_owner_fill_signals;
 mod v1_binary_trades;
 mod v2_owner_fill_signals;
 pub use ctf_operations::{
@@ -165,13 +166,20 @@ pub use known_position_balances::{
     KnownPositionBalanceId, KnownPositionBalanceNamespace, KnownPositionBalanceRow,
     KnownPositionBalancesObservation,
 };
+pub use recorded_owner_fill_signals::{
+    BoundedRecordedOwnerFillSignalsError, CapturedV2OwnerFillSignals,
+    RECORDED_V2_OWNER_FILL_PACKET_SCHEMA_VERSION, RecordedV2OwnerFillSignals,
+    RecordedV2OwnerFillSignalsPacket, V2_OWNER_FILL_CAPTURE_POLICY_VERSION,
+    V2_OWNER_FILL_RECORDED_REVERIFICATION_POLICY_VERSION,
+    reverify_recorded_v2_owner_fill_signals_bounded,
+};
 pub use v1_binary_trades::{
     V1BinaryTradeTransactionFact, V1BinaryTradeTransactionStatus, V1BinaryTradesEvidence,
     V1ExchangeInventorySnapshot,
 };
 pub use v2_owner_fill_signals::{
     CTF_V2_OWNER_FILL_SIGNAL_POLICY_VERSION, V2OwnerFillRole, V2OwnerFillSignal,
-    extract_ctf_v2_owner_fill_signals,
+    V2OwnerFillSignalProvenance, extract_ctf_v2_owner_fill_signals,
 };
 
 /// Polygon chain ID verified by this diagnostic transaction verifier.

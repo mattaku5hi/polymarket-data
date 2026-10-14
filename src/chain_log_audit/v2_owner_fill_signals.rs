@@ -10,7 +10,15 @@ use super::{
 };
 
 pub const CTF_V2_OWNER_FILL_SIGNAL_POLICY_VERSION: &str =
-    "ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/2";
+    "ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/3";
+
+/// Whether a signal was produced from the current provider call or from a
+/// complete saved transcript that passed the same receipt-root verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2OwnerFillSignalProvenance {
+    OnlineProvidersReportFinalized,
+    RecordedProvidersReportedFinalized,
+}
 
 /// Observable OrderFilled owner role inferred from the raw counterparty topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +58,7 @@ pub struct V2OwnerFillSignal {
     fee_base_units: u128,
     builder: String,
     metadata: String,
+    provenance: V2OwnerFillSignalProvenance,
 }
 
 impl V2OwnerFillSignal {
@@ -147,12 +156,26 @@ impl V2OwnerFillSignal {
     pub fn metadata(&self) -> &str {
         &self.metadata
     }
+    #[must_use]
+    pub const fn provenance(&self) -> V2OwnerFillSignalProvenance {
+        self.provenance
+    }
 }
 
 /// Extract CTF V2 owner fills from privately constructed, receipt-root-verified
 /// evidence. Selected malformed e111/e222 OrderFilled logs refuse the interval.
 pub fn extract_ctf_v2_owner_fill_signals(
     evidence: &ChainReceiptIntervalEvidence,
+) -> Result<Vec<V2OwnerFillSignal>, ChainLogAuditError> {
+    extract_ctf_v2_owner_fill_signals_with_provenance(
+        evidence,
+        V2OwnerFillSignalProvenance::OnlineProvidersReportFinalized,
+    )
+}
+
+pub(super) fn extract_ctf_v2_owner_fill_signals_with_provenance(
+    evidence: &ChainReceiptIntervalEvidence,
+    provenance: V2OwnerFillSignalProvenance,
 ) -> Result<Vec<V2OwnerFillSignal>, ChainLogAuditError> {
     if evidence.chain_id() != CHAIN_ID
         || evidence.from_block() == 0
@@ -225,6 +248,7 @@ pub fn extract_ctf_v2_owner_fill_signals(
                     receipt_log,
                     u64::try_from(local_ordinal).map_err(|_| ChainLogAuditError::Unverified)?,
                     fill,
+                    provenance,
                 ));
             }
         }
@@ -266,6 +290,7 @@ fn signal_from_fill(
     log: &ChainReceiptLog,
     local_ordinal: u64,
     fill: ChainMakerFill,
+    provenance: V2OwnerFillSignalProvenance,
 ) -> V2OwnerFillSignal {
     let role = if fill.exchange_counterparty_aggregate_shape {
         V2OwnerFillRole::ExchangeAggregateOwner
@@ -296,6 +321,7 @@ fn signal_from_fill(
         fee_base_units: fill.fee_base_units,
         builder: format!("0x{}", &log.data()[2 + 5 * 64..2 + 6 * 64]),
         metadata: format!("0x{}", &log.data()[2 + 6 * 64..2 + 7 * 64]),
+        provenance,
     }
 }
 
@@ -416,6 +442,10 @@ mod tests {
         ]);
         let rows = extract_ctf_v2_owner_fill_signals(&evidence).unwrap();
         assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].provenance(),
+            V2OwnerFillSignalProvenance::OnlineProvidersReportFinalized
+        );
         assert_eq!(rows[0].role(), V2OwnerFillRole::OrdinaryMaker);
         assert_eq!(rows[1].role(), V2OwnerFillRole::ExchangeAggregateOwner);
         assert_eq!(rows[0].transaction_local_log_ordinal(), 1);

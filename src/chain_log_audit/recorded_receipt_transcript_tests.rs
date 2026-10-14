@@ -5,6 +5,10 @@ mod rpc_http_timeout_tests {
     include!("rpc_http_timeout_tests.rs");
 }
 
+mod recorded_owner_fill_signals_tests {
+    include!("recorded_owner_fill_signals_tests.rs");
+}
+
 async fn receipt_transcript_rpc(
     State(fixture): State<CtfInventoryFixture>,
     Json(request): Json<Value>,
