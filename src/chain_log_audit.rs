@@ -59,6 +59,7 @@ mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
 mod known_position_balances;
 mod recorded_owner_fill_signals;
+mod selected_owner_watch;
 mod v1_binary_trades;
 mod v2_owner_fill_signals;
 pub use ctf_operations::{
@@ -173,6 +174,10 @@ pub use recorded_owner_fill_signals::{
     RecordedV2OwnerFillSignalsPacket, V2_OWNER_FILL_CAPTURE_POLICY_VERSION,
     V2_OWNER_FILL_RECORDED_REVERIFICATION_POLICY_VERSION,
     reverify_recorded_v2_owner_fill_signals_bounded,
+};
+pub use selected_owner_watch::{
+    BoundedSelectedCtfV2OwnerWatchError, SELECTED_CTF_V2_OWNER_WATCH_POLICY_VERSION,
+    SelectedCtfV2OwnerLogIdentity, SourceAttestedSelectedCtfV2OwnerWatchObservation,
 };
 pub use v1_binary_trades::{
     V1BinaryTradeTransactionFact, V1BinaryTradeTransactionStatus, V1BinaryTradesEvidence,

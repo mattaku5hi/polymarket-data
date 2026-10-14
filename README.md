@@ -253,6 +253,22 @@ capture still independently checks both providers, finality, receipts and logs.
 It adds up to three calls before the capture's existing14; reserve up to17
 actual sends for a complete observe-and-capture step.
 
+`ChainLogVerifier::observe_selected_ctf_v2_owner_logs_bounded` compares a
+caller-selected explicit range (at most16 blocks) across both configured
+providers with two bounded `eth_getLogs` requests. It filters only the e111/e222
+V2 exchanges, `OrderFilled`, and indexed topic2 maker addresses. The caller
+must choose the range it considers finalized; this method does not read headers
+or independently establish finality. Wallets must be a nonempty, unique list
+of lowercase canonical `0x` addresses. Their sorted topics must fit the
+existing 4 KiB serialized request limit; callers must partition larger
+selections into separately bounded queries. The shared request budget, 128 MiB
+operation response ceiling, existing 8 MiB per-response limit and absolute
+deadline constrain both requests. Full normalized logs must agree across
+providers, but remain source-attested only: even an empty equal result does not
+prove absence, receipt completeness, finality or all-chain coverage.
+Root-capture every candidate block through the existing sealed two-provider
+receipt-root path before treating a candidate as verified.
+
 `ChainLogVerifier::capture_v2_owner_fill_signals_bounded` captures one explicit
 block with caller-supplied parent/end hashes, shared request budget, response
 byte cap, and total deadline. The returned
