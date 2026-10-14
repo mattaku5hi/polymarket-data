@@ -3,6 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::Mutex;
 
 use super::v2_owner_fill_signals::{
@@ -112,6 +113,39 @@ impl CapturedV2OwnerFillSignals {
     }
 }
 
+/// One primary-provider header observation for an explicit Polygon block.
+/// This does not establish finality or agreement; use the existing anchored
+/// two-provider capture before treating it as verified evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedChainBlockAnchor {
+    block_number: u64,
+    block_hash: String,
+    parent_hash: String,
+    response_bytes: usize,
+}
+
+impl ObservedChainBlockAnchor {
+    #[must_use]
+    pub const fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    #[must_use]
+    pub fn block_hash(&self) -> &str {
+        &self.block_hash
+    }
+
+    #[must_use]
+    pub fn parent_hash(&self) -> &str {
+        &self.parent_hash
+    }
+
+    #[must_use]
+    pub const fn response_bytes(&self) -> usize {
+        self.response_bytes
+    }
+}
+
 /// Offline-reverified owner signals. It intentionally exposes only the
 /// checked single-block anchors, never a live-finality interval object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +195,86 @@ pub enum BoundedRecordedOwnerFillSignalsError {
 }
 
 impl ChainLogVerifier {
+    /// Observe a content-bound block header from the primary provider under
+    /// one actual-send budget, response-byte cap, and total deadline. The
+    /// returned anchor is only an observation; the subsequent sealed capture
+    /// independently checks both providers, finality, receipts, and logs.
+    pub async fn observe_block_anchor_bounded(
+        &self,
+        block_number: u64,
+        budget: &TransactionRequestBudget,
+        max_total_response_bytes: usize,
+        total_timeout: Duration,
+    ) -> Result<ObservedChainBlockAnchor, BoundedRecordedOwnerFillSignalsError> {
+        validate_limits(max_total_response_bytes, total_timeout)?;
+        if block_number == 0 {
+            return Err(BoundedRecordedOwnerFillSignalsError::Verification(
+                ChainLogAuditError::InvalidInput,
+            ));
+        }
+        let deadline_at = tokio::time::Instant::now()
+            .checked_add(total_timeout)
+            .ok_or(BoundedRecordedOwnerFillSignalsError::Verification(
+                ChainLogAuditError::InvalidInput,
+            ))?;
+        let capture = Arc::new(Mutex::new(RpcCaptureState {
+            max_response_bytes: max_total_response_bytes,
+            response_bytes: 0,
+            pages: Vec::new(),
+        }));
+        let mut scoped = self.with_request_budget(budget.inner());
+        scoped.rpc_execution = RpcExecution::Capture(Arc::clone(&capture));
+        let mut exhaustion = budget.0.exhaustion.subscribe();
+        let request = scoped.rpc(
+            &scoped.primary,
+            "eth_getBlockByNumber",
+            json!([format!("{block_number:#x}"), false]),
+        );
+        tokio::pin!(request);
+        let header = tokio::select! {
+            biased;
+            _ = exhaustion.wait_for(|is_exhausted| *is_exhausted) => {
+                return Err(BoundedRecordedOwnerFillSignalsError::RequestBudgetExceeded);
+            }
+            () = tokio::time::sleep_until(deadline_at) => {
+                return if budget.is_exhausted() {
+                    Err(BoundedRecordedOwnerFillSignalsError::RequestBudgetExceeded)
+                } else {
+                    Err(BoundedRecordedOwnerFillSignalsError::Timeout)
+                };
+            }
+            result = &mut request => {
+                if budget.is_exhausted() {
+                    return Err(BoundedRecordedOwnerFillSignalsError::RequestBudgetExceeded);
+                }
+                result.map_err(BoundedRecordedOwnerFillSignalsError::Verification)?
+            }
+        };
+        if tokio::time::Instant::now() >= deadline_at {
+            return Err(BoundedRecordedOwnerFillSignalsError::Timeout);
+        }
+        let header = super::bind_header(&header)
+            .map_err(BoundedRecordedOwnerFillSignalsError::Verification)?;
+        if tokio::time::Instant::now() >= deadline_at {
+            return Err(BoundedRecordedOwnerFillSignalsError::Timeout);
+        }
+        let response_bytes = capture.lock().await.response_bytes;
+        if tokio::time::Instant::now() >= deadline_at {
+            return Err(BoundedRecordedOwnerFillSignalsError::Timeout);
+        }
+        if header.number != block_number {
+            return Err(BoundedRecordedOwnerFillSignalsError::Verification(
+                ChainLogAuditError::Unverified,
+            ));
+        }
+        Ok(ObservedChainBlockAnchor {
+            block_number: header.number,
+            block_hash: header.hash,
+            parent_hash: header.parent_hash,
+            response_bytes,
+        })
+    }
+
     /// Capture one anchored receipt block and CTF V2 owner signals. It does not
     /// scan arbitrary ranges or assert continuity with another block.
     pub async fn capture_v2_owner_fill_signals_bounded(

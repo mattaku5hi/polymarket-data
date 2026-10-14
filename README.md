@@ -231,6 +231,13 @@ accounting or RTDS matches. This CTF extractor does not cover the separate fifth
 Exchange.
 
 The decoder policy is `ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/3`.
+`ChainLogVerifier::observe_block_anchor_bounded` reads one explicit-height
+primary header under an actual-send budget, response-byte cap and deadline.
+Its content-bound `ObservedChainBlockAnchor` is a provider observation, without
+finality or agreement authority. Pass its hashes to the sealed capture below;
+subtract its `response_bytes()` if both operations share a total byte budget.
+The observation is separate from the recorded capture transcript.
+
 `ChainLogVerifier::capture_v2_owner_fill_signals_bounded` captures one explicit
 block with caller-supplied parent/end hashes, shared request budget, response
 byte cap, and total deadline. The returned

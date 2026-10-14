@@ -392,3 +392,188 @@ async fn owner_signal_capture_enforces_budget_timeout_and_cancellation() {
     );
     assert_eq!(transaction_hash.len(), 66);
 }
+
+#[derive(Clone)]
+struct BlockAnchorFixture {
+    header: Value,
+    padding_bytes: usize,
+    delay: Duration,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct BlockAnchorProvider {
+    url: String,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BlockAnchorProvider {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn block_anchor_rpc(
+    State(fixture): State<BlockAnchorFixture>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    use std::sync::atomic::Ordering;
+
+    assert_eq!(request["method"], "eth_getBlockByNumber");
+    assert_eq!(request["params"], json!(["0x64", false]));
+    fixture.requests.fetch_add(1, Ordering::Relaxed);
+    if !fixture.delay.is_zero() {
+        tokio::time::sleep(fixture.delay).await;
+    }
+    let mut response = json!({
+        "jsonrpc":"2.0",
+        "id":request["id"],
+        "result":fixture.header,
+    });
+    if fixture.padding_bytes > 0 {
+        response["padding"] = json!("x".repeat(fixture.padding_bytes));
+    }
+    Json(response)
+}
+
+async fn block_anchor_provider(
+    header: Value,
+    padding_bytes: usize,
+    delay: Duration,
+) -> BlockAnchorProvider {
+    use std::sync::atomic::AtomicUsize;
+
+    let requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let fixture = BlockAnchorFixture {
+        header,
+        padding_bytes,
+        delay,
+        requests: requests.clone(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/", post(block_anchor_rpc))
+                .with_state(fixture),
+        )
+        .await
+        .unwrap();
+    });
+    BlockAnchorProvider {
+        url,
+        requests,
+        task,
+    }
+}
+
+fn block_anchor_header(number: u64) -> Value {
+    let parent = format!("0x{}", "11".repeat(32));
+    let zero = format!("0x{}", "00".repeat(32));
+    super::super::super::header_binding::fixture_header(number, &parent, &zero, &zero, &zero)
+}
+
+fn block_anchor_verifier(primary_url: &str) -> ChainLogVerifier {
+    ChainLogVerifier::new(primary_url, "http://127.0.0.1:1").unwrap()
+}
+
+#[tokio::test]
+async fn block_anchor_observation_is_one_primary_rpc_and_returns_content_bound_hashes() {
+    use std::sync::atomic::Ordering;
+
+    let header = block_anchor_header(100);
+    let expected_hash = header["hash"].as_str().unwrap().to_owned();
+    let expected_parent = header["parentHash"].as_str().unwrap().to_owned();
+    let provider = block_anchor_provider(header, 0, Duration::ZERO).await;
+    let budget = TransactionRequestBudget::new(1);
+    let observed = block_anchor_verifier(&provider.url)
+        .observe_block_anchor_bounded(100, &budget, 4096, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(observed.block_number(), 100);
+    assert_eq!(observed.block_hash(), expected_hash);
+    assert_eq!(observed.parent_hash(), expected_parent);
+    assert!(observed.response_bytes() > 0);
+    assert!(observed.response_bytes() <= 4096);
+    assert_eq!(budget.reserved_requests(), 1);
+    assert_eq!(provider.requests.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn block_anchor_observation_rejects_wrong_height_and_malformed_header() {
+    for header in [block_anchor_header(101), {
+        let mut header = block_anchor_header(100);
+        header["hash"] = json!(format!("0x{}", "ff".repeat(32)));
+        header
+    }] {
+        let provider = block_anchor_provider(header, 0, Duration::ZERO).await;
+        let result = block_anchor_verifier(&provider.url)
+            .observe_block_anchor_bounded(
+                100,
+                &TransactionRequestBudget::new(1),
+                4096,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(BoundedRecordedOwnerFillSignalsError::Verification(
+                ChainLogAuditError::Unverified
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn block_anchor_observation_enforces_response_and_request_budgets() {
+    use std::sync::atomic::Ordering;
+
+    let provider = block_anchor_provider(block_anchor_header(100), 1024, Duration::ZERO).await;
+    let byte_result = block_anchor_verifier(&provider.url)
+        .observe_block_anchor_bounded(
+            100,
+            &TransactionRequestBudget::new(1),
+            64,
+            Duration::from_secs(1),
+        )
+        .await;
+    assert!(matches!(
+        byte_result,
+        Err(BoundedRecordedOwnerFillSignalsError::Verification(
+            ChainLogAuditError::Unverified
+        ))
+    ));
+    assert_eq!(provider.requests.load(Ordering::Relaxed), 1);
+
+    let budget = TransactionRequestBudget::new(0);
+    let budget_result = block_anchor_verifier(&provider.url)
+        .observe_block_anchor_bounded(100, &budget, 4096, Duration::from_secs(1))
+        .await;
+    assert!(matches!(
+        budget_result,
+        Err(BoundedRecordedOwnerFillSignalsError::RequestBudgetExceeded)
+    ));
+    assert_eq!(budget.reserved_requests(), 0);
+    assert_eq!(provider.requests.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn block_anchor_observation_timeout_returns_no_anchor() {
+    let provider =
+        block_anchor_provider(block_anchor_header(100), 0, Duration::from_millis(100)).await;
+    let result = block_anchor_verifier(&provider.url)
+        .observe_block_anchor_bounded(
+            100,
+            &TransactionRequestBudget::new(1),
+            4096,
+            Duration::from_millis(1),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(BoundedRecordedOwnerFillSignalsError::Timeout)
+    ));
+}
