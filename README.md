@@ -253,6 +253,14 @@ capture still independently checks both providers, finality, receipts and logs.
 It adds up to three calls before the capture's existing14; reserve up to17
 actual sends for a complete observe-and-capture step.
 
+`ChainLogVerifier::observe_selected_ctf_v2_owner_window_bounded` first reads both
+content-bound finalized heads, returning a head-only `Waiting` when necessary.
+Otherwise it observes up to16 inclusive blocks and partitions up to1024 canonical
+makers into actual serialized4KiB filters. All heads and partitions share one
+send budget, cumulative response-byte cap and whole-operation deadline. Equal
+normalized logs are source-attested candidates, not receipt inclusion or proof
+that a quiet interval is complete. Matched blocks still need rooted capture.
+
 `ChainLogVerifier::observe_selected_ctf_v2_owner_logs_bounded` compares a
 caller-selected explicit range (at most16 blocks) across both configured
 providers with two bounded `eth_getLogs` requests. It filters only the e111/e222

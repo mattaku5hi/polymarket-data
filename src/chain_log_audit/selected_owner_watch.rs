@@ -274,7 +274,9 @@ impl ChainLogVerifier {
     }
 }
 
-fn selected_maker_topics(selected_makers: &[String]) -> Result<Vec<String>, ChainLogAuditError> {
+pub(super) fn selected_maker_topics(
+    selected_makers: &[String],
+) -> Result<Vec<String>, ChainLogAuditError> {
     if selected_makers.is_empty() || selected_makers.len() > MAX_RECORDED_RECEIPT_REQUEST_BYTES / 68
     {
         return Err(ChainLogAuditError::InvalidInput);
@@ -292,7 +294,7 @@ fn selected_maker_topics(selected_makers: &[String]) -> Result<Vec<String>, Chai
     Ok(topics.into_iter().collect())
 }
 
-fn normalize_provider_logs(
+pub(super) fn normalize_provider_logs(
     value: Value,
     from_block: u64,
     through_block: u64,
