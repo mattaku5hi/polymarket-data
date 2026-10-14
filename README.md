@@ -215,6 +215,24 @@ Source trade fills and direct module transaction locators expose their exact
 receipt log indices. Repeated owner order hashes retain distinct occurrences;
 consumers can order economic actions without reparsing vendor event ABIs.
 
+`chain_log_audit::extract_ctf_v2_owner_fill_signals` extracts owner rows only
+from a sealed `ChainReceiptIntervalEvidence`, and only for the e111/e222 CTF V2
+exchanges. It ignores unrelated events, but a malformed scoped `OrderFilled`
+rejects the full extraction. Each row preserves block/parent/time, transaction
+index/hash, global log index, and the log's ordinal among **all** receipt logs
+in that transaction. `OrdinaryMaker` versus `ExchangeAggregateOwner` is the
+observable source event shape; equal-valued logs remain separate rows. Share,
+collateral, and fee amounts are gross V2 event base units (the V2 fee is
+collateral-denominated); they are not wallet-net accounting or RTDS matches.
+This CTF extractor does not cover the separate fifth Exchange.
+
+`FifthReceiptMakerWindow::aggregate_fills()` separately returns fifth-Exchange
+aggregate owner rows only after their `OrderFilled`/`OrdersMatched` pair passes
+the existing source-pinned checks. `maker_fills()` and `aggregate_count()` keep
+their prior meanings. Fifth rows also expose the transaction-local ordinal and
+global receipt log index. Neither API claims complete wallet history or
+qualifies an economic trade.
+
 Polydoghound consumes these modules through thin local trait/domain adapters.
 Polyazimuth can consume gross-depth acquisition through its observation consumer
 seam; its reconstructed book views are not silently upgraded to executable quotes.

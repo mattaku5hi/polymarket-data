@@ -59,6 +59,7 @@ mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
 mod known_position_balances;
 mod v1_binary_trades;
+mod v2_owner_fill_signals;
 pub use ctf_operations::{
     CtfOperationClassificationEvidence, CtfOperationKind, CtfOperationTransactionFact,
     CtfOperationTransactionStatus,
@@ -167,6 +168,10 @@ pub use known_position_balances::{
 pub use v1_binary_trades::{
     V1BinaryTradeTransactionFact, V1BinaryTradeTransactionStatus, V1BinaryTradesEvidence,
     V1ExchangeInventorySnapshot,
+};
+pub use v2_owner_fill_signals::{
+    CTF_V2_OWNER_FILL_SIGNAL_POLICY_VERSION, V2OwnerFillRole, V2OwnerFillSignal,
+    extract_ctf_v2_owner_fill_signals,
 };
 
 /// Polygon chain ID verified by this diagnostic transaction verifier.
@@ -35253,7 +35258,23 @@ mod receipt_tests {
                 .await
                 .unwrap();
             assert_eq!(window.maker_fills().len(), 2);
+            assert_eq!(window.aggregate_fills().len(), 1);
             assert_eq!(window.aggregate_count(), 1);
+            assert_eq!(window.aggregate_fills()[0].maker(), aggregate_maker);
+            assert!(
+                window.aggregate_fills()[0]
+                    .taker()
+                    .eq_ignore_ascii_case(EXCHANGES[4])
+            );
+            assert_eq!(
+                window.aggregate_fills()[0].maker_amount_filled(),
+                aggregate_amount
+            );
+            assert_eq!(
+                window.aggregate_fills()[0].transaction_local_log_ordinal(),
+                2
+            );
+            assert_eq!(window.aggregate_fills()[0].log_index(), 2);
             assert_eq!(
                 window
                     .predecessor_code_context()
