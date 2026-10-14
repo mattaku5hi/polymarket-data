@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use super::v2_owner_fill_signals::{
     CTF_V2_OWNER_FILL_SIGNAL_POLICY_VERSION, V2OwnerFillSignal, V2OwnerFillSignalProvenance,
@@ -124,6 +124,36 @@ pub struct ObservedChainBlockAnchor {
     response_bytes: usize,
 }
 
+/// A bounded observation of both providers' finalized tags, optionally paired
+/// with a primary-provider header for the requested block. Neither variant is
+/// sealed verification evidence; the subsequent owner-fill capture performs
+/// its existing two-provider verification independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizedCaptureAnchorObservation {
+    /// At least one provider has not yet reported the requested block as
+    /// finalized. No explicit-height header was requested in this case.
+    Waiting {
+        primary_finalized_block: u64,
+        secondary_finalized_block: u64,
+        primary_finalized_hash: String,
+        secondary_finalized_hash: String,
+        response_bytes: usize,
+    },
+    /// Both providers reported finalized heights at or beyond the request and
+    /// the primary provider returned the content-bound requested header.
+    Ready(ObservedChainBlockAnchor),
+}
+
+impl FinalizedCaptureAnchorObservation {
+    #[must_use]
+    pub const fn response_bytes(&self) -> usize {
+        match self {
+            Self::Waiting { response_bytes, .. } => *response_bytes,
+            Self::Ready(anchor) => anchor.response_bytes(),
+        }
+    }
+}
+
 impl ObservedChainBlockAnchor {
     #[must_use]
     pub const fn block_number(&self) -> u64 {
@@ -141,6 +171,9 @@ impl ObservedChainBlockAnchor {
     }
 
     #[must_use]
+    /// Response bytes consumed by the operation that produced this anchor.
+    /// The single-header observer counts one body; the finalized preflight
+    /// counts both finalized headers and this explicit-height header.
     pub const fn response_bytes(&self) -> usize {
         self.response_bytes
     }
@@ -195,6 +228,110 @@ pub enum BoundedRecordedOwnerFillSignalsError {
 }
 
 impl ChainLogVerifier {
+    /// Observe both providers' `finalized` headers before observing the primary
+    /// header for one explicit block. All three possible response bodies share
+    /// one actual-send budget, response-byte cap, and absolute deadline. A lag
+    /// returns `Waiting` without requesting the explicit block header. This is
+    /// a scheduling observation only; the sealed capture independently
+    /// checks finality, providers, receipts, and logs.
+    pub async fn observe_finalized_capture_anchor_bounded(
+        &self,
+        block_number: u64,
+        budget: &TransactionRequestBudget,
+        max_total_response_bytes: usize,
+        total_timeout: Duration,
+    ) -> Result<FinalizedCaptureAnchorObservation, BoundedRecordedOwnerFillSignalsError> {
+        validate_limits(max_total_response_bytes, total_timeout)?;
+        if block_number == 0 {
+            return Err(BoundedRecordedOwnerFillSignalsError::Verification(
+                ChainLogAuditError::InvalidInput,
+            ));
+        }
+        let deadline_at = tokio::time::Instant::now()
+            .checked_add(total_timeout)
+            .ok_or(BoundedRecordedOwnerFillSignalsError::Verification(
+                ChainLogAuditError::InvalidInput,
+            ))?;
+        let capture = Arc::new(Mutex::new(RpcCaptureState {
+            max_response_bytes: max_total_response_bytes,
+            response_bytes: 0,
+            pages: Vec::new(),
+        }));
+        let mut scoped = self.with_request_budget(budget.inner());
+        scoped.rpc_execution = RpcExecution::Capture(Arc::clone(&capture));
+        let mut exhaustion = budget.0.exhaustion.subscribe();
+        let primary_endpoint = scoped.primary.clone();
+        let secondary_endpoint = scoped.secondary.clone();
+        let primary_finalized = bounded_observed_header(
+            &scoped,
+            &primary_endpoint,
+            json!(["finalized", false]),
+            budget,
+            deadline_at,
+            &mut exhaustion,
+        )
+        .await?;
+        let secondary_finalized = bounded_observed_header(
+            &scoped,
+            &secondary_endpoint,
+            json!(["finalized", false]),
+            budget,
+            deadline_at,
+            &mut exhaustion,
+        )
+        .await?;
+        if tokio::time::Instant::now() >= deadline_at {
+            return Err(BoundedRecordedOwnerFillSignalsError::Timeout);
+        }
+        if primary_finalized.0 < block_number || secondary_finalized.0 < block_number {
+            let response_bytes = capture.lock().await.response_bytes;
+            if tokio::time::Instant::now() >= deadline_at {
+                return Err(BoundedRecordedOwnerFillSignalsError::Timeout);
+            }
+            return Ok(FinalizedCaptureAnchorObservation::Waiting {
+                primary_finalized_block: primary_finalized.0,
+                secondary_finalized_block: secondary_finalized.0,
+                primary_finalized_hash: primary_finalized.1,
+                secondary_finalized_hash: secondary_finalized.1,
+                response_bytes,
+            });
+        }
+
+        let requested_header = bounded_observed_header(
+            &scoped,
+            &primary_endpoint,
+            json!([format!("{block_number:#x}"), false]),
+            budget,
+            deadline_at,
+            &mut exhaustion,
+        )
+        .await?;
+        if tokio::time::Instant::now() >= deadline_at {
+            return Err(BoundedRecordedOwnerFillSignalsError::Timeout);
+        }
+        if requested_header.0 != block_number
+            || (primary_finalized.0 == block_number && primary_finalized.1 != requested_header.1)
+            || (secondary_finalized.0 == block_number
+                && secondary_finalized.1 != requested_header.1)
+        {
+            return Err(BoundedRecordedOwnerFillSignalsError::Verification(
+                ChainLogAuditError::Unverified,
+            ));
+        }
+        let response_bytes = capture.lock().await.response_bytes;
+        if tokio::time::Instant::now() >= deadline_at {
+            return Err(BoundedRecordedOwnerFillSignalsError::Timeout);
+        }
+        Ok(FinalizedCaptureAnchorObservation::Ready(
+            ObservedChainBlockAnchor {
+                block_number: requested_header.0,
+                block_hash: requested_header.1,
+                parent_hash: requested_header.2,
+                response_bytes,
+            },
+        ))
+    }
+
     /// Observe a content-bound block header from the primary provider under
     /// one actual-send budget, response-byte cap, and total deadline. The
     /// returned anchor is only an observation; the subsequent sealed capture
@@ -365,6 +502,46 @@ impl ChainLogVerifier {
         }
         Ok(captured)
     }
+}
+
+async fn bounded_observed_header(
+    verifier: &ChainLogVerifier,
+    endpoint: &str,
+    params: serde_json::Value,
+    budget: &TransactionRequestBudget,
+    deadline_at: tokio::time::Instant,
+    exhaustion: &mut watch::Receiver<bool>,
+) -> Result<(u64, String, String), BoundedRecordedOwnerFillSignalsError> {
+    let request = verifier.rpc(endpoint, "eth_getBlockByNumber", params);
+    tokio::pin!(request);
+    let value = tokio::select! {
+        biased;
+        _ = exhaustion.wait_for(|is_exhausted| *is_exhausted) => {
+            return Err(BoundedRecordedOwnerFillSignalsError::RequestBudgetExceeded);
+        }
+        () = tokio::time::sleep_until(deadline_at) => {
+            return if budget.is_exhausted() {
+                Err(BoundedRecordedOwnerFillSignalsError::RequestBudgetExceeded)
+            } else {
+                Err(BoundedRecordedOwnerFillSignalsError::Timeout)
+            };
+        }
+        result = &mut request => {
+            if budget.is_exhausted() {
+                return Err(BoundedRecordedOwnerFillSignalsError::RequestBudgetExceeded);
+            }
+            result.map_err(BoundedRecordedOwnerFillSignalsError::Verification)?
+        }
+    };
+    if tokio::time::Instant::now() >= deadline_at {
+        return Err(BoundedRecordedOwnerFillSignalsError::Timeout);
+    }
+    let header =
+        super::bind_header(&value).map_err(BoundedRecordedOwnerFillSignalsError::Verification)?;
+    if tokio::time::Instant::now() >= deadline_at {
+        return Err(BoundedRecordedOwnerFillSignalsError::Timeout);
+    }
+    Ok((header.number, header.hash, header.parent_hash))
 }
 
 /// Reverify a saved one-block transcript without constructing an RPC client or

@@ -167,7 +167,8 @@ pub use known_position_balances::{
     KnownPositionBalancesObservation,
 };
 pub use recorded_owner_fill_signals::{
-    BoundedRecordedOwnerFillSignalsError, CapturedV2OwnerFillSignals, ObservedChainBlockAnchor,
+    BoundedRecordedOwnerFillSignalsError, CapturedV2OwnerFillSignals,
+    FinalizedCaptureAnchorObservation, ObservedChainBlockAnchor,
     RECORDED_V2_OWNER_FILL_PACKET_SCHEMA_VERSION, RecordedV2OwnerFillSignals,
     RecordedV2OwnerFillSignalsPacket, V2_OWNER_FILL_CAPTURE_POLICY_VERSION,
     V2_OWNER_FILL_RECORDED_REVERIFICATION_POLICY_VERSION,

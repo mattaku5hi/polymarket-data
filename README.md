@@ -238,6 +238,21 @@ finality or agreement authority. Pass its hashes to the sealed capture below;
 subtract its `response_bytes()` if both operations share a total byte budget.
 The observation is separate from the recorded capture transcript.
 
+`ChainLogVerifier::observe_finalized_capture_anchor_bounded` first reads the
+`finalized` header from both configured providers, then—only when both reported
+heights cover the requested block—reads that explicit-height header from the
+primary provider. It returns `FinalizedCaptureAnchorObservation::Waiting` with
+both reported heights and combined response bytes when either provider lags;
+that result has no requested-block anchor and causes no receipt capture. A
+`Ready` anchor also reports bytes for all three observations. One request
+budget, response-byte cap and absolute deadline cover the whole operation;
+provider RPC errors and malformed headers remain errors, not `Waiting`.
+Reported finalized heights are observations, not a consensus or independence
+claim. This preflight does not enter the recorded packet. The following sealed
+capture still independently checks both providers, finality, receipts and logs.
+It adds up to three calls before the capture's existing14; reserve up to17
+actual sends for a complete observe-and-capture step.
+
 `ChainLogVerifier::capture_v2_owner_fill_signals_bounded` captures one explicit
 block with caller-supplied parent/end hashes, shared request budget, response
 byte cap, and total deadline. The returned
