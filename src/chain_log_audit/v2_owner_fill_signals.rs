@@ -10,7 +10,7 @@ use super::{
 };
 
 pub const CTF_V2_OWNER_FILL_SIGNAL_POLICY_VERSION: &str =
-    "ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/1";
+    "ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/2";
 
 /// Observable OrderFilled owner role inferred from the raw counterparty topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,8 @@ pub struct V2OwnerFillSignal {
     collateral_base_units: u128,
     fee_asset: FeeAsset,
     fee_base_units: u128,
+    builder: String,
+    metadata: String,
 }
 
 impl V2OwnerFillSignal {
@@ -135,6 +137,16 @@ impl V2OwnerFillSignal {
     pub const fn fee_base_units(&self) -> u128 {
         self.fee_base_units
     }
+    /// Raw final `bytes32` event word, prefixed with `0x`.
+    #[must_use]
+    pub fn builder(&self) -> &str {
+        &self.builder
+    }
+    /// Raw final `bytes32` event word, prefixed with `0x`.
+    #[must_use]
+    pub fn metadata(&self) -> &str {
+        &self.metadata
+    }
 }
 
 /// Extract CTF V2 owner fills from privately constructed, receipt-root-verified
@@ -197,7 +209,7 @@ pub fn extract_ctf_v2_owner_fill_signals(
                 }
                 if transaction.status() != 1
                     || receipt_log.topics().len() != 4
-                    || receipt_log.data().len() != 2 + 5 * 64
+                    || receipt_log.data().len() != 2 + 7 * 64
                 {
                     return Err(ChainLogAuditError::Unverified);
                 }
@@ -282,6 +294,8 @@ fn signal_from_fill(
         collateral_base_units: fill.collateral_base_units,
         fee_asset: fill.fee_asset,
         fee_base_units: fill.fee_base_units,
+        builder: format!("0x{}", &log.data()[2 + 5 * 64..2 + 6 * 64]),
+        metadata: format!("0x{}", &log.data()[2 + 6 * 64..2 + 7 * 64]),
     }
 }
 
@@ -322,7 +336,16 @@ mod tests {
             ],
             data: format!(
                 "0x{}",
-                [word(side), word(9), word(100), word(100), word(5)].join("")
+                [
+                    word(side),
+                    word(9),
+                    word(100),
+                    word(100),
+                    word(5),
+                    word(0xb017),
+                    word(0xcafe),
+                ]
+                .join("")
             ),
         }
     }
@@ -406,20 +429,35 @@ mod tests {
         assert_eq!(rows[0].share_base_units(), 100);
         assert_eq!(rows[0].collateral_base_units(), 100);
         assert_eq!(rows[0].fee_base_units(), 5);
+        assert_eq!(rows[0].builder(), &format!("0x{}", word(0xb017)));
+        assert_eq!(rows[0].metadata(), &format!("0x{}", word(0xcafe)));
         assert_eq!(rows[0].decoder_version(), CtfDecoderVersion::V2);
         assert_eq!(rows[0].block_timestamp(), 1_800_000_000);
         assert_eq!(rows[0].parent_hash(), repeated_hash("88"));
     }
 
     #[test]
-    fn malformed_selected_v2_fill_or_bad_receipt_context_refuses_interval() {
+    fn selected_v2_fill_requires_exactly_seven_data_words() {
         let exchange = super::super::EXCHANGES[3];
-        let mut malformed = fill_log(exchange, "0x2222222222222222222222222222222222222222", 0);
-        malformed.data.push_str("00");
-        assert_eq!(
-            extract_ctf_v2_owner_fill_signals(&interval(vec![malformed])),
-            Err(ChainLogAuditError::Unverified)
-        );
+        let valid = fill_log(exchange, "0x2222222222222222222222222222222222222222", 0);
+        let mut five_words = valid.clone();
+        five_words.data.truncate(2 + 5 * 64);
+        let mut truncated = valid.clone();
+        truncated.data.truncate(truncated.data.len() - 1);
+        let mut eight_words = valid;
+        eight_words.data.push_str(&word(1));
+
+        for malformed in [five_words, truncated, eight_words] {
+            assert_eq!(
+                extract_ctf_v2_owner_fill_signals(&interval(vec![malformed])),
+                Err(ChainLogAuditError::Unverified)
+            );
+        }
+    }
+
+    #[test]
+    fn bad_receipt_context_refuses_interval() {
+        let exchange = super::super::EXCHANGES[3];
 
         let mut bad_context = interval(vec![fill_log(
             exchange,
