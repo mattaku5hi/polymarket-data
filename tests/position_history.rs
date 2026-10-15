@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -16,8 +16,9 @@ use axum::{
 };
 use polymarket_data::position_history::{
     CTF_EMITTER, MAX_HISTORY_RESPONSE_BYTES, POSITION_MANAGER_EMITTER, PositionHistoryDirection,
-    PositionHistoryError, PositionLedger, SqdPositionHistoryReader, SqdPositionHistoryRequest,
-    TRANSFER_SINGLE_TOPIC,
+    PositionHistoryError, PositionLedger, RecordedSqdPositionHistoryPage, SqdPositionHistoryReader,
+    SqdPositionHistoryRequest, TRANSFER_SINGLE_TOPIC,
+    reverify_recorded_sqd_position_history_segment,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -29,12 +30,14 @@ const TX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 #[derive(Clone)]
 struct ServerState {
     requests: Arc<AtomicUsize>,
+    arrivals: Arc<Mutex<Vec<tokio::time::Instant>>>,
     mode: &'static str,
 }
 
 async fn server(mode: &'static str) -> (String, ServerState) {
     let state = ServerState {
         requests: Arc::new(AtomicUsize::new(0)),
+        arrivals: Arc::new(Mutex::new(Vec::new())),
         mode,
     };
     let app = Router::new()
@@ -49,6 +52,11 @@ async fn server(mode: &'static str) -> (String, ServerState) {
 }
 
 async fn handler(State(state): State<ServerState>, request: Request<Body>) -> Response {
+    state
+        .arrivals
+        .lock()
+        .unwrap()
+        .push(tokio::time::Instant::now());
     let number = state.requests.fetch_add(1, Ordering::SeqCst);
     if request
         .headers()
@@ -262,7 +270,178 @@ async fn paginates_sparse_pages_keeps_filter_evidence_and_deduplicates_self_tran
     assert!(to["logs"][0].get("topic3").is_some());
     assert!(to["logs"][0].get("topic2").is_none());
     assert_eq!(observation.from_terminal().hash(), HASH15);
+    assert_eq!(observation.start_header().number(), 10);
+    assert_eq!(observation.start_header().hash(), hash_for(10));
     assert_eq!(state.requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn recorded_segment_replays_exact_ordered_pages_and_rejects_mutations() {
+    let (reader, _) = make_reader("ok").await;
+    let captured = reader.read_history(&request()).await.unwrap();
+    let pages: Vec<_> = captured
+        .pages()
+        .iter()
+        .map(|page| RecordedSqdPositionHistoryPage {
+            direction: page.direction(),
+            cursor: page.cursor(),
+            last_block: page.last_block(),
+            request_body: page.request_body().to_owned(),
+            response_body: page.response_body().to_owned(),
+        })
+        .collect();
+    let replayed = reverify_recorded_sqd_position_history_segment(&request(), &pages)
+        .await
+        .unwrap();
+    assert_eq!(replayed.start_header().number(), 10);
+    assert_eq!(replayed.from_terminal().hash(), HASH15);
+    assert_eq!(replayed.to_terminal().hash(), HASH15);
+    assert_eq!(replayed.logs(), captured.logs());
+    assert_eq!(replayed.request_count(), 3);
+    assert_eq!(
+        replayed.response_bytes(),
+        pages
+            .iter()
+            .map(|page| page.response_body.len())
+            .sum::<usize>()
+    );
+
+    let mut reordered = pages.clone();
+    reordered.swap(0, 1);
+    assert!(
+        reverify_recorded_sqd_position_history_segment(&request(), &reordered)
+            .await
+            .is_err()
+    );
+    let mut extra = pages.clone();
+    extra.push(pages[0].clone());
+    assert!(
+        reverify_recorded_sqd_position_history_segment(&request(), &extra)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&request(), &pages[..2])
+            .await
+            .unwrap_err(),
+        PositionHistoryError::Incomplete(PositionHistoryDirection::To)
+    );
+    let mut wrong_cursor = pages.clone();
+    wrong_cursor[1].cursor += 1;
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&request(), &wrong_cursor)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::InvalidPageCursor(PositionHistoryDirection::From)
+    );
+    let mut wrong_direction = pages.clone();
+    wrong_direction[0].direction = PositionHistoryDirection::To;
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&request(), &wrong_direction)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::InvalidPageCursor(PositionHistoryDirection::From)
+    );
+    let mut wrong_last = pages.clone();
+    wrong_last[0].last_block += 1;
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&request(), &wrong_last)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::InvalidPageCursor(PositionHistoryDirection::From)
+    );
+    let mut wrong_request = pages.clone();
+    wrong_request[0].request_body.push(' ');
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&request(), &wrong_request)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::InvalidPageCursor(PositionHistoryDirection::From)
+    );
+    let mut wrong_query_scope = request();
+    wrong_query_scope.holder_address = "0x2222222222222222222222222222222222222222".to_owned();
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&wrong_query_scope, &pages)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::InvalidPageCursor(PositionHistoryDirection::From)
+    );
+    let mut wrong_anchor = request();
+    wrong_anchor.expected_through_hash = hash_for(14);
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&wrong_anchor, &pages)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::AnchorMismatch
+    );
+    let mut too_large = pages.clone();
+    too_large[0].response_body = " ".repeat(MAX_HISTORY_RESPONSE_BYTES + 1);
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&request(), &too_large)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::BodyBudgetExceeded
+    );
+    let mut aggregate_limit = request();
+    aggregate_limit.max_total_response_bytes = pages[0].response_body.len() - 1;
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&aggregate_limit, &pages)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::BodyBudgetExceeded
+    );
+    let mut request_limit = request();
+    request_limit.max_requests = 2;
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&request_limit, &pages)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::RequestBudgetExceeded
+    );
+    let mut short = request();
+    short.total_timeout = Duration::from_nanos(1);
+    assert_eq!(
+        reverify_recorded_sqd_position_history_segment(&short, &pages)
+            .await
+            .unwrap_err(),
+        PositionHistoryError::Timeout(PositionHistoryDirection::From)
+    );
+}
+
+#[tokio::test]
+async fn request_interval_is_shared_across_requests_and_reads_and_uses_deadline() {
+    let (base, state) = server("ok").await;
+    let interval = Duration::from_millis(20);
+    let reader = SqdPositionHistoryReader::new_with_request_interval(
+        reqwest::Client::builder(),
+        &base,
+        interval,
+    )
+    .unwrap();
+    reader.read_history(&request()).await.unwrap();
+    reader.read_history(&request()).await.unwrap();
+    {
+        let arrivals = state.arrivals.lock().unwrap();
+        assert_eq!(arrivals.len(), 6);
+        for pair in arrivals.windows(2) {
+            assert!(pair[1].duration_since(pair[0]) >= interval - Duration::from_millis(3));
+        }
+    }
+
+    let (base, state) = server("ok").await;
+    let reader = SqdPositionHistoryReader::new_with_request_interval(
+        reqwest::Client::builder(),
+        &base,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let mut short = request();
+    short.total_timeout = Duration::from_millis(200);
+    assert_eq!(
+        reader.read_history(&short).await.unwrap_err(),
+        PositionHistoryError::Timeout(PositionHistoryDirection::From)
+    );
+    assert_eq!(state.requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

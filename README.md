@@ -19,6 +19,45 @@ for observation in page.observations {
 
 The response is capped at 8 MiB before decoding (including chunked responses); the wallet reader rejects any invalid row atomically. Both readers return typed status/transport/body errors without embedding request URLs or response bodies. Numeric `Retry-After` is surfaced as seconds; no retry is performed. HTTPS is required except loopback HTTP for local fixtures. The vendor JSON remains available via `vendor_row()`. The API returns decimal **text** as supplied by JSON representation; it does not calculate fees or fill economics.
 
+For explicit wallet full-history reads, use `fetch_v2_trades_page_full_history`; it sends `start=1` on the initial request and every cursor request while keeping the same wallet and `taker_only=false` filters. For a bounded historical walk, use `fetch_v2_trades_page_full_history_until` with a positive inclusive Unix-second `end`:
+
+```rust,ignore
+let page = polymarket_data::fetch_v2_trades_page_full_history_until(
+    &client,
+    polymarket_data::DEFAULT_BASE_URL,
+    proxy_wallet,
+    100,
+    saved_cursor,
+    end_unix_seconds,
+).await?;
+```
+
+Both `start=1` and the same `end` are sent on every cursor request. The upper event-time bound does not provide snapshot isolation or prove that data through that instant is available; callers must retain page/capture coverage and source freshness evidence. These functions select request modes, not completeness. The existing `fetch_v2_trades_page` leaves `start` and `end` unset and keeps its prior behavior.
+
+## Venue-reported wallet economics
+
+```rust,ignore
+use polymarket_data::economics::{EconomicsReader, PositionsRequest, UserPnlRequest};
+
+let reader = EconomicsReader::new(client.clone(), polymarket_data::DEFAULT_BASE_URL)?;
+let mut request = PositionsRequest::new(proxy_wallet, 100);
+request.status = Some("CLOSED".to_owned());
+let positions = reader.positions(&request).await?;
+let stats = reader.user_stats(proxy_wallet).await?;
+let pnl = reader.user_pnl(&UserPnlRequest::new(proxy_wallet)).await?;
+// Follow positions.next_cursor using request.with_cursor(cursor).
+// The caller owns full-walk coverage, rate budgets and durable storage.
+```
+
+Each response retains exact raw bytes, query parameters, request/retrieval times
+and HTTP freshness headers. Each request, including its body, has a 30-second
+deadline and an 8 MiB body cap; no automatic retry is performed. Structured
+HTTP errors retain status, Retry-After and the venue error payload. Successful
+DTOs support serde captures, preserving absent versus explicitly null economic
+atoms. Projected JSON numbers remain unvalidated provider values; use raw bytes
+when exact decimal spelling matters. The source is explicitly `venue_reported`.
+These readers do not calculate qualification, historical cost basis or ROI.
+
 ## Global trade page (raw evidence)
 
 ```rust,ignore
@@ -36,6 +75,10 @@ For an explicit smaller **positive** TOKENS floor, use `fetch_v2_global_trades_p
 Only first-page requests send `limit`; cursor requests use the provider's encoded size. No global `start/end` parameters are exposed: the provider ignores them outside the wallet-shaped feed. The global feed retains the current-plus-previous calendar month, not full history. A short walk is not proof of end-to-end completeness, and following an old cursor only walks older rows—it does not poll new arrivals.
 
 A bounded 2026-09-30 public probe found CloudFront `Cache-Control: public, max-age=300`; request `Cache-Control: no-cache` still returned an aged head. It also found enrichment changing between reads (`event_slug`/`outcome_index`). Thus an identical cached head is not a liveness guarantee and a whole-row JSON hash is not stable overlap identity. `RawTradesPage.cache_age_seconds` exposes a parsed HTTP `Age` header; missing or invalid means unknown, never an invented zero/cache miss. The library does not bypass caching, infer a freshness SLA or recover coverage gaps.
+
+## API-only wallet activity hints
+
+With the existing `chain-audit` feature, `activity_hints::PolymarketActivityHintClient::acquire_wallet_activity_hints` walks the default activity filter and explicit `TIP` filter using HTTP-only `WalletActivityHintLimits`. It keeps raw activity rows and per-pass/page/row occurrence positions without constructing a receipt verifier or sending RPC requests. Both filters retain `start`/`end` and other request parameters on cursor pages. Even two exhausted passes are hints, not proof of complete wallet history, balances, or ROI; callers must inspect `is_complete()` and keep venue-reported source semantics explicit.
 
 ## CLOB book snapshot
 
@@ -171,6 +214,89 @@ complete wallet history or qualification.
 Source trade fills and direct module transaction locators expose their exact
 receipt log indices. Repeated owner order hashes retain distinct occurrences;
 consumers can order economic actions without reparsing vendor event ABIs.
+
+`chain_log_audit::extract_ctf_v2_owner_fill_signals` extracts owner rows only
+from a sealed `ChainReceiptIntervalEvidence`, and only for the e111/e222 CTF V2
+exchanges. It ignores unrelated events, but a malformed scoped `OrderFilled`
+rejects the full extraction. It enforces all seven non-indexed words in the
+pinned V2 event ABI and preserves the final `builder` and `metadata` bytes32
+words through getters. Its policy version is
+`ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/3`. Each row preserves
+block/parent/time, transaction index/hash, global log index, and the log's
+ordinal among **all** receipt logs in that transaction. `OrdinaryMaker` versus
+`ExchangeAggregateOwner` is the observable source event shape; equal-valued
+logs remain separate rows. Share, collateral, and fee amounts are gross V2
+event base units (the V2 fee is collateral-denominated); they are not wallet-net
+accounting or RTDS matches. This CTF extractor does not cover the separate fifth
+Exchange.
+
+The decoder policy is `ctf-v2-rooted-receipt-owner-fill-signals-e111-e222/3`.
+`ChainLogVerifier::observe_block_anchor_bounded` reads one explicit-height
+primary header under an actual-send budget, response-byte cap and deadline.
+Its content-bound `ObservedChainBlockAnchor` is a provider observation, without
+finality or agreement authority. Pass its hashes to the sealed capture below;
+subtract its `response_bytes()` if both operations share a total byte budget.
+The observation is separate from the recorded capture transcript.
+
+`ChainLogVerifier::observe_finalized_capture_anchor_bounded` first reads the
+`finalized` header from both configured providers, then—only when both reported
+heights cover the requested block—reads that explicit-height header from the
+primary provider. It returns `FinalizedCaptureAnchorObservation::Waiting` with
+both reported heights and combined response bytes when either provider lags;
+that result has no requested-block anchor and causes no receipt capture. A
+`Ready` anchor also reports bytes for all three observations. One request
+budget, response-byte cap and absolute deadline cover the whole operation;
+provider RPC errors and malformed headers remain errors, not `Waiting`.
+Reported finalized heights are observations, not a consensus or independence
+claim. This preflight does not enter the recorded packet. The following sealed
+capture still independently checks both providers, finality, receipts and logs.
+It adds up to three calls before the capture's existing14; reserve up to17
+actual sends for a complete observe-and-capture step.
+
+`ChainLogVerifier::observe_selected_ctf_v2_owner_window_bounded` first reads both
+content-bound finalized heads, returning a head-only `Waiting` when necessary.
+Otherwise it observes up to16 inclusive blocks and partitions up to1024 canonical
+makers into actual serialized4KiB filters. All heads and partitions share one
+send budget, cumulative response-byte cap and whole-operation deadline. Equal
+normalized logs are source-attested candidates, not receipt inclusion or proof
+that a quiet interval is complete. Matched blocks still need rooted capture.
+
+`ChainLogVerifier::observe_selected_ctf_v2_owner_logs_bounded` compares a
+caller-selected explicit range (at most16 blocks) across both configured
+providers with two bounded `eth_getLogs` requests. It filters only the e111/e222
+V2 exchanges, `OrderFilled`, and indexed topic2 maker addresses. The caller
+must choose the range it considers finalized; this method does not read headers
+or independently establish finality. Wallets must be a nonempty, unique list
+of lowercase canonical `0x` addresses. Their sorted topics must fit the
+existing 4 KiB serialized request limit; callers must partition larger
+selections into separately bounded queries. The shared request budget, 128 MiB
+operation response ceiling, existing 8 MiB per-response limit and absolute
+deadline constrain both requests. Full normalized logs must agree across
+providers, but remain source-attested only: even an empty equal result does not
+prove absence, receipt completeness, finality or all-chain coverage.
+Root-capture every candidate block through the existing sealed two-provider
+receipt-root path before treating a candidate as verified.
+
+`ChainLogVerifier::capture_v2_owner_fill_signals_bounded` captures one explicit
+block with caller-supplied parent/end hashes, shared request budget, response
+byte cap, and total deadline. The returned
+`RecordedV2OwnerFillSignalsPacket` contains the exact RPC transcript and schema,
+capture-policy, and decoder-policy versions. It is untrusted serialized input:
+`reverify_recorded_v2_owner_fill_signals_bounded` contacts no provider and
+replays every frame through the same receipt-root interval verifier, rejecting
+unsupported versions, changed/missing/extra frames, and exceeded bounds.
+Captured rows are marked `OnlineProvidersReportFinalized`; replayed rows are
+marked `RecordedProvidersReportedFinalized`. The latter establishes that the
+saved provider claims passed current local replay checks, not that the block is
+currently finalized. Neither result adds a capture/availability timestamp or
+claims wallet-history completeness.
+
+`FifthReceiptMakerWindow::aggregate_fills()` separately returns fifth-Exchange
+aggregate owner rows only after their `OrderFilled`/`OrdersMatched` pair passes
+the existing source-pinned checks. `maker_fills()` and `aggregate_count()` keep
+their prior meanings. Fifth rows also expose the transaction-local ordinal and
+global receipt log index. Neither API claims complete wallet history or
+qualifies an economic trade.
 
 Polydoghound consumes these modules through thin local trait/domain adapters.
 Polyazimuth can consume gross-depth acquisition through its observation consumer

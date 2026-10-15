@@ -58,7 +58,11 @@ mod fifth_native_two_condition_trades;
 mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
 mod known_position_balances;
+mod recorded_owner_fill_signals;
+mod selected_owner_watch;
+mod selected_owner_window;
 mod v1_binary_trades;
+mod v2_owner_fill_signals;
 pub use ctf_operations::{
     CtfOperationClassificationEvidence, CtfOperationKind, CtfOperationTransactionFact,
     CtfOperationTransactionStatus,
@@ -164,9 +168,31 @@ pub use known_position_balances::{
     KnownPositionBalanceId, KnownPositionBalanceNamespace, KnownPositionBalanceRow,
     KnownPositionBalancesObservation,
 };
+pub use recorded_owner_fill_signals::{
+    BoundedRecordedOwnerFillSignalsError, CapturedV2OwnerFillSignals,
+    FinalizedCaptureAnchorObservation, ObservedChainBlockAnchor,
+    RECORDED_V2_OWNER_FILL_PACKET_SCHEMA_VERSION, RecordedV2OwnerFillSignals,
+    RecordedV2OwnerFillSignalsPacket, V2_OWNER_FILL_CAPTURE_POLICY_VERSION,
+    V2_OWNER_FILL_RECORDED_REVERIFICATION_POLICY_VERSION,
+    reverify_recorded_v2_owner_fill_signals_bounded,
+};
+pub use selected_owner_watch::{
+    BoundedSelectedCtfV2OwnerWatchError, SELECTED_CTF_V2_OWNER_WATCH_POLICY_VERSION,
+    SelectedCtfV2OwnerLogIdentity, SourceAttestedSelectedCtfV2OwnerWatchObservation,
+};
+pub use selected_owner_window::{
+    BoundedSelectedCtfV2OwnerWindowError, SELECTED_CTF_V2_OWNER_WATCH_WINDOW_POLICY_VERSION,
+    SelectedCtfV2OwnerWatchFinalizedHead, SelectedCtfV2OwnerWatchWindow,
+    SelectedCtfV2OwnerWatchWindowCohort, SelectedCtfV2OwnerWatchWindowWaiting,
+    SourceAttestedSelectedCtfV2OwnerWatchWindow,
+};
 pub use v1_binary_trades::{
     V1BinaryTradeTransactionFact, V1BinaryTradeTransactionStatus, V1BinaryTradesEvidence,
     V1ExchangeInventorySnapshot,
+};
+pub use v2_owner_fill_signals::{
+    CTF_V2_OWNER_FILL_SIGNAL_POLICY_VERSION, V2OwnerFillRole, V2OwnerFillSignal,
+    V2OwnerFillSignalProvenance, extract_ctf_v2_owner_fill_signals,
 };
 
 /// Polygon chain ID verified by this diagnostic transaction verifier.
@@ -379,6 +405,13 @@ impl TransactionRequestBudget {
     #[must_use]
     pub fn is_exhausted(&self) -> bool {
         *self.0.exhaustion.borrow()
+    }
+
+    #[must_use]
+    pub fn remaining_requests(&self) -> usize {
+        self.0
+            .limit
+            .saturating_sub(self.0.reserved.load(Ordering::Acquire))
     }
 
     fn inner(&self) -> Arc<OperationRequestBudget> {
@@ -3326,10 +3359,27 @@ pub struct ChainLogVerifier {
     client: Option<reqwest::Client>,
     primary: String,
     secondary: String,
+    primary_rpc_headers: reqwest::header::HeaderMap,
+    secondary_rpc_headers: reqwest::header::HeaderMap,
     request_budget: Option<Arc<OperationRequestBudget>>,
     scoped_call_targets: Option<[Address; 3]>,
     rpc_execution: RpcExecution,
     full_block_hash_lookup: bool,
+}
+
+fn mark_rpc_provider_headers_sensitive(headers: &mut reqwest::header::HeaderMap) -> bool {
+    if headers.keys().any(|name| {
+        matches!(
+            name.as_str(),
+            "host" | "content-length" | "transfer-encoding" | "connection" | "content-type"
+        )
+    }) {
+        return false;
+    }
+    for value in headers.values_mut() {
+        value.set_sensitive(true);
+    }
+    true
 }
 
 impl ChainLogVerifier {
@@ -3360,6 +3410,8 @@ impl ChainLogVerifier {
             client: Some(client),
             primary: primary.to_owned(),
             secondary: secondary.to_owned(),
+            primary_rpc_headers: reqwest::header::HeaderMap::new(),
+            secondary_rpc_headers: reqwest::header::HeaderMap::new(),
             request_budget: None,
             scoped_call_targets: None,
             rpc_execution: RpcExecution::Network,
@@ -3384,6 +3436,24 @@ impl ChainLogVerifier {
             return Err(ChainLogAuditError::InvalidInput);
         }
         self.client = Some(Self::build_rpc_client(timeout)?);
+        Ok(self)
+    }
+
+    /// Set private headers sent only to their corresponding RPC provider.
+    /// Transport-owned headers are rejected; credential values are marked
+    /// sensitive and are never included in captured request transcripts.
+    pub fn with_rpc_provider_headers(
+        mut self,
+        mut primary: reqwest::header::HeaderMap,
+        mut secondary: reqwest::header::HeaderMap,
+    ) -> Result<Self, ChainLogAuditError> {
+        if !mark_rpc_provider_headers_sensitive(&mut primary)
+            || !mark_rpc_provider_headers_sensitive(&mut secondary)
+        {
+            return Err(ChainLogAuditError::InvalidInput);
+        }
+        self.primary_rpc_headers = primary;
+        self.secondary_rpc_headers = secondary;
         Ok(self)
     }
 
@@ -4201,6 +4271,8 @@ impl ChainLogVerifier {
             client: self.client.clone(),
             primary: self.primary.clone(),
             secondary: self.secondary.clone(),
+            primary_rpc_headers: self.primary_rpc_headers.clone(),
+            secondary_rpc_headers: self.secondary_rpc_headers.clone(),
             request_budget: Some(budget),
             scoped_call_targets: self.scoped_call_targets,
             rpc_execution: self.rpc_execution.clone(),
@@ -4213,6 +4285,8 @@ impl ChainLogVerifier {
             client: self.client.clone(),
             primary: self.primary.clone(),
             secondary: self.secondary.clone(),
+            primary_rpc_headers: self.primary_rpc_headers.clone(),
+            secondary_rpc_headers: self.secondary_rpc_headers.clone(),
             request_budget: self.request_budget.clone(),
             scoped_call_targets: Some([
                 fifth_code_context::POSITION_MANAGER_PROXY
@@ -6621,6 +6695,10 @@ impl ChainLogVerifier {
         } else {
             return Err(ChainLogAuditError::Unverified);
         };
+        let provider_headers = match source {
+            ChainRpcSourceRole::Primary => &self.primary_rpc_headers,
+            ChainRpcSourceRole::Secondary => &self.secondary_rpc_headers,
+        };
         let request_body =
             serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
                 .map_err(|_| ChainLogAuditError::Unverified)?;
@@ -6650,6 +6728,7 @@ impl ChainLogVerifier {
                     .ok_or(ChainLogAuditError::Unavailable)?;
                 let mut response = client
                     .post(endpoint)
+                    .headers(provider_headers.clone())
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(request_body)
                     .send()
@@ -6775,6 +6854,8 @@ pub async fn reverify_recorded_transaction_receipt_observation_bounded(
         client: None,
         primary: "recorded-receipt-primary".to_owned(),
         secondary: "recorded-receipt-secondary".to_owned(),
+        primary_rpc_headers: reqwest::header::HeaderMap::new(),
+        secondary_rpc_headers: reqwest::header::HeaderMap::new(),
         request_budget: None,
         scoped_call_targets: None,
         rpc_execution: RpcExecution::Recorded(Arc::clone(&replay)),
@@ -35205,7 +35286,23 @@ mod receipt_tests {
                 .await
                 .unwrap();
             assert_eq!(window.maker_fills().len(), 2);
+            assert_eq!(window.aggregate_fills().len(), 1);
             assert_eq!(window.aggregate_count(), 1);
+            assert_eq!(window.aggregate_fills()[0].maker(), aggregate_maker);
+            assert!(
+                window.aggregate_fills()[0]
+                    .taker()
+                    .eq_ignore_ascii_case(EXCHANGES[4])
+            );
+            assert_eq!(
+                window.aggregate_fills()[0].maker_amount_filled(),
+                aggregate_amount
+            );
+            assert_eq!(
+                window.aggregate_fills()[0].transaction_local_log_ordinal(),
+                2
+            );
+            assert_eq!(window.aggregate_fills()[0].log_index(), 2);
             assert_eq!(
                 window
                     .predecessor_code_context()

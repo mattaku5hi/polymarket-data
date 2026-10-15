@@ -40,6 +40,7 @@ pub struct FifthReceiptMakerFill {
     block_hash: String,
     transaction_hash: String,
     transaction_index: u64,
+    transaction_local_log_ordinal: u64,
     log_index: u64,
     order_hash: B256,
     maker: String,
@@ -73,6 +74,11 @@ impl FifthReceiptMakerFill {
     #[must_use]
     pub const fn transaction_index(&self) -> u64 {
         self.transaction_index
+    }
+
+    #[must_use]
+    pub const fn transaction_local_log_ordinal(&self) -> u64 {
+        self.transaction_local_log_ordinal
     }
 
     #[must_use]
@@ -144,6 +150,7 @@ pub struct FifthReceiptMakerWindow {
     predecessor_code_context: FifthCodeContextObservation,
     block_code_contexts: Vec<FifthCodeContextObservation>,
     maker_fills: Vec<FifthReceiptMakerFill>,
+    aggregate_fills: Vec<FifthReceiptMakerFill>,
     aggregate_count: usize,
 }
 
@@ -166,6 +173,11 @@ impl FifthReceiptMakerWindow {
     #[must_use]
     pub fn maker_fills(&self) -> &[FifthReceiptMakerFill] {
         &self.maker_fills
+    }
+
+    #[must_use]
+    pub fn aggregate_fills(&self) -> &[FifthReceiptMakerFill] {
+        &self.aggregate_fills
     }
 
     #[must_use]
@@ -322,16 +334,19 @@ impl ChainLogVerifier {
         }
 
         let mut maker_fills = Vec::new();
+        let mut aggregate_fills = Vec::new();
         let mut aggregate_count = 0_usize;
         for (block, context) in evidence.blocks().iter().zip(&block_code_contexts) {
             ensure_before_deadline(deadline)?;
             let version = context.exchange_implementation_version();
             for transaction in block.transactions() {
-                let mut pending_aggregate: Option<ParsedOrderFilled> = None;
+                let mut pending_aggregate: Option<(ParsedOrderFilled, u64, u64)> = None;
                 let mut maker_count = 0_usize;
                 let mut aggregate_count_for_transaction = 0_usize;
                 let mut has_order_filled = false;
-                for log in transaction.logs() {
+                for (local_ordinal, log) in transaction.logs().iter().enumerate() {
+                    let local_ordinal =
+                        u64::try_from(local_ordinal).map_err(|_| ChainLogAuditError::Unverified)?;
                     let exchange_emitter = log.address().eq_ignore_ascii_case(EXCHANGE_PROXY);
                     let Some(topic) = log.topics().first() else {
                         if pending_aggregate.is_some() {
@@ -339,7 +354,9 @@ impl ChainLogVerifier {
                         }
                         continue;
                     };
-                    if let Some(aggregate) = pending_aggregate.take() {
+                    if let Some((aggregate, aggregate_ordinal, aggregate_log_index)) =
+                        pending_aggregate.take()
+                    {
                         if !exchange_emitter
                             || !topic
                                 .eq_ignore_ascii_case(&v1_event_topic(ORDERS_MATCHED_SIGNATURE))
@@ -347,6 +364,25 @@ impl ChainLogVerifier {
                             return Err(ChainLogAuditError::Unverified.into());
                         }
                         verify_aggregate_pair(&aggregate, log)?;
+                        aggregate_fills.push(FifthReceiptMakerFill {
+                            block_number: log.block_number(),
+                            block_hash: log.block_hash().to_owned(),
+                            transaction_hash: log.transaction_hash().to_owned(),
+                            transaction_index: log.transaction_index(),
+                            transaction_local_log_ordinal: aggregate_ordinal,
+                            log_index: aggregate_log_index,
+                            order_hash: aggregate.order_hash,
+                            maker: aggregate.maker,
+                            taker: aggregate.taker,
+                            side: aggregate.side,
+                            token_id: aggregate.token_id,
+                            maker_amount_filled: aggregate.maker_amount_filled,
+                            taker_amount_filled: aggregate.taker_amount_filled,
+                            fee_amount: aggregate.fee_amount,
+                            builder: aggregate.builder,
+                            metadata: aggregate.metadata,
+                            implementation_version: version,
+                        });
                         aggregate_count = aggregate_count
                             .checked_add(1)
                             .ok_or(ChainLogAuditError::Unverified)?;
@@ -367,13 +403,14 @@ impl ChainLogVerifier {
                     has_order_filled = true;
                     let parsed = decode_fifth_order_filled(log)?;
                     if parsed.taker.eq_ignore_ascii_case(EXCHANGE_PROXY) {
-                        pending_aggregate = Some(parsed);
+                        pending_aggregate = Some((parsed, local_ordinal, log.block_log_index()));
                     } else {
                         maker_fills.push(FifthReceiptMakerFill {
                             block_number: log.block_number(),
                             block_hash: log.block_hash().to_owned(),
                             transaction_hash: log.transaction_hash().to_owned(),
                             transaction_index: log.transaction_index(),
+                            transaction_local_log_ordinal: local_ordinal,
                             log_index: log.block_log_index(),
                             order_hash: parsed.order_hash,
                             maker: parsed.maker,
@@ -406,6 +443,7 @@ impl ChainLogVerifier {
             predecessor_code_context: predecessor,
             block_code_contexts,
             maker_fills,
+            aggregate_fills,
             aggregate_count,
         })
     }

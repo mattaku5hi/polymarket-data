@@ -7,12 +7,15 @@ use axum::{
 };
 use polymarket_data::{
     position_history::{
-        CTF_EMITTER, POSITION_MANAGER_EMITTER, TRANSFER_BATCH_TOPIC, TRANSFER_SINGLE_TOPIC,
+        CTF_EMITTER, POSITION_MANAGER_EMITTER, RecordedSqdPositionHistoryPage,
+        SqdPositionHistoryReader, SqdPositionHistoryRequest, TRANSFER_BATCH_TOPIC,
+        TRANSFER_SINGLE_TOPIC, reverify_recorded_sqd_position_history_segment,
     },
     rpc_position_history::{
         RecordedRpcPositionHistoryPage, RpcPositionHistoryError, RpcPositionHistoryReader,
         RpcPositionHistoryRequest, reverify_recorded_rpc_position_history_segment,
         validate_recorded_position_history_segment_source_agreement,
+        validate_recorded_rpc_sqd_position_history_segment_source_agreement,
     },
 };
 use serde_json::{Value, json};
@@ -42,6 +45,94 @@ async fn reader(event: Option<Value>) -> (RpcPositionHistoryReader, Replay) {
         RpcPositionHistoryReader::new(reqwest::Client::builder(), &format!("http://{address}/rpc"))
             .unwrap();
     (reader, replay)
+}
+
+async fn sqd_transcript() -> (
+    polymarket_data::position_history::SqdPositionHistoryObservation,
+    Vec<RecordedSqdPositionHistoryPage>,
+) {
+    let app = Router::new().route("/dataset/finalized-stream", post(sqd_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let reader = SqdPositionHistoryReader::new(
+        reqwest::Client::builder(),
+        &format!("http://{address}/dataset"),
+    )
+    .unwrap();
+    let observation = reader.read_history(&sqd_request()).await.unwrap();
+    let pages = observation
+        .pages()
+        .iter()
+        .map(|page| RecordedSqdPositionHistoryPage {
+            direction: page.direction(),
+            cursor: page.cursor(),
+            last_block: page.last_block(),
+            request_body: page.request_body().to_owned(),
+            response_body: page.response_body().to_owned(),
+        })
+        .collect();
+    (observation, pages)
+}
+
+async fn sqd_handler(request: Request<Body>) -> impl IntoResponse {
+    let bytes = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let query: Value = serde_json::from_slice(&bytes).unwrap();
+    let direction = if query["logs"][0].get("topic2").is_some() {
+        "from"
+    } else {
+        "to"
+    };
+    let event = transfer(
+        POSITION_MANAGER_EMITTER,
+        TRANSFER_BATCH_TOPIC,
+        HOLDER,
+        HOLDER,
+    );
+    let mut records = Vec::new();
+    for n in 10..=15 {
+        let block_hash = hash(n);
+        let header = json!({
+            "number":n, "hash":block_hash, "parentHash":hash(n.saturating_sub(1)),
+            "stateRoot":hash(n.saturating_add(1)), "transactionsRoot":hash(n.saturating_add(2)),
+            "receiptsRoot":hash(n.saturating_add(3)), "logsBloom":format!("0x{}", "00".repeat(256)),
+        });
+        let logs = if n == 12 {
+            let rpc_log = event.clone();
+            json!([{
+                "address":rpc_log["address"], "topics":rpc_log["topics"], "data":rpc_log["data"],
+                "transactionHash":rpc_log["transactionHash"], "transactionIndex":rpc_log["transactionIndex"],
+                "logIndex":rpc_log["logIndex"],
+            }])
+        } else {
+            json!([])
+        };
+        records.push(json!({"header":header,"logs":logs}));
+    }
+    let _ = direction;
+    (
+        axum::http::StatusCode::OK,
+        records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+}
+
+fn sqd_request() -> SqdPositionHistoryRequest {
+    SqdPositionHistoryRequest {
+        holder_address: HOLDER.to_owned(),
+        from_block: 10,
+        through_block: 15,
+        expected_through_hash: hash(15),
+        max_requests: 16,
+        max_total_response_bytes: 8 * 1024 * 1024,
+        total_timeout: Duration::from_secs(3),
+    }
 }
 
 async fn handler(State(replay): State<Replay>, request: Request<Body>) -> impl IntoResponse {
@@ -431,6 +522,65 @@ async fn paired_recorded_segments_agree_across_chunk_widths_and_refuse_changed_l
         .await
         .unwrap();
     assert!(validate_recorded_position_history_segment_source_agreement(&first, &empty).is_err());
+}
+
+#[tokio::test]
+async fn recorded_rpc_and_sqd_segments_require_matching_scope_headers_and_physical_logs() {
+    let event = Some(transfer(
+        POSITION_MANAGER_EMITTER,
+        TRANSFER_BATCH_TOPIC,
+        HOLDER,
+        HOLDER,
+    ));
+    let (_, rpc_pages) = online_capture(event, 2).await;
+    let rpc = reverify_recorded_rpc_position_history_segment(&request(), 2, &rpc_pages)
+        .await
+        .unwrap();
+    let (sqd_live, sqd_pages) = sqd_transcript().await;
+    let (rpc_live, _) = online_capture(
+        Some(transfer(
+            POSITION_MANAGER_EMITTER,
+            TRANSFER_BATCH_TOPIC,
+            HOLDER,
+            HOLDER,
+        )),
+        2,
+    )
+    .await;
+    polymarket_data::rpc_position_history::validate_rpc_sqd_position_history_segment_source_agreement(
+        &rpc_live, &sqd_live,
+    ).unwrap();
+    let sqd = reverify_recorded_sqd_position_history_segment(&sqd_request(), &sqd_pages)
+        .await
+        .unwrap();
+    validate_recorded_rpc_sqd_position_history_segment_source_agreement(&rpc, &sqd).unwrap();
+
+    let mut changed_logs = sqd_pages.clone();
+    for page in &mut changed_logs {
+        page.response_body = page.response_body.replace("0x01", "0x02");
+    }
+    let changed = reverify_recorded_sqd_position_history_segment(&sqd_request(), &changed_logs)
+        .await
+        .unwrap();
+    assert!(
+        validate_recorded_rpc_sqd_position_history_segment_source_agreement(&rpc, &changed)
+            .is_err()
+    );
+
+    let mut changed_header = sqd_pages.clone();
+    for page in &mut changed_header {
+        page.response_body = page.response_body.replace(
+            &format!("\"stateRoot\":\"{}\"", hash(11)),
+            &format!("\"stateRoot\":\"{}\"", hash(90)),
+        );
+    }
+    let changed = reverify_recorded_sqd_position_history_segment(&sqd_request(), &changed_header)
+        .await
+        .unwrap();
+    assert!(
+        validate_recorded_rpc_sqd_position_history_segment_source_agreement(&rpc, &changed)
+            .is_err()
+    );
 }
 
 #[tokio::test]

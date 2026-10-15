@@ -3,6 +3,7 @@
 //! No order submission, wallet spending or qualified P&L claims.
 
 pub mod clob;
+pub mod economics;
 pub mod position_history;
 pub mod rpc_position_history;
 
@@ -155,6 +156,12 @@ pub struct RawTradesPage {
     pub cache_age_seconds: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+struct TradeHistoryRange {
+    start: u64,
+    end: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PageError {
     #[error("Data API trades limit must be in 1..={MAX_BATCH_LIMIT}, got {0}")]
@@ -163,6 +170,8 @@ pub enum PageError {
         "Data API trades minimum token size must be an exact positive decimal (zero means the provider default)"
     )]
     InvalidMinimumSize,
+    #[error("Data API trades end timestamp must be a positive Unix-seconds value fitting i64")]
+    InvalidEnd,
     #[error("Data API trades endpoint must use HTTPS (loopback HTTP only for local tests)")]
     InvalidEndpoint,
     #[error("Data API trades request failed")]
@@ -197,7 +206,95 @@ pub async fn fetch_v2_trades_page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<TradesPage, PageError> {
-    let page = fetch_raw_trades_page(client, base_url, Some(user), limit, cursor, None).await?;
+    let page =
+        fetch_raw_trades_page(client, base_url, Some(user), limit, cursor, None, None).await?;
+    let observations = page
+        .rows
+        .iter()
+        .map(parse_v2_trade)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PageError::InvalidTrade)?;
+    Ok(TradesPage {
+        observations,
+        next_cursor: page.next_cursor,
+    })
+}
+
+/// Fetch one wallet v2 page with the provider's explicit full-history bound
+/// (`start=1`), including maker-side fills (`taker_only=false`). The start
+/// filter is repeated on every cursor request. This is a request mode, not a
+/// claim that the provider returned complete wallet history.
+///
+/// # Errors
+///
+/// Uses the same bounded request, row validation and error behavior as
+/// [`fetch_v2_trades_page`].
+pub async fn fetch_v2_trades_page_full_history(
+    client: &reqwest::Client,
+    base_url: &str,
+    user: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<TradesPage, PageError> {
+    let page = fetch_raw_trades_page(
+        client,
+        base_url,
+        Some(user),
+        limit,
+        cursor,
+        None,
+        Some(TradeHistoryRange {
+            start: 1,
+            end: None,
+        }),
+    )
+    .await?;
+    let observations = page
+        .rows
+        .iter()
+        .map(parse_v2_trade)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PageError::InvalidTrade)?;
+    Ok(TradesPage {
+        observations,
+        next_cursor: page.next_cursor,
+    })
+}
+
+/// Fetch one wallet v2 page with full-history mode and an inclusive Unix-second
+/// upper bound. The same `start=1`, `end`, wallet and maker-fill filters are
+/// repeated on every cursor request. This bounds the request window but does
+/// not establish complete history within that window or snapshot isolation.
+///
+/// # Errors
+///
+/// Rejects zero or non-i64 `end` before network access and otherwise uses the
+/// same bounded request, row validation and error behavior as
+/// [`fetch_v2_trades_page`].
+pub async fn fetch_v2_trades_page_full_history_until(
+    client: &reqwest::Client,
+    base_url: &str,
+    user: &str,
+    limit: usize,
+    cursor: Option<&str>,
+    end: u64,
+) -> Result<TradesPage, PageError> {
+    if end == 0 || end > i64::MAX as u64 {
+        return Err(PageError::InvalidEnd);
+    }
+    let page = fetch_raw_trades_page(
+        client,
+        base_url,
+        Some(user),
+        limit,
+        cursor,
+        None,
+        Some(TradeHistoryRange {
+            start: 1,
+            end: Some(end),
+        }),
+    )
+    .await?;
     let observations = page
         .rows
         .iter()
@@ -226,7 +323,7 @@ pub async fn fetch_v2_global_trades_page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<RawTradesPage, PageError> {
-    fetch_raw_trades_page(client, base_url, None, limit, cursor, None).await
+    fetch_raw_trades_page(client, base_url, None, limit, cursor, None, None).await
 }
 
 /// Read a global page with an explicit positive `TOKENS` minimum. In particular,
@@ -250,7 +347,7 @@ pub async fn fetch_v2_global_trades_page_with_min_size(
         return Err(PageError::InvalidMinimumSize);
     }
     let minimum = minimum.normalize().to_string();
-    fetch_raw_trades_page(client, base_url, None, limit, cursor, Some(&minimum)).await
+    fetch_raw_trades_page(client, base_url, None, limit, cursor, Some(&minimum), None).await
 }
 
 async fn fetch_raw_trades_page(
@@ -260,6 +357,7 @@ async fn fetch_raw_trades_page(
     limit: usize,
     cursor: Option<&str>,
     min_size: Option<&str>,
+    history_range: Option<TradeHistoryRange>,
 ) -> Result<RawTradesPage, PageError> {
     if !(1..=MAX_BATCH_LIMIT).contains(&limit) {
         return Err(PageError::InvalidLimit(limit));
@@ -281,6 +379,12 @@ async fn fetch_raw_trades_page(
     if let Some(minimum) = min_size {
         query.push(("filter_type", "TOKENS".to_owned()));
         query.push(("filter_amount", minimum.to_owned()));
+    }
+    if let Some(history_range) = history_range {
+        query.push(("start", history_range.start.to_string()));
+        if let Some(end) = history_range.end {
+            query.push(("end", end.to_string()));
+        }
     }
     if let Some(cursor) = cursor {
         query.push(("cursor", cursor.to_owned()));
