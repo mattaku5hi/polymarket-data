@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 pub const V2_POSITIONS_PATH: &str = "/v2/positions";
 pub const V2_USER_STATS_PATH: &str = "/v2/user-stats";
 pub const V2_USER_PNL_PATH: &str = "/v2/user-pnl";
+pub const V2_PORTFOLIO_VALUE_PATH: &str = "/v2/value";
 pub const MAX_ECONOMICS_PAGE_LIMIT: usize = 1_000;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -27,7 +28,7 @@ pub enum EconomicsSource {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ResponseEvidence {
     pub source: EconomicsSource,
-    /// Route path used (one of the three v2 constants in this module).
+    /// Route path used (one of the v2 route constants in this module).
     pub route_path: String,
     pub request_started_at: DateTime<Utc>,
     pub retrieved_at: DateTime<Utc>,
@@ -129,6 +130,18 @@ pub struct UserPnlSeries {
     pub source_fidelity: Option<String>,
     pub points: Vec<PnlPoint>,
     /// Full `data` object, including fields added by the venue in future.
+    pub raw_data: Value,
+}
+
+/// Current venue-reported portfolio value for a wallet. The value is an
+/// unvalidated provider atom, not verified money data or a portfolio NAV.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PortfolioValue {
+    pub evidence: ResponseEvidence,
+    pub proxy_wallet: String,
+    /// The venue's current positions value; explicit JSON null remains null.
+    pub value: Value,
+    /// Complete vendor `data` object, including fields added in the future.
     pub raw_data: Value,
 }
 
@@ -274,6 +287,8 @@ pub enum EconomicsError {
     InvalidUserStatsEnvelope,
     #[error("Data API response was not a valid user-PnL envelope")]
     InvalidUserPnlEnvelope,
+    #[error("Data API response was not a valid portfolio-value envelope")]
+    InvalidPortfolioValueEnvelope,
 }
 
 /// Structured error fields documented by the production Data API OpenAPI.
@@ -287,7 +302,7 @@ pub struct VenueErrorBody {
     pub parameter: Option<String>,
 }
 
-/// Read only the three wallet-economics routes used for published economics.
+/// Read only the wallet-economics routes used for published economics.
 /// The caller supplies its client; this type has no credentials, retries, or
 /// mutable state.
 #[derive(Clone, Debug)]
@@ -424,6 +439,36 @@ impl EconomicsReader {
             source_fidelity: string_field(object, "source_fidelity"),
             points,
             raw_data: data,
+        })
+    }
+
+    /// Fetch the current whole-wallet positions value: marked market holdings
+    /// plus unresolved combos at cost basis. It excludes cash and has no venue
+    /// as-of timestamp; callers must not treat it as cash-inclusive NAV/equity.
+    pub async fn portfolio_value(&self, user: &str) -> Result<PortfolioValue, EconomicsError> {
+        validate_user(user)?;
+        let params = vec![("user".to_owned(), user.to_owned())];
+        let response = self.get(V2_PORTFOLIO_VALUE_PATH, &params).await?;
+        let envelope: DataEnvelope = serde_json::from_slice(&response.body)
+            .map_err(|_| EconomicsError::InvalidPortfolioValueEnvelope)?;
+        let raw_data = envelope.data;
+        let Some(object) = raw_data.as_object() else {
+            return Err(EconomicsError::InvalidPortfolioValueEnvelope);
+        };
+        let Some(proxy_wallet) = string_field(object, "proxy_wallet") else {
+            return Err(EconomicsError::InvalidPortfolioValueEnvelope);
+        };
+        if !proxy_wallet.eq_ignore_ascii_case(user) {
+            return Err(EconomicsError::InvalidPortfolioValueEnvelope);
+        }
+        let Some(value) = raw_field(object, "value") else {
+            return Err(EconomicsError::InvalidPortfolioValueEnvelope);
+        };
+        Ok(PortfolioValue {
+            evidence: evidence(V2_PORTFOLIO_VALUE_PATH, params, response),
+            proxy_wallet,
+            value,
+            raw_data,
         })
     }
 
@@ -739,6 +784,23 @@ mod tests {
         )
     }
 
+    async fn portfolio_value_route(
+        Query(query): Query<BTreeMap<String, String>>,
+    ) -> axum::response::Response {
+        let requested_user = query.get("user").map(String::as_str).unwrap_or_default();
+        let body = match requested_user {
+            WRONG_VALUE_WALLET_USER => br#"{"data":{"proxy_wallet":"0x9999999999999999999999999999999999999999","value":2.5}}"#.to_vec(),
+            MALFORMED_VALUE_USER => br#"{"data":[{"proxy_wallet":"0x1111111111111111111111111111111111111111","value":2.5}]}"#.to_vec(),
+            MISSING_VALUE_USER => br#"{"data":{"proxy_wallet":"0x9999999999999999999999999999999999999998"}}"#.to_vec(),
+            NULL_VALUE_USER => serde_json::to_vec(&json!({"data": {"proxy_wallet": requested_user, "value": null}})).unwrap(),
+            _ => br#"{"data":{"proxy_wallet":"0x1111111111111111111111111111111111111111","value":12.3400,"future_field":"retained"}}"#.to_vec(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("age", "3".parse().unwrap());
+        headers.insert("cache-control", "max-age=10".parse().unwrap());
+        (StatusCode::OK, headers, Bytes::from(body)).into_response()
+    }
+
     fn error_route() -> axum::response::Response {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", "7".parse().unwrap());
@@ -780,6 +842,7 @@ mod tests {
             .route(V2_POSITIONS_PATH, get(positions_route))
             .route(V2_USER_STATS_PATH, get(stats_route))
             .route(V2_USER_PNL_PATH, get(pnl_route))
+            .route(V2_PORTFOLIO_VALUE_PATH, get(portfolio_value_route))
             .with_state(seen.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -793,6 +856,52 @@ mod tests {
     const OVERSIZED_USER: &str = "0x4444444444444444444444444444444444444444";
     const MALFORMED_PAGE_USER: &str = "0x5555555555555555555555555555555555555555";
     const SLOW_USER: &str = "0x6666666666666666666666666666666666666666";
+    const WRONG_VALUE_WALLET_USER: &str = "0x7777777777777777777777777777777777777777";
+    const MALFORMED_VALUE_USER: &str = "0x8888888888888888888888888888888888888888";
+    const MISSING_VALUE_USER: &str = "0x9999999999999999999999999999999999999998";
+    const NULL_VALUE_USER: &str = "0x9999999999999999999999999999999999999997";
+
+    #[tokio::test]
+    async fn portfolio_value_preserves_unvalidated_atom_and_response_evidence() {
+        let (base, _) = server().await;
+        let reader = EconomicsReader::new(reqwest::Client::new(), base).unwrap();
+        let value = reader.portfolio_value(USER).await.unwrap();
+        assert_eq!(value.proxy_wallet, USER);
+        assert_eq!(value.value, json!(12.3400));
+        assert_eq!(value.raw_data["future_field"], "retained");
+        assert_eq!(value.evidence.route_path, V2_PORTFOLIO_VALUE_PATH);
+        assert_eq!(
+            value.evidence.request_params,
+            vec![("user".to_owned(), USER.to_owned())]
+        );
+        assert_eq!(value.evidence.response_age.as_deref(), Some("3"));
+        assert_eq!(value.evidence.cache_control.as_deref(), Some("max-age=10"));
+        assert_eq!(
+            value.evidence.raw_body,
+            br#"{"data":{"proxy_wallet":"0x1111111111111111111111111111111111111111","value":12.3400,"future_field":"retained"}}"#
+        );
+
+        let null_value = reader.portfolio_value(NULL_VALUE_USER).await.unwrap();
+        assert_eq!(null_value.value, Value::Null);
+        assert_eq!(
+            reader.portfolio_value(MISSING_VALUE_USER).await,
+            Err(EconomicsError::InvalidPortfolioValueEnvelope)
+        );
+    }
+
+    #[tokio::test]
+    async fn portfolio_value_rejects_non_object_data_and_wrong_wallet() {
+        let (base, _) = server().await;
+        let reader = EconomicsReader::new(reqwest::Client::new(), base).unwrap();
+        assert_eq!(
+            reader.portfolio_value(WRONG_VALUE_WALLET_USER).await,
+            Err(EconomicsError::InvalidPortfolioValueEnvelope)
+        );
+        assert_eq!(
+            reader.portfolio_value(MALFORMED_VALUE_USER).await,
+            Err(EconomicsError::InvalidPortfolioValueEnvelope)
+        );
+    }
 
     #[tokio::test]
     async fn cursor_walk_repeats_filters_and_keeps_evidence_and_nulls() {

@@ -2518,7 +2518,7 @@ impl ChainReceiptLog {
 
 /// Maximum ERC-1155 batch elements decoded in one raw movement observation.
 /// This is a decoder resource cap, not a canonical chain or contract limit.
-pub const MAX_ERC1155_BATCH_ITEMS: usize = 128;
+pub const MAX_ERC1155_BATCH_ITEMS: usize = crate::position_history::erc1155_abi::MAX_BATCH_ITEMS;
 
 /// A structurally recognized raw movement event. This is not an asset mapping,
 /// deployment-authority check, accounting event, or proof of economic meaning.
@@ -10430,130 +10430,85 @@ fn decode_erc20_transfer(
 fn decode_erc1155_single(
     log: &ChainReceiptLog,
 ) -> Result<ObservedAssetMovement, UnsupportedMovementReason> {
-    if log.topics.len() != 4 {
-        return Err(UnsupportedMovementReason::WrongTopicCount);
+    decode_erc1155_single_fields(&log.topics, &log.data)
+}
+
+fn decode_erc1155_single_fields(
+    topics: &[String],
+    data: &str,
+) -> Result<ObservedAssetMovement, UnsupportedMovementReason> {
+    match crate::position_history::erc1155_abi::decode_fields(topics, data)
+        .map_err(map_erc1155_decode_error)?
+    {
+        crate::position_history::erc1155_abi::DecodedTransfer::Single {
+            operator,
+            from,
+            to,
+            id,
+            amount,
+        } => Ok(ObservedAssetMovement::Erc1155TransferSingle {
+            operator,
+            from,
+            to,
+            id: U256::from_be_slice(&id),
+            amount: U256::from_be_slice(&amount),
+        }),
+        crate::position_history::erc1155_abi::DecodedTransfer::Batch { .. } => {
+            Err(UnsupportedMovementReason::WrongTopicCount)
+        }
     }
-    let operator = indexed_address(&log.topics[1])?;
-    let from = indexed_address(&log.topics[2])?;
-    let to = indexed_address(&log.topics[3])?;
-    let data = movement_data(&log.data)?;
-    if data.len() != 64 {
-        return Err(UnsupportedMovementReason::WrongDataLength);
-    }
-    Ok(ObservedAssetMovement::Erc1155TransferSingle {
-        operator,
-        from,
-        to,
-        id: U256::from_be_slice(&data[..32]),
-        amount: U256::from_be_slice(&data[32..]),
-    })
 }
 
 fn decode_erc1155_batch(
     log: &ChainReceiptLog,
 ) -> Result<ObservedAssetMovement, UnsupportedMovementReason> {
-    if log.topics.len() != 4 {
-        return Err(UnsupportedMovementReason::WrongTopicCount);
+    decode_erc1155_batch_fields(&log.topics, &log.data)
+}
+
+fn decode_erc1155_batch_fields(
+    topics: &[String],
+    data: &str,
+) -> Result<ObservedAssetMovement, UnsupportedMovementReason> {
+    match crate::position_history::erc1155_abi::decode_fields(topics, data)
+        .map_err(map_erc1155_decode_error)?
+    {
+        crate::position_history::erc1155_abi::DecodedTransfer::Batch {
+            operator,
+            from,
+            to,
+            ids,
+            amounts,
+        } => Ok(ObservedAssetMovement::Erc1155TransferBatch {
+            operator,
+            from,
+            to,
+            ids: ids.iter().map(|word| U256::from_be_slice(word)).collect(),
+            amounts: amounts
+                .iter()
+                .map(|word| U256::from_be_slice(word))
+                .collect(),
+        }),
+        crate::position_history::erc1155_abi::DecodedTransfer::Single { .. } => {
+            Err(UnsupportedMovementReason::WrongTopicCount)
+        }
     }
-    let operator = indexed_address(&log.topics[1])?;
-    let from = indexed_address(&log.topics[2])?;
-    let to = indexed_address(&log.topics[3])?;
-    let data = movement_data(&log.data)?;
-    if data.len() < 64 {
-        return Err(UnsupportedMovementReason::BatchDataLengthMismatch);
+}
+
+fn map_erc1155_decode_error(
+    error: crate::position_history::erc1155_abi::DecodeError,
+) -> UnsupportedMovementReason {
+    use crate::position_history::erc1155_abi::DecodeError;
+    match error {
+        DecodeError::WrongTopicCount => UnsupportedMovementReason::WrongTopicCount,
+        DecodeError::IndexedAddressPadding => UnsupportedMovementReason::IndexedAddressPadding,
+        DecodeError::InvalidDataHex => UnsupportedMovementReason::InvalidDataHex,
+        DecodeError::WrongDataLength => UnsupportedMovementReason::WrongDataLength,
+        DecodeError::InvalidBatchOffset => UnsupportedMovementReason::InvalidBatchOffset,
+        DecodeError::BatchLengthMismatch => UnsupportedMovementReason::BatchLengthMismatch,
+        DecodeError::BatchTooManyItems => UnsupportedMovementReason::BatchTooManyItems,
+        DecodeError::NonCanonicalBatchLayout => UnsupportedMovementReason::NonCanonicalBatchLayout,
+        DecodeError::BatchDataLengthMismatch => UnsupportedMovementReason::BatchDataLengthMismatch,
     }
-    let ids_offset = movement_word(&data, 0)
-        .and_then(u256_to_usize)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    let amounts_offset = movement_word(&data, 32)
-        .and_then(u256_to_usize)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    if ids_offset != 64 {
-        return Err(UnsupportedMovementReason::NonCanonicalBatchLayout);
-    }
-    let ids_length = movement_word(&data, ids_offset)
-        .and_then(u256_to_usize)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    if ids_length > MAX_ERC1155_BATCH_ITEMS {
-        return Err(UnsupportedMovementReason::BatchTooManyItems);
-    }
-    let ids_bytes = ids_length
-        .checked_mul(32)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    let canonical_amounts_offset = 96_usize
-        .checked_add(ids_bytes)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    if amounts_offset != canonical_amounts_offset {
-        return Err(UnsupportedMovementReason::NonCanonicalBatchLayout);
-    }
-    let amounts_length_end = amounts_offset
-        .checked_add(32)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    let amounts_length = movement_word(&data, amounts_offset)
-        .and_then(u256_to_usize)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    if amounts_length > MAX_ERC1155_BATCH_ITEMS {
-        return Err(UnsupportedMovementReason::BatchTooManyItems);
-    }
-    if amounts_length != ids_length {
-        return Err(UnsupportedMovementReason::BatchLengthMismatch);
-    }
-    let amounts_bytes = amounts_length
-        .checked_mul(32)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    let expected_end = amounts_length_end
-        .checked_add(amounts_bytes)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    if expected_end != data.len() {
-        return Err(UnsupportedMovementReason::BatchDataLengthMismatch);
-    }
-    let ids_start = ids_offset
-        .checked_add(32)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    let mut ids = Vec::with_capacity(ids_length);
-    for index in 0..ids_length {
-        let start = ids_start
-            .checked_add(
-                index
-                    .checked_mul(32)
-                    .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?,
-            )
-            .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-        let end = start
-            .checked_add(32)
-            .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-        ids.push(U256::from_be_slice(
-            data.get(start..end)
-                .ok_or(UnsupportedMovementReason::BatchDataLengthMismatch)?,
-        ));
-    }
-    let amounts_start = amounts_offset
-        .checked_add(32)
-        .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-    let mut amounts = Vec::with_capacity(amounts_length);
-    for index in 0..amounts_length {
-        let start = amounts_start
-            .checked_add(
-                index
-                    .checked_mul(32)
-                    .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?,
-            )
-            .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-        let end = start
-            .checked_add(32)
-            .ok_or(UnsupportedMovementReason::InvalidBatchOffset)?;
-        amounts.push(U256::from_be_slice(
-            data.get(start..end)
-                .ok_or(UnsupportedMovementReason::BatchDataLengthMismatch)?,
-        ));
-    }
-    Ok(ObservedAssetMovement::Erc1155TransferBatch {
-        operator,
-        from,
-        to,
-        ids,
-        amounts,
-    })
 }
 
 fn indexed_address(topic: &str) -> Result<String, UnsupportedMovementReason> {
@@ -10568,18 +10523,6 @@ fn indexed_address(topic: &str) -> Result<String, UnsupportedMovementReason> {
 fn movement_data(data: &str) -> Result<Vec<u8>, UnsupportedMovementReason> {
     hex::decode(data.strip_prefix("0x").unwrap_or(data))
         .map_err(|_| UnsupportedMovementReason::InvalidDataHex)
-}
-
-fn movement_word(data: &[u8], offset: usize) -> Option<U256> {
-    let end = offset.checked_add(32)?;
-    Some(U256::from_be_slice(data.get(offset..end)?))
-}
-
-fn u256_to_usize(value: U256) -> Option<usize> {
-    if value > U256::from(u64::MAX) {
-        return None;
-    }
-    usize::try_from(value.to::<u64>()).ok()
 }
 
 fn select_target_receipt_logs(

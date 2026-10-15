@@ -10,6 +10,8 @@ use reqwest::{Client, ClientBuilder, StatusCode, Url};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+pub(crate) mod erc1155_abi;
+
 pub const SQD_POLYGON_DATASET_URL: &str = "https://portal.sqd.dev/datasets/polygon-mainnet";
 pub const CTF_EMITTER: &str = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
 pub const POSITION_MANAGER_EMITTER: &str = "0x006f54f7f9a22e0000cc2ab60031000000ae9fef";

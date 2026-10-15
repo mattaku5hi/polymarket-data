@@ -16,6 +16,8 @@ use crate::position_history::{
     TRANSFER_BATCH_TOPIC, TRANSFER_SINGLE_TOPIC, normalize_address, normalize_hash, normalize_log,
 };
 
+pub mod current_interval_census;
+
 #[cfg(feature = "chain-audit")]
 use crate::position_history::{
     RecordedSqdPositionHistorySegmentObservation, SqdPositionHistoryObservation,
@@ -77,6 +79,12 @@ pub enum RpcPositionHistoryRequestMethod {
     GetLogs,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CurrentIntervalLogFamily {
+    Collateral,
+    Position,
+}
+
 /// Fixed reader phase for a planned JSON-RPC call; contains no raw request values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RpcPositionHistoryRequestPhase {
@@ -88,6 +96,18 @@ pub enum RpcPositionHistoryRequestPhase {
         direction: PositionHistoryDirection,
         from_block: u64,
         through_block: u64,
+    },
+    CurrentIntervalStartAnchor,
+    CurrentIntervalEndBefore,
+    CurrentIntervalEndAfter,
+    CurrentIntervalLogs {
+        family: CurrentIntervalLogFamily,
+        direction: PositionHistoryDirection,
+        from_block: u64,
+        through_block: u64,
+    },
+    CurrentIntervalBlockTimestamp {
+        number: u64,
     },
     TerminalAfter,
 }
