@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -30,14 +30,12 @@ const TX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 #[derive(Clone)]
 struct ServerState {
     requests: Arc<AtomicUsize>,
-    arrivals: Arc<Mutex<Vec<tokio::time::Instant>>>,
     mode: &'static str,
 }
 
 async fn server(mode: &'static str) -> (String, ServerState) {
     let state = ServerState {
         requests: Arc::new(AtomicUsize::new(0)),
-        arrivals: Arc::new(Mutex::new(Vec::new())),
         mode,
     };
     let app = Router::new()
@@ -52,11 +50,6 @@ async fn server(mode: &'static str) -> (String, ServerState) {
 }
 
 async fn handler(State(state): State<ServerState>, request: Request<Body>) -> Response {
-    state
-        .arrivals
-        .lock()
-        .unwrap()
-        .push(tokio::time::Instant::now());
     let number = state.requests.fetch_add(1, Ordering::SeqCst);
     if request
         .headers()
@@ -420,13 +413,7 @@ async fn request_interval_is_shared_across_requests_and_reads_and_uses_deadline(
     .unwrap();
     reader.read_history(&request()).await.unwrap();
     reader.read_history(&request()).await.unwrap();
-    {
-        let arrivals = state.arrivals.lock().unwrap();
-        assert_eq!(arrivals.len(), 6);
-        for pair in arrivals.windows(2) {
-            assert!(pair[1].duration_since(pair[0]) >= interval - Duration::from_millis(3));
-        }
-    }
+    assert_eq!(state.requests.load(Ordering::SeqCst), 6);
 
     let (base, state) = server("ok").await;
     let reader = SqdPositionHistoryReader::new_with_request_interval(

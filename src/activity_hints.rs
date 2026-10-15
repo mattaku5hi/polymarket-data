@@ -962,7 +962,9 @@ mod tests {
     };
     use std::{
         collections::HashMap,
+        future::Future,
         sync::{Arc, Mutex},
+        task::Poll,
         time::Duration,
     };
 
@@ -1028,7 +1030,6 @@ mod tests {
     #[derive(Clone)]
     struct FixtureState {
         requests: Arc<Mutex<Vec<HashMap<String, String>>>>,
-        started_at: Arc<Mutex<Option<Instant>>>,
         cycle: bool,
         delay: Duration,
         oversized_body: Option<usize>,
@@ -1038,14 +1039,6 @@ mod tests {
         State(state): State<FixtureState>,
         Query(query): Query<HashMap<String, String>>,
     ) -> Response<Body> {
-        let mut query = query;
-        let now = Instant::now();
-        let elapsed_millis = {
-            let mut started_at = state.started_at.lock().unwrap();
-            let first = *started_at.get_or_insert(now);
-            now.duration_since(first).as_millis().to_string()
-        };
-        query.insert("__elapsed_millis".into(), elapsed_millis);
         state.requests.lock().unwrap().push(query.clone());
         if let Some(size) = state.oversized_body {
             return Response::builder()
@@ -1101,7 +1094,6 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = FixtureState {
             requests: requests.clone(),
-            started_at: Arc::new(Mutex::new(None)),
             cycle,
             delay,
             oversized_body,
@@ -1172,15 +1164,6 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        let elapsed_millis: Vec<u128> = requests
-            .iter()
-            .map(|query| query["__elapsed_millis"].parse().unwrap())
-            .collect();
-        assert!(
-            elapsed_millis
-                .windows(2)
-                .all(|pair| pair[1] - pair[0] >= 500)
-        );
         let expected_wallet = format!("0x{}", "aa".repeat(20));
         for (index, query) in requests.iter().enumerate() {
             assert_eq!(
@@ -1210,6 +1193,64 @@ mod tests {
                 assert_eq!(query.get("cursor").map(String::as_str), Some("shared"));
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_pacer_uses_a_fresh_500ms_wait_after_each_start() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut pacer = ActivityRequestPacer::new(Some(API_ONLY_MIN_REQUEST_INTERVAL));
+
+        let mut first_wait = Box::pin(pacer.wait_until_ready(deadline));
+        let first_request =
+            std::future::poll_fn(|cx| Poll::Ready(first_wait.as_mut().poll(cx))).await;
+        assert_eq!(first_request, Poll::Ready(Ok(())));
+        drop(first_wait);
+        pacer.mark_started();
+
+        let mut wait = Box::pin(pacer.wait_until_ready(deadline));
+        let first_poll = std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx))).await;
+        assert!(first_poll.is_pending());
+        tokio::time::advance(Duration::from_millis(499)).await;
+        let at_499ms = std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx))).await;
+        assert!(at_499ms.is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let at_500ms = std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx))).await;
+        assert_eq!(at_500ms, Poll::Ready(Ok(())));
+        drop(wait);
+
+        // Every dispatched request resets the clock; passing the first slot
+        // cannot create a burst of immediately eligible later requests.
+        pacer.mark_started();
+        let mut next_wait = Box::pin(pacer.wait_until_ready(deadline));
+        let immediately_after_start =
+            std::future::poll_fn(|cx| Poll::Ready(next_wait.as_mut().poll(cx))).await;
+        assert!(immediately_after_start.is_pending());
+        tokio::time::advance(Duration::from_millis(499)).await;
+        let next_at_499ms =
+            std::future::poll_fn(|cx| Poll::Ready(next_wait.as_mut().poll(cx))).await;
+        assert!(next_at_499ms.is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let next_at_500ms =
+            std::future::poll_fn(|cx| Poll::Ready(next_wait.as_mut().poll(cx))).await;
+        assert_eq!(next_at_500ms, Poll::Ready(Ok(())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_pacer_deadline_wins_when_next_start_is_due_at_same_instant() {
+        let mut pacer = ActivityRequestPacer::new(Some(API_ONLY_MIN_REQUEST_INTERVAL));
+        let started_at = Instant::now();
+        pacer.mark_started();
+        let deadline = started_at + API_ONLY_MIN_REQUEST_INTERVAL;
+
+        let mut wait = Box::pin(pacer.wait_until_ready(deadline));
+        let before_deadline = std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx))).await;
+        assert!(before_deadline.is_pending());
+        tokio::time::advance(API_ONLY_MIN_REQUEST_INTERVAL).await;
+        let at_deadline = std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx))).await;
+        assert_eq!(
+            at_deadline,
+            Poll::Ready(Err(ActivityHintIncompleteReason::DeadlineExceeded))
+        );
     }
 
     #[tokio::test]

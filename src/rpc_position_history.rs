@@ -27,6 +27,7 @@ const RPC_CHAIN_ID: u64 = 137;
 const RPC_CONTEXT_CALLS: u128 = 4;
 const RPC_SEGMENT_CONTEXT_CALLS: u128 = 5;
 const MAX_RECORDED_REQUEST_BYTES: usize = 4096;
+const MAX_CURRENT_INTERVAL_LOG_REQUEST_BYTES: usize = 16 * 1024;
 
 /// Structural source capture with an extra start-header observation; no ancestry proof.
 pub const RPC_POSITION_HISTORY_SEGMENT_POLICY_VERSION: &str =
@@ -106,10 +107,28 @@ pub enum RpcPositionHistoryRequestPhase {
         from_block: u64,
         through_block: u64,
     },
+    #[cfg(feature = "chain-audit")]
+    CurrentIntervalOwnerFills {
+        from_block: u64,
+        through_block: u64,
+    },
     CurrentIntervalBlockTimestamp {
         number: u64,
     },
     TerminalAfter,
+}
+
+fn request_byte_limit(phase: RpcPositionHistoryRequestPhase) -> usize {
+    match phase {
+        RpcPositionHistoryRequestPhase::CurrentIntervalLogs { .. } => {
+            MAX_CURRENT_INTERVAL_LOG_REQUEST_BYTES
+        }
+        #[cfg(feature = "chain-audit")]
+        RpcPositionHistoryRequestPhase::CurrentIntervalOwnerFills { .. } => {
+            MAX_CURRENT_INTERVAL_LOG_REQUEST_BYTES
+        }
+        _ => MAX_RECORDED_REQUEST_BYTES,
+    }
 }
 
 /// Per-read locator for a failed network call; this is not a consensus proof.
@@ -986,6 +1005,7 @@ impl RpcPositionHistoryReader {
         &self,
         method: &str,
         params: Value,
+        request_byte_limit: usize,
         deadline: tokio::time::Instant,
         request: &RpcPositionHistoryRequest,
         state: &mut ReadState,
@@ -1000,6 +1020,9 @@ impl RpcPositionHistoryReader {
         state.next_id += 1;
         let request_json =
             json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}).to_string();
+        if request_json.len() > request_byte_limit {
+            return Err(RpcPositionHistoryError::BodyBudgetExceeded);
+        }
         self.wait_for_request_start(deadline).await?;
         let response = tokio::time::timeout_at(
             deadline,
@@ -1132,12 +1155,13 @@ pub async fn reverify_recorded_rpc_position_history_segment(
 fn recorded_call(
     pages: &[RecordedRpcPositionHistoryPage],
     next_page: &mut usize,
-    method: &str,
-    params: Value,
+    rpc_request: (&str, Value),
+    phase: RpcPositionHistoryRequestPhase,
     deadline: tokio::time::Instant,
     request: &RpcPositionHistoryRequest,
     state: &mut ReadState,
 ) -> Result<Value, RpcPositionHistoryError> {
+    let (method, params) = rpc_request;
     if tokio::time::Instant::now() >= deadline {
         return Err(RpcPositionHistoryError::Timeout);
     }
@@ -1147,7 +1171,7 @@ fn recorded_call(
     let page = pages
         .get(*next_page)
         .ok_or(RpcPositionHistoryError::MalformedResponse)?;
-    if page.request_json.len() > MAX_RECORDED_REQUEST_BYTES {
+    if page.request_json.len() > request_byte_limit(phase) {
         return Err(RpcPositionHistoryError::BodyBudgetExceeded);
     }
     let expected_id = state.next_id;
@@ -1304,7 +1328,14 @@ impl RpcCallSource<'_> {
                     phase,
                 };
                 let result = reader
-                    .call_network(method, params, deadline, request, state)
+                    .call_network(
+                        method,
+                        params,
+                        request_byte_limit(phase),
+                        deadline,
+                        request,
+                        state,
+                    )
                     .await;
                 *last_failure = if *capture_failure_context && result.is_err() {
                     Some(locator)
@@ -1313,9 +1344,15 @@ impl RpcCallSource<'_> {
                 };
                 result
             }
-            Self::Recorded { pages, next_page } => {
-                recorded_call(pages, next_page, method, params, deadline, request, state)
-            }
+            Self::Recorded { pages, next_page } => recorded_call(
+                pages,
+                next_page,
+                (method, params),
+                phase,
+                deadline,
+                request,
+                state,
+            ),
         }
     }
 

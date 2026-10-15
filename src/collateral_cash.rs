@@ -1,7 +1,9 @@
-//! Bounded single-provider Polygon observations of pUSD and USDC.e balances.
+//! Bounded provider observations of Polygon pUSD and USDC.e balances, plus
+//! pure composition with current venue-reported position values.
 //!
-//! This is a same-block provider attestation. It does not verify state roots,
-//! establish portfolio NAV, or perform money arithmetic.
+//! Cash is a same-block provider attestation. It does not verify state roots
+//! or establish portfolio NAV. The composition API uses exact Decimal sums
+//! over mixed capture windows and does not establish completeness or peg value.
 
 use std::{collections::HashSet, net::IpAddr, time::Duration};
 
@@ -10,6 +12,12 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::timeout;
+
+mod mark_composition;
+pub use mark_composition::{
+    CurrentPortfolioEstimateSet, CurrentWalletEstimate, CurrentWalletEstimateWithCashEvidence,
+    MarkCompositionError, compose_current_portfolio_estimates, compose_current_wallet_estimate,
+};
 
 pub const POLYGON_CHAIN_ID: u64 = 137;
 pub const MAX_COLLATERAL_WALLETS: usize = 100;

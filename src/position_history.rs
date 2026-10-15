@@ -1162,3 +1162,178 @@ fn normalize_hex_bytes(s: &str) -> Option<String> {
     }
     Some(format!("0x{}", n.to_ascii_lowercase()))
 }
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    fn reader(interval: Duration) -> SqdPositionHistoryReader {
+        SqdPositionHistoryReader::new_with_request_interval(
+            Client::builder(),
+            "http://127.0.0.1:1/dataset",
+            interval,
+        )
+        .unwrap()
+    }
+
+    fn deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(5)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_slots_are_immediate_then_exactly_interval_spaced_across_directions() {
+        let reader = reader(Duration::from_millis(20));
+        let start = tokio::time::Instant::now();
+
+        reader
+            .wait_for_request_slot(deadline(), PositionHistoryDirection::From)
+            .await
+            .unwrap();
+        assert_eq!(tokio::time::Instant::now(), start);
+
+        let second = reader.wait_for_request_slot(deadline(), PositionHistoryDirection::To);
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(19), &mut second)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(19)
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        second.await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(20)
+        );
+
+        let third = reader.wait_for_request_slot(deadline(), PositionHistoryDirection::From);
+        tokio::pin!(third);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(19), &mut third)
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        third.await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(40)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_slot_does_not_catch_up_or_shorten_the_following_interval() {
+        let reader = reader(Duration::from_millis(20));
+        let start = tokio::time::Instant::now();
+        reader
+            .wait_for_request_slot(deadline(), PositionHistoryDirection::From)
+            .await
+            .unwrap();
+
+        tokio::time::advance(Duration::from_millis(35)).await;
+        reader
+            .wait_for_request_slot(deadline(), PositionHistoryDirection::To)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(35)
+        );
+
+        let next = reader.wait_for_request_slot(deadline(), PositionHistoryDirection::From);
+        tokio::pin!(next);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(19), &mut next)
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        next.await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(55)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_directions_are_serialized_by_the_shared_slot_mutex() {
+        let reader = reader(Duration::from_millis(20));
+        let start = tokio::time::Instant::now();
+        reader
+            .wait_for_request_slot(deadline(), PositionHistoryDirection::From)
+            .await
+            .unwrap();
+
+        let from = async {
+            reader
+                .wait_for_request_slot(deadline(), PositionHistoryDirection::From)
+                .await
+                .unwrap();
+            tokio::time::Instant::now()
+        };
+        let to = async {
+            reader
+                .wait_for_request_slot(deadline(), PositionHistoryDirection::To)
+                .await
+                .unwrap();
+            tokio::time::Instant::now()
+        };
+        let (from, to) = tokio::join!(from, to);
+        let mut slots = [from, to];
+        slots.sort();
+        assert_eq!(
+            slots,
+            [
+                start + Duration::from_millis(20),
+                start + Duration::from_millis(40)
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_timeout_does_not_reserve_a_later_slot() {
+        let reader = reader(Duration::from_millis(20));
+        let start = tokio::time::Instant::now();
+        reader
+            .wait_for_request_slot(
+                start + Duration::from_millis(10),
+                PositionHistoryDirection::From,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reader
+                .wait_for_request_slot(
+                    start + Duration::from_millis(10),
+                    PositionHistoryDirection::To,
+                )
+                .await,
+            Err(PositionHistoryError::Timeout(PositionHistoryDirection::To))
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(10)
+        );
+
+        let retry = reader.wait_for_request_slot(
+            start + Duration::from_secs(1),
+            PositionHistoryDirection::From,
+        );
+        tokio::pin!(retry);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(9), &mut retry)
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        retry.await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(20)
+        );
+    }
+}

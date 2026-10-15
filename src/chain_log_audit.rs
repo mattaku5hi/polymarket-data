@@ -58,6 +58,7 @@ mod fifth_native_two_condition_trades;
 mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
 mod known_position_balances;
+mod provider_reported_maker_fill;
 mod recorded_owner_fill_signals;
 mod selected_owner_watch;
 mod selected_owner_window;
@@ -168,6 +169,10 @@ pub use known_position_balances::{
     KnownPositionBalanceId, KnownPositionBalanceNamespace, KnownPositionBalanceRow,
     KnownPositionBalancesObservation,
 };
+pub use provider_reported_maker_fill::{
+    PROVIDER_REPORTED_MAKER_FILL_LOG_MAX_BYTES, ProviderReportedMakerFillError,
+    decode_provider_reported_maker_fill,
+};
 pub use recorded_owner_fill_signals::{
     BoundedRecordedOwnerFillSignalsError, CapturedV2OwnerFillSignals,
     FinalizedCaptureAnchorObservation, ObservedChainBlockAnchor,
@@ -265,14 +270,16 @@ pub const COMPLEMENTARY_INVENTORY_POLICY_VERSION: &str =
     "ctf-complementary-pair-usdce-shared-interval-replay/1";
 pub const CTF_OPERATION_CLASSIFICATION_POLICY_VERSION: &str =
     "ctf-root-binary-source-exact-operation-receipt-classification/1";
-const V1_ORDER_FILLED: &str = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6";
-const V2_ORDER_FILLED: &str = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee";
+pub(crate) const V1_ORDER_FILLED: &str =
+    "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6";
+pub(crate) const V2_ORDER_FILLED: &str =
+    "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee";
 const ERC20_TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const ERC1155_TRANSFER_SINGLE: &str =
     "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
 const ERC1155_TRANSFER_BATCH: &str =
     "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb";
-const EXCHANGES: [&str; 5] = [
+pub(crate) const EXCHANGES: [&str; 5] = [
     "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
     "0xC5d563A36AE78145C45a50134d48A1215220f80a",
     "0xE111180000d2663C0091e4f400237545B87B996B",

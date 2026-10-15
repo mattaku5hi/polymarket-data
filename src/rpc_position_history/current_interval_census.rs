@@ -10,6 +10,12 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
+#[cfg(feature = "chain-audit")]
+use crate::chain_log_audit::{
+    ChainMakerFill, EXCHANGES, V1_ORDER_FILLED, V2_ORDER_FILLED,
+    decode_provider_reported_maker_fill,
+};
+
 use super::{
     CurrentIntervalLogFamily, MAX_HISTORY_REQUESTS, MAX_HISTORY_TOTAL_BYTES, RPC_CHAIN_ID,
     ReadState, RpcCallSource, RpcPositionHistoryError, RpcPositionHistoryPage,
@@ -108,6 +114,31 @@ pub struct RpcCurrentIntervalCensus {
     pub requests: Vec<RpcPositionHistoryPage>,
 }
 
+/// Provider-reported owner fill from the current interval's single grouped
+/// maker-topic query. The enclosing census retains the raw response frame.
+#[cfg(feature = "chain-audit")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpcCurrentIntervalOwnerFill {
+    pub fill: ChainMakerFill,
+    pub transaction_index: u64,
+    pub block_timestamp: u64,
+}
+
+/// Opt-in transfer census plus first-four-exchange CTF owner fills.
+/// Request/byte totals and raw request frames in `census` cover both parts.
+/// This remains provider-reported event data, not receipt, flow, or NAV proof.
+#[cfg(feature = "chain-audit")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpcCurrentIntervalOwnerFillCensus {
+    pub census: RpcCurrentIntervalCensus,
+    pub owner_fills: Vec<RpcCurrentIntervalOwnerFill>,
+}
+
+#[cfg(feature = "chain-audit")]
+type OwnerFillResult = Vec<RpcCurrentIntervalOwnerFill>;
+#[cfg(not(feature = "chain-audit"))]
+type OwnerFillResult = ();
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Direction {
     From,
@@ -129,6 +160,31 @@ impl RpcPositionHistoryReader {
         &self,
         request: &RpcCurrentIntervalCensusRequest,
     ) -> Result<RpcCurrentIntervalCensus, RpcPositionHistoryError> {
+        self.read_current_interval_inner(request, false)
+            .await
+            .map(|(census, _)| census)
+    }
+
+    /// Opt in to one grouped OrderFilled maker-topic query per block chunk.
+    /// The selected wallets are ORed at topic 2, so one query covers indexed
+    /// maker ownership without adding a redundant taker-topic query.
+    #[cfg(feature = "chain-audit")]
+    pub async fn read_current_interval_owner_fills(
+        &self,
+        request: &RpcCurrentIntervalCensusRequest,
+    ) -> Result<RpcCurrentIntervalOwnerFillCensus, RpcPositionHistoryError> {
+        let (census, owner_fills) = self.read_current_interval_inner(request, true).await?;
+        Ok(RpcCurrentIntervalOwnerFillCensus {
+            census,
+            owner_fills,
+        })
+    }
+
+    async fn read_current_interval_inner(
+        &self,
+        request: &RpcCurrentIntervalCensusRequest,
+        include_owner_fills: bool,
+    ) -> Result<(RpcCurrentIntervalCensus, OwnerFillResult), RpcPositionHistoryError> {
         if request.wallets.is_empty() || request.wallets.len() > MAX_WALLETS {
             return Err(RpcPositionHistoryError::InvalidInput);
         }
@@ -166,7 +222,8 @@ impl RpcPositionHistoryReader {
         let chunks = span.div_ceil(LOG_CHUNK_BLOCKS);
         // Five chain/finality/anchor calls, four filters per chunk, and at
         // most one timestamp header per distinct event block.
-        let minimum_calls = 5_u128 + 4 * u128::from(chunks);
+        let filters_per_chunk = if include_owner_fills { 5 } else { 4 };
+        let minimum_calls = 5_u128 + filters_per_chunk * u128::from(chunks);
         if minimum_calls > request.max_requests as u128 {
             return Err(RpcPositionHistoryError::RequestBudgetExceeded);
         }
@@ -264,6 +321,8 @@ impl RpcPositionHistoryReader {
         let base_filters = filters(&wallets, log_from_block, request.through_block)
             .ok_or(RpcPositionHistoryError::InvalidInput)?;
         let mut movements = BTreeMap::<Locator, RpcCurrentIntervalLog>::new();
+        #[cfg(feature = "chain-audit")]
+        let mut owner_fills = BTreeMap::<Locator, RpcCurrentIntervalOwnerFill>::new();
         let mut event_blocks = BTreeMap::<u64, String>::new();
         let mut chunk_start = log_from_block;
         while chunk_start <= request.through_block {
@@ -320,7 +379,59 @@ impl RpcPositionHistoryReader {
                         return Err(RpcPositionHistoryError::ConflictingHeader);
                     }
                     event_blocks.insert(block_number, block_hash);
+                    #[cfg(feature = "chain-audit")]
+                    if owner_fills.contains_key(&movement_key(&movement)?) {
+                        return Err(RpcPositionHistoryError::ConflictingLocator);
+                    }
                     insert_unique_log(&mut movements, movement)?;
+                    #[cfg(feature = "chain-audit")]
+                    if include_owner_fills
+                        && movements.len().saturating_add(owner_fills.len()) > MAX_UNIQUE_LOGS
+                    {
+                        return Err(RpcPositionHistoryError::BodyBudgetExceeded);
+                    }
+                }
+            }
+            #[cfg(feature = "chain-audit")]
+            if include_owner_fills {
+                let mut filter = owner_fill_filter(&wallets, chunk_start, chunk_end)
+                    .ok_or(RpcPositionHistoryError::InvalidInput)?;
+                filter["fromBlock"] = json!(quantity(chunk_start));
+                filter["toBlock"] = json!(quantity(chunk_end));
+                let response = source
+                    .call(
+                        "eth_getLogs",
+                        json!([filter]),
+                        RpcPositionHistoryRequestPhase::CurrentIntervalOwnerFills {
+                            from_block: chunk_start,
+                            through_block: chunk_end,
+                        },
+                        deadline,
+                        &transport,
+                        &mut state,
+                    )
+                    .await?;
+                let rows = response
+                    .as_array()
+                    .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+                for row in rows {
+                    let fill = decode_owner_fill(row, &wallets, chunk_start, chunk_end)?;
+                    let key = owner_fill_key(&fill);
+                    if movements.contains_key(&key) {
+                        return Err(RpcPositionHistoryError::ConflictingLocator);
+                    }
+                    let block_number = fill.fill.block_number;
+                    if event_blocks
+                        .get(&block_number)
+                        .is_some_and(|previous| previous != &fill.fill.block_hash)
+                    {
+                        return Err(RpcPositionHistoryError::ConflictingHeader);
+                    }
+                    event_blocks.insert(block_number, fill.fill.block_hash.clone());
+                    insert_unique_owner_fill(&mut owner_fills, fill)?;
+                    if movements.len().saturating_add(owner_fills.len()) > MAX_UNIQUE_LOGS {
+                        return Err(RpcPositionHistoryError::BodyBudgetExceeded);
+                    }
                 }
             }
             if chunk_end == request.through_block {
@@ -331,6 +442,8 @@ impl RpcPositionHistoryReader {
                 .ok_or(RpcPositionHistoryError::InvalidInput)?;
         }
         validate_block_log_indices(&movements)?;
+        #[cfg(feature = "chain-audit")]
+        validate_owner_fill_block_log_indices(&movements, &owner_fills)?;
         if event_blocks.len() > MAX_EVENT_BLOCKS {
             return Err(RpcPositionHistoryError::RequestBudgetExceeded);
         }
@@ -363,6 +476,14 @@ impl RpcPositionHistoryReader {
             }
             event_headers.push(header);
         }
+        #[cfg(feature = "chain-audit")]
+        for fill in owner_fills.values_mut() {
+            fill.block_timestamp = event_headers
+                .iter()
+                .find(|header| header.number == fill.fill.block_number)
+                .ok_or(RpcPositionHistoryError::MalformedResponse)?
+                .timestamp;
+        }
         let end_after = source
             .call(
                 "eth_getBlockByNumber",
@@ -384,7 +505,7 @@ impl RpcPositionHistoryReader {
         source.finish()?;
         let mut logs: Vec<_> = movements.into_values().collect();
         logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
-        Ok(RpcCurrentIntervalCensus {
+        let census = RpcCurrentIntervalCensus {
             wallets,
             start_block: request.start_block,
             through_block: request.through_block,
@@ -399,7 +520,20 @@ impl RpcPositionHistoryReader {
             request_count: state.next_id.saturating_sub(1) as usize,
             response_bytes: state.response_bytes,
             requests: state.pages,
-        })
+        };
+        #[cfg(feature = "chain-audit")]
+        let mut fills: Vec<_> = owner_fills.into_values().collect();
+        #[cfg(feature = "chain-audit")]
+        fills.sort_by_key(|fill| {
+            (
+                fill.fill.block_number,
+                fill.transaction_index,
+                fill.fill.log_index,
+            )
+        });
+        #[cfg(not(feature = "chain-audit"))]
+        let fills = ();
+        Ok((census, fills))
     }
 }
 
@@ -449,6 +583,53 @@ fn filters(wallets: &[String], from: u64, through: u64) -> Option<[Value; 4]> {
         filter["toBlock"] = json!(quantity(through));
     }
     Some([cash_from, cash_to, position_from, position_to])
+}
+
+#[cfg(feature = "chain-audit")]
+fn owner_fill_filter(wallets: &[String], from: u64, through: u64) -> Option<Value> {
+    if wallets.is_empty() || wallets.len() > MAX_WALLETS {
+        return None;
+    }
+    let span = through.checked_sub(from)?.checked_add(1)?;
+    if span > MAX_BLOCK_SPAN {
+        return None;
+    }
+    let maker_topics: Vec<_> = wallets
+        .iter()
+        .map(|wallet| normalize_address(wallet).map(|wallet| format!("0x{:0>64}", &wallet[2..])))
+        .collect::<Option<_>>()?;
+    Some(json!({
+        "address": &EXCHANGES[..4],
+        "topics": [[V1_ORDER_FILLED, V2_ORDER_FILLED], null, maker_topics],
+        "fromBlock": quantity(from),
+        "toBlock": quantity(through),
+    }))
+}
+
+#[cfg(feature = "chain-audit")]
+fn decode_owner_fill(
+    raw: &Value,
+    wallets: &[String],
+    from_block: u64,
+    through_block: u64,
+) -> Result<RpcCurrentIntervalOwnerFill, RpcPositionHistoryError> {
+    let decoded = decode_provider_reported_maker_fill(raw)
+        .map_err(|_| RpcPositionHistoryError::MalformedResponse)?;
+    if decoded.chain_id != RPC_CHAIN_ID
+        || !(from_block..=through_block).contains(&decoded.block_number)
+        || !wallets.iter().any(|wallet| wallet == &decoded.wallet)
+    {
+        return Err(RpcPositionHistoryError::MalformedResponse);
+    }
+    let transaction_index = raw
+        .get("transactionIndex")
+        .and_then(parse_quantity)
+        .ok_or(RpcPositionHistoryError::MalformedResponse)?;
+    Ok(RpcCurrentIntervalOwnerFill {
+        block_timestamp: 0,
+        fill: decoded,
+        transaction_index,
+    })
 }
 
 fn decode_log(
@@ -615,6 +796,64 @@ fn insert_unique_log(
     Ok(())
 }
 
+#[cfg(feature = "chain-audit")]
+fn owner_fill_key(fill: &RpcCurrentIntervalOwnerFill) -> Locator {
+    Locator {
+        chain_id: fill.fill.chain_id,
+        transaction_hash: fill.fill.transaction_hash.clone(),
+        log_index: fill.fill.log_index,
+    }
+}
+
+#[cfg(feature = "chain-audit")]
+fn insert_unique_owner_fill(
+    fills: &mut BTreeMap<Locator, RpcCurrentIntervalOwnerFill>,
+    fill: RpcCurrentIntervalOwnerFill,
+) -> Result<(), RpcPositionHistoryError> {
+    let key = owner_fill_key(&fill);
+    if let Some(previous) = fills.get(&key) {
+        if previous != &fill {
+            return Err(RpcPositionHistoryError::ConflictingLocator);
+        }
+    } else {
+        fills.insert(key, fill);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "chain-audit")]
+fn validate_owner_fill_block_log_indices(
+    movements: &BTreeMap<Locator, RpcCurrentIntervalLog>,
+    fills: &BTreeMap<Locator, RpcCurrentIntervalOwnerFill>,
+) -> Result<(), RpcPositionHistoryError> {
+    let mut indices = BTreeMap::new();
+    for (block_hash, log_index, transaction_hash) in movements
+        .values()
+        .map(|log| {
+            (
+                log.block_hash.as_str(),
+                log.log_index,
+                log.transaction_hash.as_str(),
+            )
+        })
+        .chain(fills.values().map(|fill| {
+            (
+                fill.fill.block_hash.as_str(),
+                fill.fill.log_index,
+                fill.fill.transaction_hash.as_str(),
+            )
+        }))
+    {
+        if indices
+            .insert((block_hash, log_index), transaction_hash)
+            .is_some_and(|previous| previous != transaction_hash)
+        {
+            return Err(RpcPositionHistoryError::ConflictingLocator);
+        }
+    }
+    Ok(())
+}
+
 fn validate_block_log_indices(
     movements: &BTreeMap<Locator, RpcCurrentIntervalLog>,
 ) -> Result<(), RpcPositionHistoryError> {
@@ -681,6 +920,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const WALLET: &str = "0x1111111111111111111111111111111111111111";
+    const TEST_OWNER_FILL_EXCHANGES: [&str; 4] = [
+        "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+        "0xC5d563A36AE78145C45a50134d48A1215220f80a",
+        "0xE111180000d2663C0091e4f400237545B87B996B",
+        "0xe2222d279d744050d28e00520010520000310F59",
+    ];
+    const TEST_V1_ORDER_FILLED_TOPIC: &str =
+        "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6";
+    const TEST_V2_ORDER_FILLED_TOPIC: &str =
+        "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee";
     fn topic(address: &str) -> String {
         format!("0x{:0>64}", &address[2..])
     }
@@ -712,6 +961,137 @@ mod tests {
             json!([topic(WALLET), topic(other)])
         );
         assert!(super::filters(&wallets, 1, MAX_BLOCK_SPAN + 1).is_none());
+    }
+
+    #[cfg(feature = "chain-audit")]
+    #[test]
+    fn owner_fill_filter_is_one_grouped_topic_two_query_for_known_exchanges() {
+        let other = "0x2222222222222222222222222222222222222222";
+        let wallets = vec![WALLET.to_owned(), other.to_owned()];
+        let filter = owner_fill_filter(&wallets, 11, 20).unwrap();
+        assert_eq!(filter["address"], json!(&EXCHANGES[..4]));
+        assert_eq!(
+            filter["topics"],
+            json!([
+                [V1_ORDER_FILLED, V2_ORDER_FILLED],
+                null,
+                [topic(WALLET), topic(other)]
+            ])
+        );
+        assert_eq!(filter["fromBlock"], "0xb");
+        assert_eq!(filter["toBlock"], "0x14");
+        assert!(owner_fill_filter(&wallets, 1, MAX_BLOCK_SPAN + 1).is_none());
+    }
+
+    #[cfg(feature = "chain-audit")]
+    #[test]
+    fn recorded_calls_allow_capped_grouped_wallet_filters_only_in_current_interval_phase() {
+        let wallets: Vec<_> = (1_u128..=MAX_WALLETS as u128)
+            .map(|index| format!("0x{index:040x}"))
+            .collect();
+        let filter = owner_fill_filter(&wallets, 11, 20).unwrap();
+        let params = json!([filter]);
+        let expected_request = json!({
+            "jsonrpc":"2.0", "id":1, "method":"eth_getLogs", "params":params,
+        })
+        .to_string();
+        assert!(expected_request.len() > super::super::MAX_RECORDED_REQUEST_BYTES);
+        assert!(expected_request.len() <= super::super::MAX_CURRENT_INTERVAL_LOG_REQUEST_BYTES);
+        let response = json!({"jsonrpc":"2.0", "id":1, "result":[]}).to_string();
+        let pages = [super::super::RecordedRpcPositionHistoryPage {
+            request_json: expected_request.clone(),
+            response_json: response.clone(),
+        }];
+        let request = RpcPositionHistoryRequest {
+            holder_address: wallets[0].clone(),
+            from_block: 11,
+            through_block: 20,
+            expected_through_hash: mock_header(20)["hash"].as_str().unwrap().to_owned(),
+            max_requests: 1,
+            max_total_response_bytes: MAX_HISTORY_TOTAL_BYTES,
+            total_timeout: Duration::from_secs(5),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let phase = RpcPositionHistoryRequestPhase::CurrentIntervalOwnerFills {
+            from_block: 11,
+            through_block: 20,
+        };
+        let mut next_page = 0;
+        let mut state = super::super::ReadState {
+            pages: Vec::new(),
+            response_bytes: 0,
+            next_id: 1,
+        };
+        assert!(
+            super::super::recorded_call(
+                &pages,
+                &mut next_page,
+                (
+                    "eth_getLogs",
+                    json!([owner_fill_filter(&wallets, 11, 20).unwrap()])
+                ),
+                phase,
+                deadline,
+                &request,
+                &mut state,
+            )
+            .is_ok()
+        );
+
+        let mut next_page = 0;
+        let mut state = super::super::ReadState {
+            pages: vec![],
+            response_bytes: 0,
+            next_id: 1,
+        };
+        let legacy_phase = RpcPositionHistoryRequestPhase::Logs {
+            direction: PositionHistoryDirection::From,
+            from_block: 11,
+            through_block: 20,
+        };
+        assert_eq!(
+            super::super::recorded_call(
+                &pages,
+                &mut next_page,
+                (
+                    "eth_getLogs",
+                    json!([owner_fill_filter(&wallets, 11, 20).unwrap()])
+                ),
+                legacy_phase,
+                deadline,
+                &request,
+                &mut state,
+            ),
+            Err(RpcPositionHistoryError::BodyBudgetExceeded)
+        );
+
+        let oversized_filter = json!({"padding":"x".repeat(17_000)});
+        let oversized_request = json!({
+            "jsonrpc":"2.0", "id":1, "method":"eth_getLogs", "params":[oversized_filter],
+        })
+        .to_string();
+        let oversized = [super::super::RecordedRpcPositionHistoryPage {
+            request_json: oversized_request,
+            response_json: response,
+        }];
+        let mut next_page = 0;
+        let mut state = super::super::ReadState {
+            pages: vec![],
+            response_bytes: 0,
+            next_id: 1,
+        };
+        assert_eq!(
+            super::super::recorded_call(
+                &oversized,
+                &mut next_page,
+                ("eth_getLogs", json!([{"padding":"x".repeat(17_000)}])),
+                phase,
+                deadline,
+                &request,
+                &mut state,
+            ),
+            Err(RpcPositionHistoryError::BodyBudgetExceeded)
+        );
     }
 
     #[test]
@@ -1030,13 +1410,18 @@ mod tests {
                 let filter = &params[0];
                 if filter["address"] == json!([PUSD_ADDRESS, USDCE_ADDRESS])
                     && filter["topics"][0] == ERC20_TRANSFER_TOPIC
-                    && filter["topics"][1]
-                        == json!([
-                            topic(WALLET),
-                            topic("0x2222222222222222222222222222222222222222")
-                        ])
+                    && filter["topics"][1].as_array().is_some_and(|topics| {
+                        topics
+                            .iter()
+                            .any(|entry| entry.as_str() == Some(&topic(WALLET)))
+                    })
                 {
                     json!([mock_cash_log()])
+                } else if filter["address"] == json!(TEST_OWNER_FILL_EXCHANGES)
+                    && filter["topics"][0]
+                        == json!([TEST_V1_ORDER_FILLED_TOPIC, TEST_V2_ORDER_FILLED_TOPIC])
+                {
+                    json!([mock_owner_fill()])
                 } else {
                     json!([])
                 }
@@ -1066,6 +1451,29 @@ mod tests {
             "transactionIndex":"0x1", "logIndex":"0x2", "address":PUSD_ADDRESS,
             "topics":[ERC20_TRANSFER_TOPIC, topic(WALLET), topic("0x2222222222222222222222222222222222222222")],
             "data":format!("0x{}", format!("{:064x}", 123_u64)),
+        })
+    }
+
+    fn mock_owner_fill() -> Value {
+        let words = [0_u128, 123, 5_000_000, 7_000_000, 9]
+            .into_iter()
+            .map(|word| format!("{word:064x}"))
+            .collect::<String>();
+        json!({
+            "removed":false,
+            "blockNumber":"0xf",
+            "blockHash":mock_header(15)["hash"],
+            "transactionHash":format!("0x{}", "77".repeat(32)),
+            "transactionIndex":"0x3",
+            "logIndex":"0x5",
+            "address":TEST_OWNER_FILL_EXCHANGES[0],
+            "topics":[
+                TEST_V1_ORDER_FILLED_TOPIC,
+                format!("0x{}", "88".repeat(32)),
+                topic(WALLET),
+                topic("0x2222222222222222222222222222222222222222")
+            ],
+            "data":format!("0x{words}"),
         })
     }
 
@@ -1145,6 +1553,140 @@ mod tests {
             4
         );
         server.abort();
+    }
+
+    #[cfg(feature = "chain-audit")]
+    #[tokio::test]
+    async fn opt_in_owner_fill_census_shares_caps_frames_and_event_headers() {
+        let (reader, requests, server) = mock_reader().await;
+        let mut wallets = vec![WALLET.to_owned()];
+        wallets.extend((2_u128..=MAX_WALLETS as u128).map(|index| format!("0x{index:040x}")));
+        let request = RpcCurrentIntervalCensusRequest {
+            wallets,
+            start_block: 10,
+            expected_start_hash: mock_header(10)["hash"].as_str().unwrap().to_owned(),
+            through_block: 20,
+            expected_through_hash: mock_header(20)["hash"].as_str().unwrap().to_owned(),
+            max_requests: 5 + 5 + MAX_EVENT_BLOCKS,
+            max_total_response_bytes: MAX_HISTORY_TOTAL_BYTES,
+            total_timeout: Duration::from_secs(5),
+        };
+        let observation = reader
+            .read_current_interval_owner_fills(&request)
+            .await
+            .unwrap();
+        assert_eq!(observation.census.logs.len(), 1);
+        assert_eq!(observation.owner_fills.len(), 1);
+        let fill = &observation.owner_fills[0];
+        assert_eq!(fill.fill.block_number, 15);
+        assert_eq!(fill.fill.log_index, 5);
+        assert_eq!(fill.fill.wallet, WALLET);
+        assert_eq!(fill.transaction_index, 3);
+        assert_eq!(fill.block_timestamp, 1_800_000_015);
+        assert_eq!(observation.census.event_headers.len(), 1);
+        assert_eq!(observation.census.wallets.len(), MAX_WALLETS);
+        assert_eq!(observation.census.request_count, 11);
+        assert_eq!(observation.census.requests.len(), 11);
+        let calls = requests.lock().unwrap();
+        assert_eq!(calls.len(), 11);
+        let log_filters: Vec<_> = calls
+            .iter()
+            .filter(|call| call["method"] == "eth_getLogs")
+            .collect();
+        assert_eq!(log_filters.len(), 5);
+        assert_eq!(
+            log_filters[4]["params"][0]["topics"][2]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_WALLETS
+        );
+        server.abort();
+    }
+
+    #[cfg(feature = "chain-audit")]
+    #[tokio::test]
+    async fn owner_fill_event_header_request_counts_against_shared_request_budget() {
+        let (reader, requests, server) = mock_reader().await;
+        let request = RpcCurrentIntervalCensusRequest {
+            wallets: vec![WALLET.to_owned()],
+            start_block: 10,
+            expected_start_hash: mock_header(10)["hash"].as_str().unwrap().to_owned(),
+            through_block: 20,
+            expected_through_hash: mock_header(20)["hash"].as_str().unwrap().to_owned(),
+            max_requests: 10,
+            max_total_response_bytes: MAX_HISTORY_TOTAL_BYTES,
+            total_timeout: Duration::from_secs(5),
+        };
+        assert_eq!(
+            reader.read_current_interval_owner_fills(&request).await,
+            Err(RpcPositionHistoryError::RequestBudgetExceeded)
+        );
+        let calls = requests.lock().unwrap();
+        assert_eq!(calls.len(), 10);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "eth_getLogs")
+                .count(),
+            5
+        );
+        server.abort();
+    }
+
+    #[cfg(feature = "chain-audit")]
+    #[tokio::test]
+    async fn owner_fill_response_uses_existing_shared_byte_budget() {
+        let (reader, _, server) = mock_reader().await;
+        let request = RpcCurrentIntervalCensusRequest {
+            wallets: vec![
+                WALLET.to_owned(),
+                "0x2222222222222222222222222222222222222222".to_owned(),
+            ],
+            start_block: 10,
+            expected_start_hash: mock_header(10)["hash"].as_str().unwrap().to_owned(),
+            through_block: 20,
+            expected_through_hash: mock_header(20)["hash"].as_str().unwrap().to_owned(),
+            max_requests: 5 + 5 + MAX_EVENT_BLOCKS,
+            max_total_response_bytes: MAX_HISTORY_TOTAL_BYTES,
+            total_timeout: Duration::from_secs(5),
+        };
+        let baseline = reader.read_current_interval_census(&request).await.unwrap();
+        let bounded = RpcCurrentIntervalCensusRequest {
+            max_total_response_bytes: baseline.response_bytes,
+            ..request
+        };
+        assert_eq!(
+            reader.read_current_interval_owner_fills(&bounded).await,
+            Err(RpcPositionHistoryError::BodyBudgetExceeded)
+        );
+        server.abort();
+    }
+
+    #[cfg(feature = "chain-audit")]
+    #[test]
+    fn owner_fill_rows_bind_wallet_range_and_conflict_at_the_shared_locator() {
+        let wallets = vec![WALLET.to_owned()];
+        let raw = mock_owner_fill();
+        let fill = decode_owner_fill(&raw, &wallets, 11, 20).unwrap();
+        assert_eq!(fill.fill.wallet, WALLET);
+        assert_eq!(fill.transaction_index, 3);
+        assert!(decode_owner_fill(&raw, &wallets, 16, 20).is_err());
+
+        let mut wrong_wallet = raw.clone();
+        wrong_wallet["topics"][2] = json!(topic("0x2222222222222222222222222222222222222222"));
+        assert!(decode_owner_fill(&wrong_wallet, &wallets, 11, 20).is_err());
+
+        let mut fills = BTreeMap::new();
+        insert_unique_owner_fill(&mut fills, fill.clone()).unwrap();
+        insert_unique_owner_fill(&mut fills, fill.clone()).unwrap();
+        assert_eq!(fills.len(), 1);
+        let mut changed = fill;
+        changed.transaction_index += 1;
+        assert_eq!(
+            insert_unique_owner_fill(&mut fills, changed),
+            Err(RpcPositionHistoryError::ConflictingLocator)
+        );
     }
 
     #[tokio::test]
