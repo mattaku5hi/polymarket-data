@@ -1,0 +1,9 @@
+/target/
+/.cargo-budget.lock
+.env
+.env.*
+!.env.example
+*.env
+*.pem
+*.key
+*.log

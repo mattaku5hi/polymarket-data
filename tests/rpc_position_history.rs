@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -30,12 +30,14 @@ const TX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 struct ServerState {
     mode: &'static str,
     count: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<Value>>>,
 }
 
 async fn server(mode: &'static str) -> (String, ServerState) {
     let state = ServerState {
         mode,
         count: Arc::new(AtomicUsize::new(0)),
+        requests: Arc::new(Mutex::new(Vec::new())),
     };
     let app = Router::new()
         .route("/rpc", post(handler))
@@ -52,8 +54,11 @@ async fn handler(State(state): State<ServerState>, request: Request<Body>) -> Re
     let n = state.count.fetch_add(1, Ordering::SeqCst);
     let bytes = to_bytes(request.into_body(), 64 * 1024).await.unwrap();
     let request: Value = serde_json::from_slice(&bytes).unwrap();
+    state.requests.lock().unwrap().push(request.clone());
     if state.mode == "delayed" {
         tokio::time::sleep(Duration::from_millis(100)).await;
+    } else if state.mode == "paged_delayed" && n >= 5 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
     if state.mode == "rate_limited" {
         return Response::builder()
@@ -85,13 +90,34 @@ async fn handler(State(state): State<ServerState>, request: Request<Body>) -> Re
             "0x89"
         }),
         "eth_getBlockByNumber" if request["params"][0] == "finalized" => header(
-            if state.mode == "not_final" { 14 } else { 20 },
-            &hash_for(20),
+            if state.mode == "not_final" {
+                14
+            } else if state.mode == "chunked" {
+                u64::MAX
+            } else {
+                1_000
+            },
+            &hash_for(if state.mode == "chunked" {
+                u64::MAX
+            } else {
+                1_000
+            }),
         ),
         "eth_getBlockByNumber" => {
-            let mut h = header(15, HASH15);
-            if state.mode == "anchor_change" && n == 5 {
-                h["hash"] = json!(hash_for(16));
+            let terminal = request["params"][0]
+                .as_str()
+                .and_then(|tag| u64::from_str_radix(tag.strip_prefix("0x").unwrap_or(""), 16).ok())
+                .unwrap_or(15);
+            let terminal_hash = if terminal == 15 {
+                HASH15.to_owned()
+            } else {
+                hash_for(terminal)
+            };
+            let mut h = header(terminal, &terminal_hash);
+            if (state.mode == "anchor_change" && n == 5)
+                || (state.mode == "anchor_change_paginated" && n == 9)
+            {
+                h["hash"] = json!(hash_for(terminal + 1));
             }
             if state.mode == "before_wrong" && n == 2 {
                 h["hash"] = json!(hash_for(16));
@@ -99,7 +125,23 @@ async fn handler(State(state): State<ServerState>, request: Request<Body>) -> Re
             h
         }
         "eth_getLogs" => {
-            if state.mode == "out_of_range" {
+            let filter = &request["params"][0];
+            let from = filter["fromBlock"].as_str().unwrap();
+            let from = u64::from_str_radix(from.trim_start_matches("0x"), 16).unwrap();
+            if matches!(state.mode, "chunked" | "paged_delayed")
+                || (from == 100
+                    && matches!(
+                        state.mode,
+                        "later_rpc_error" | "later_out_of_chunk" | "anchor_change_paginated"
+                    ))
+                || (state.mode == "anchor_change_paginated" && from > 100)
+            {
+                json!([log_at(from)])
+            } else if state.mode == "later_rpc_error" && from == 103 {
+                json!(null)
+            } else if state.mode == "later_out_of_chunk" && from == 103 {
+                json!([log_at(106)])
+            } else if state.mode == "out_of_range" {
                 json!([log(16)])
             } else if state.mode == "removed" {
                 let mut l = log(15);
@@ -132,7 +174,11 @@ async fn handler(State(state): State<ServerState>, request: Request<Body>) -> Re
         }
         _ => unreachable!(),
     };
-    let envelope = if state.mode == "rpc_error" {
+    let envelope = if state.mode == "rpc_error"
+        || (state.mode == "later_rpc_error"
+            && request["method"] == "eth_getLogs"
+            && request["params"][0]["fromBlock"] == "0x67")
+    {
         json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32000,"message":"sensitive-provider-detail"}})
     } else {
         json!({"jsonrpc":"2.0", "id":id, "result":result})
@@ -145,13 +191,21 @@ fn hash_for(number: u64) -> String {
 }
 fn header(number: u64, hash: &str) -> Value {
     json!({"number":format!("0x{number:x}"), "hash":hash, "parentHash":hash_for(number.saturating_sub(1)),
-        "stateRoot":hash_for(number + 1), "transactionsRoot":hash_for(number + 2), "receiptsRoot":hash_for(number + 3),
+        "stateRoot":hash_for(number.saturating_add(1)), "transactionsRoot":hash_for(number.saturating_add(2)), "receiptsRoot":hash_for(number.saturating_add(3)),
         "logsBloom":format!("0x{}", "00".repeat(256))})
 }
 fn log(number: u64) -> Value {
+    log_at(number)
+}
+fn log_at(number: u64) -> Value {
     let holder = format!("0x{:0>64}", &HOLDER[2..]);
+    let tx = if number == 15 {
+        TX.to_owned()
+    } else {
+        hash_for(number)
+    };
     json!({"address":CTF_EMITTER, "topics":[TRANSFER_SINGLE_TOPIC, hash_for(0), holder, holder], "data":"0x01",
-        "blockNumber":format!("0x{number:x}"), "blockHash":HASH15, "transactionHash":TX,
+        "blockNumber":format!("0x{number:x}"), "blockHash":if number == 15 { HASH15.to_owned() } else { hash_for(number) }, "transactionHash":tx,
         "transactionIndex":"0x2", "logIndex":"0x3", "removed":false})
 }
 fn request() -> RpcPositionHistoryRequest {
@@ -201,6 +255,283 @@ async fn sends_six_sequential_exact_scope_calls_and_collapses_self_transfer() {
         to["params"][0]["topics"][3],
         format!("0x{:0>64}", &HOLDER[2..])
     );
+}
+
+#[tokio::test]
+async fn paginated_reads_three_exact_contiguous_chunks_with_both_directions() {
+    let (reader, state) = make_reader("chunked").await;
+    let mut request = request();
+    request.from_block = 100;
+    request.through_block = 106;
+    request.expected_through_hash = hash_for(106);
+    request.max_requests = 10;
+    let observation = reader.read_history_paginated(&request, 3).await.unwrap();
+
+    assert_eq!(observation.request_count(), 10);
+    assert_eq!(observation.pages().len(), 10);
+    assert_eq!(observation.logs().len(), 3);
+    assert_eq!(
+        observation
+            .logs()
+            .iter()
+            .map(|log| log.block_number())
+            .collect::<Vec<_>>(),
+        [100, 103, 106]
+    );
+    assert_eq!(state.count.load(Ordering::SeqCst), 10);
+    let requests = state.requests.lock().unwrap();
+    let filters = requests
+        .iter()
+        .filter(|request| request["method"] == "eth_getLogs")
+        .map(|request| request["params"][0].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(filters.len(), 6);
+    for (index, bounds) in [("0x64", "0x66"), ("0x67", "0x69"), ("0x6a", "0x6a")]
+        .into_iter()
+        .enumerate()
+    {
+        for filter in [&filters[index * 2], &filters[index * 2 + 1]] {
+            assert_eq!(filter["fromBlock"], bounds.0);
+            assert_eq!(filter["toBlock"], bounds.1);
+            assert_eq!(
+                filter["address"],
+                json!([CTF_EMITTER, "0x006f54f7f9a22e0000cc2ab60031000000ae9fef"])
+            );
+            assert_eq!(
+                filter["topics"][0],
+                json!([TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC])
+            );
+        }
+        assert_eq!(
+            filters[index * 2]["topics"][2],
+            format!("0x{:0>64}", &HOLDER[2..])
+        );
+        assert!(filters[index * 2]["topics"][3].is_null());
+        assert!(filters[index * 2 + 1]["topics"][2].is_null());
+        assert_eq!(
+            filters[index * 2 + 1]["topics"][3],
+            format!("0x{:0>64}", &HOLDER[2..])
+        );
+    }
+    assert_eq!(requests[0]["method"], "eth_chainId");
+    assert_eq!(requests[1]["params"][0], "finalized");
+    assert_eq!(requests[2]["method"], "eth_getBlockByNumber");
+    assert_eq!(requests[9]["method"], "eth_getBlockByNumber");
+    assert_eq!(requests[9]["id"], 10);
+}
+
+#[tokio::test]
+async fn paginated_preflight_and_chunk_boundary_arithmetic_are_bounded() {
+    let (reader, state) = make_reader("chunked").await;
+    let mut request = request();
+    request.from_block = 7;
+    request.through_block = 12;
+    request.expected_through_hash = hash_for(12);
+    request.max_requests = 7;
+    assert_eq!(
+        reader
+            .read_history_paginated(&request, 3)
+            .await
+            .unwrap_err(),
+        RpcPositionHistoryError::RequestBudgetExceeded
+    );
+    assert_eq!(state.count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        reader
+            .read_history_paginated(&request, 0)
+            .await
+            .unwrap_err(),
+        RpcPositionHistoryError::InvalidInput
+    );
+    assert_eq!(state.count.load(Ordering::SeqCst), 0);
+
+    request.max_requests = 10;
+    let observation = reader.read_history_paginated(&request, 3).await.unwrap();
+    assert_eq!(observation.request_count(), 8);
+    let bounds = state
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["method"] == "eth_getLogs")
+        .map(|request| {
+            (
+                request["params"][0]["fromBlock"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                request["params"][0]["toBlock"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bounds,
+        [
+            ("0x7".into(), "0x9".into()),
+            ("0x7".into(), "0x9".into()),
+            ("0xa".into(), "0xc".into()),
+            ("0xa".into(), "0xc".into())
+        ]
+    );
+
+    let mut one_block = request.clone();
+    one_block.from_block = u64::MAX;
+    one_block.through_block = u64::MAX;
+    one_block.expected_through_hash = hash_for(u64::MAX);
+    one_block.max_requests = 6;
+    let (reader, _) = make_reader("chunked").await;
+    assert_eq!(
+        reader
+            .read_history_paginated(&one_block, 1)
+            .await
+            .unwrap()
+            .request_count(),
+        6
+    );
+
+    let mut top_range = one_block;
+    top_range.from_block = u64::MAX - 1;
+    top_range.max_requests = 6;
+    let (reader, state) = make_reader("chunked").await;
+    let observation = reader.read_history_paginated(&top_range, 2).await.unwrap();
+    assert_eq!(observation.request_count(), 6);
+    let top_chunk = state
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["method"] == "eth_getLogs")
+        .map(|request| {
+            (
+                request["params"][0]["fromBlock"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                request["params"][0]["toBlock"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        top_chunk,
+        [
+            (format!("0x{:x}", u64::MAX - 1), format!("0x{:x}", u64::MAX)),
+            (format!("0x{:x}", u64::MAX - 1), format!("0x{:x}", u64::MAX)),
+        ]
+    );
+
+    let mut legacy_full_range = request;
+    legacy_full_range.from_block = 0;
+    legacy_full_range.through_block = u64::MAX;
+    legacy_full_range.expected_through_hash = hash_for(u64::MAX);
+    legacy_full_range.max_requests = 6;
+    let (reader, _) = make_reader("chunked").await;
+    assert_eq!(
+        reader
+            .read_history(&legacy_full_range)
+            .await
+            .unwrap()
+            .request_count(),
+        6
+    );
+}
+
+#[tokio::test]
+async fn paginated_failure_in_later_chunk_returns_no_observation_and_shared_byte_budget_applies() {
+    let (reader, state) = make_reader("later_rpc_error").await;
+    let mut request = request();
+    request.from_block = 100;
+    request.through_block = 106;
+    request.expected_through_hash = hash_for(106);
+    request.max_requests = 10;
+    assert_eq!(
+        reader
+            .read_history_paginated(&request, 3)
+            .await
+            .unwrap_err(),
+        RpcPositionHistoryError::RpcError { code: -32000 }
+    );
+    assert_eq!(state.count.load(Ordering::SeqCst), 6);
+
+    let (reader, state) = make_reader("later_out_of_chunk").await;
+    assert_eq!(
+        reader
+            .read_history_paginated(&request, 3)
+            .await
+            .unwrap_err(),
+        RpcPositionHistoryError::MalformedResponse
+    );
+    assert_eq!(state.count.load(Ordering::SeqCst), 6);
+
+    let (reader, _) = make_reader("chunked").await;
+    let complete = reader.read_history_paginated(&request, 3).await.unwrap();
+    let (reader, state) = make_reader("chunked").await;
+    request.max_total_response_bytes = complete.response_bytes() - 1;
+    assert_eq!(
+        reader
+            .read_history_paginated(&request, 3)
+            .await
+            .unwrap_err(),
+        RpcPositionHistoryError::BodyBudgetExceeded
+    );
+    assert_eq!(state.count.load(Ordering::SeqCst), 10);
+}
+
+#[tokio::test]
+async fn paginated_rechecks_the_original_terminal_anchor_after_all_chunks() {
+    let (reader, state) = make_reader("anchor_change_paginated").await;
+    let mut request = request();
+    request.from_block = 100;
+    request.through_block = 106;
+    request.expected_through_hash = hash_for(106);
+    request.max_requests = 10;
+    assert_eq!(
+        reader
+            .read_history_paginated(&request, 3)
+            .await
+            .unwrap_err(),
+        RpcPositionHistoryError::AnchorMismatch
+    );
+    assert_eq!(state.count.load(Ordering::SeqCst), 10);
+}
+
+#[tokio::test]
+async fn paginated_reads_share_the_original_deadline() {
+    let (reader, state) = make_reader("paged_delayed").await;
+    let mut request = request();
+    request.from_block = 100;
+    request.through_block = 106;
+    request.expected_through_hash = hash_for(106);
+    request.max_requests = 10;
+    request.total_timeout = Duration::from_millis(500);
+    assert_eq!(
+        reader
+            .read_history_paginated(&request, 3)
+            .await
+            .unwrap_err(),
+        RpcPositionHistoryError::Timeout
+    );
+    assert_eq!(state.count.load(Ordering::SeqCst), 6);
+}
+
+#[tokio::test]
+async fn paginated_cancellation_after_a_complete_chunk_returns_no_observation() {
+    let (reader, state) = make_reader("paged_delayed").await;
+    let mut request = request();
+    request.from_block = 100;
+    request.through_block = 106;
+    request.expected_through_hash = hash_for(106);
+    request.max_requests = 10;
+    let task = tokio::spawn(async move { reader.read_history_paginated(&request, 3).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.count.load(Ordering::SeqCst) < 6 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first chunk completes before the next delayed call");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(state.count.load(Ordering::SeqCst), 6);
 }
 
 #[tokio::test]

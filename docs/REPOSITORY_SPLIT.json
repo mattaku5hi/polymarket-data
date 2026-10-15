@@ -1,0 +1,13 @@
+{
+  "format": "repository-split-frozen-input-v1",
+  "project": "polymarket-data",
+  "observed_at": "2026-10-15T13:13:44.691566+00:00",
+  "source_head": "1bdb88bf720259aa13d9e6124cfd549efba0574d",
+  "source_includes_nonignored_working_edits": true,
+  "bytes": 5651842,
+  "source_inventory_sha256": "04f104da3c399093194cd6894cf2665941cece03c17aa82391eca11dc35dd822",
+  "history_split_commit": "e4943fcba685aaaa3b75465fafbd0cad07d241b4",
+  "original_source_left_unchanged": true,
+  "added_build_profiles": "debug0/incrementalfalse",
+  "behavioral_controls_run": false
+}
