@@ -82,6 +82,7 @@ pub use fifth_binary_trades::{
     ProviderReportedFifthSettlement, ProviderReportedFifthSettlementError,
     ProviderReportedFifthWalletLeg, decode_provider_reported_fifth_binary_settlement,
     decode_provider_reported_fifth_settlement,
+    provider_reported_fifth_settlement_context_candidate,
 };
 pub use fifth_code_context::{
     BoundedFifthCodeContextError, FIFTH_CODE_CONTEXT_POLICY_VERSION, FifthCodeContextObservation,

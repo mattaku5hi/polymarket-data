@@ -19,6 +19,8 @@ use crate::position_history::{
 pub mod current_interval_census;
 pub mod current_interval_transactions;
 #[cfg(feature = "chain-audit")]
+pub mod current_wallet_flow;
+#[cfg(feature = "chain-audit")]
 pub mod fifth_binary_context;
 
 #[cfg(feature = "chain-audit")]

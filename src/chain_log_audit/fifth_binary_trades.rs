@@ -994,6 +994,21 @@ pub fn decode_provider_reported_fifth_binary_settlement(
     )
 }
 
+/// Return the provider-reported block anchor for a transaction sent to the
+/// fifth Exchange proxy. This only selects bounded registry-context reads;
+/// the settlement decoder remains responsible for validating the call.
+pub fn provider_reported_fifth_settlement_context_candidate(
+    transaction: &Value,
+) -> Option<(u64, String)> {
+    let to = field(transaction, "to").ok()?;
+    if !to.eq_ignore_ascii_case(EXCHANGE_ADDRESS) {
+        return None;
+    }
+    let block_number = parse_hex_u64(field(transaction, "blockNumber").ok()?).ok()?;
+    let block_hash = validate_hex(field(transaction, "blockHash").ok()?, 32).ok()?;
+    Some((block_number, block_hash))
+}
+
 fn derive_provider_reported_binary_pair(
     call: &FifthMatchOrdersCall,
     owner: Address,

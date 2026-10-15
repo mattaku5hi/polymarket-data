@@ -136,14 +136,15 @@ pub fn decode_provider_reported_maker_fill(
     if !is_v1 && !is_v2 {
         return Err(ProviderReportedMakerFillError::UnsupportedExchange);
     }
-    let row = normalize_provider_reported_log(envelope, 5 * 32)?;
+    let abi_words = if is_v1 { 5 } else { 7 };
+    let row = normalize_provider_reported_log(envelope, abi_words * 32)?;
     let block_number = row.block_number;
     let log_index = row.log_index;
     let block_hash = row.block_hash;
     let transaction_hash = row.transaction_hash;
     let topics = row.topics;
     let data = row.data;
-    if topics.len() != 4 || data.len() != 2 + 5 * 64 {
+    if topics.len() != 4 || data.len() != 2 + abi_words * 64 {
         return Err(ProviderReportedMakerFillError::MalformedLog);
     }
 
@@ -216,6 +217,69 @@ mod tests {
         })
     }
 
+    fn v2_words(
+        side: u128,
+        token_id: &str,
+        maker_amount_filled: u128,
+        taker_amount_filled: u128,
+        fee: u128,
+        builder: &str,
+        metadata: &str,
+    ) -> [String; 7] {
+        [
+            word(side),
+            token_id.trim_start_matches("0x").to_owned(),
+            word(maker_amount_filled),
+            word(taker_amount_filled),
+            word(fee),
+            builder.trim_start_matches("0x").to_owned(),
+            metadata.trim_start_matches("0x").to_owned(),
+        ]
+    }
+
+    fn log_v2(exchange: &str, topic: &str) -> Value {
+        log_with_v2_data(
+            exchange,
+            topic,
+            v2_words(
+                0,
+                &format!("0x{}", "00".repeat(31) + "7b"),
+                5_000_000,
+                7_000_000,
+                9,
+                &format!("0x{}", "44".repeat(32)),
+                &format!("0x{}", "55".repeat(32)),
+            ),
+            "0x2222222222222222222222222222222222222222",
+        )
+    }
+
+    fn log_with_v2_data(
+        exchange: &str,
+        topic: &str,
+        words: [String; 7],
+        counterparty: &str,
+    ) -> Value {
+        let owner = "0x1111111111111111111111111111111111111111";
+        let data = words.concat();
+        json!({
+            "address": exchange,
+            "blockNumber": "0x64",
+            "blockHash": format!("0x{}", "aa".repeat(32)),
+            "transactionHash": format!("0x{}", "bb".repeat(32)),
+            "transactionIndex": "0x1",
+            "logIndex": "0x2",
+            "topics": [
+                topic,
+                format!("0x{}", "33".repeat(32)),
+                address_topic(owner),
+                address_topic(counterparty),
+            ],
+            "data": format!("0x{data}"),
+            "removed": false,
+        })
+    }
+
     #[test]
     fn decodes_provider_reported_v1_and_v2_gross_fill_with_separate_fee() {
         let v1 = decode_provider_reported_maker_fill(&log(EXCHANGES[0], V1_ORDER_FILLED))
@@ -237,9 +301,10 @@ mod tests {
         assert_eq!(v1.fee_base_units, 9);
         assert_eq!(v1.fee_asset, FeeAsset::OutcomeToken);
 
-        let v2 = decode_provider_reported_maker_fill(&log(EXCHANGES[2], V2_ORDER_FILLED))
+        let v2 = decode_provider_reported_maker_fill(&log_v2(EXCHANGES[2], V2_ORDER_FILLED))
             .expect("known V2 event");
         assert_eq!(v2.decoder_version, CtfDecoderVersion::V2);
+        assert_eq!(v2.token_id, "123");
         assert_eq!(v2.side, TradeSide::Buy);
         assert_eq!(v2.share_base_units, 7_000_000);
         assert_eq!(v2.collateral_base_units, 5_000_000);
@@ -263,10 +328,18 @@ mod tests {
         assert_eq!(v1.fee_asset, FeeAsset::Collateral);
         assert!(v1.exchange_counterparty_aggregate_shape);
 
-        let v2 = decode_provider_reported_maker_fill(&log_with_data(
+        let v2 = decode_provider_reported_maker_fill(&log_with_v2_data(
             EXCHANGES[2],
             V2_ORDER_FILLED,
-            [1, 123, 7_000_000, 5_000_000, 9],
+            v2_words(
+                1,
+                &format!("0x{}", "01".repeat(32)),
+                7_000_000,
+                5_000_000,
+                9,
+                &format!("0x{}", "22".repeat(32)),
+                &format!("0x{}", "33".repeat(32)),
+            ),
             "0x2222222222222222222222222222222222222222",
         ))
         .expect("known V2 SELL event");
@@ -276,6 +349,71 @@ mod tests {
         assert_eq!(v2.fee_base_units, 9);
         assert_eq!(v2.fee_asset, FeeAsset::Collateral);
         assert!(!v2.exchange_counterparty_aggregate_shape);
+    }
+
+    #[test]
+    fn decodes_full_width_v2_token_and_requires_all_seven_source_abi_words() {
+        let token_id = format!("0x{}", "ff".repeat(32));
+        let builder = format!("0x{}", "a5".repeat(32));
+        let metadata = format!("0x{}", "5a".repeat(32));
+        let v2 = log_with_v2_data(
+            EXCHANGES[2],
+            V2_ORDER_FILLED,
+            v2_words(0, &token_id, 5_000_000, 7_000_000, 9, &builder, &metadata),
+            "0x2222222222222222222222222222222222222222",
+        );
+        let fill = decode_provider_reported_maker_fill(&v2).expect("canonical seven-word V2");
+        assert_eq!(fill.decoder_version, CtfDecoderVersion::V2);
+        assert_eq!(
+            fill.token_id,
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+        assert_eq!(fill.share_base_units, 7_000_000);
+        assert_eq!(fill.collateral_base_units, 5_000_000);
+        assert_eq!(fill.fee_base_units, 9);
+        assert_eq!(fill.fee_asset, FeeAsset::Collateral);
+        // The builder and metadata words remain in the provider's original frame.
+        assert!(v2["data"].as_str().unwrap().ends_with(&format!(
+            "{}{}",
+            &builder[2..],
+            &metadata[2..]
+        )));
+
+        for word_count in [5, 6, 8] {
+            let mut malformed = v2.clone();
+            let mut words = malformed["data"].as_str().unwrap().as_bytes()[2..]
+                .chunks(64)
+                .map(|word| std::str::from_utf8(word).unwrap().to_owned())
+                .collect::<Vec<_>>();
+            words.truncate(word_count.min(words.len()));
+            if word_count == 8 {
+                words.push("00".repeat(32));
+            }
+            malformed["data"] = Value::String(format!("0x{}", words.concat()));
+            assert_eq!(
+                decode_provider_reported_maker_fill(&malformed),
+                Err(Error::MalformedLog),
+                "word count {word_count}"
+            );
+        }
+
+        let mut short_v1 = log(EXCHANGES[0], V1_ORDER_FILLED);
+        short_v1["data"] = Value::String(format!(
+            "{}{}",
+            short_v1["data"].as_str().unwrap(),
+            "00".repeat(32)
+        ));
+        assert_eq!(
+            decode_provider_reported_maker_fill(&short_v1),
+            Err(Error::MalformedLog)
+        );
+
+        let mut wrong_topic = v2;
+        wrong_topic["topics"][0] = Value::String(V1_ORDER_FILLED.to_owned());
+        assert_eq!(
+            decode_provider_reported_maker_fill(&wrong_topic),
+            Err(Error::MalformedLog)
+        );
     }
 
     #[test]
@@ -314,7 +452,7 @@ mod tests {
             Err(Error::MalformedLog)
         );
 
-        let mut short_topics = log(EXCHANGES[2], V2_ORDER_FILLED);
+        let mut short_topics = log_v2(EXCHANGES[2], V2_ORDER_FILLED);
         short_topics["topics"] = json!(
             short_topics["topics"]
                 .as_array()
@@ -329,7 +467,7 @@ mod tests {
             Err(Error::MalformedLog)
         );
 
-        let mut wrong_topic = log(EXCHANGES[2], V1_ORDER_FILLED);
+        let mut wrong_topic = log_v2(EXCHANGES[2], V1_ORDER_FILLED);
         assert_eq!(
             decode_provider_reported_maker_fill(&wrong_topic),
             Err(Error::MalformedLog)
