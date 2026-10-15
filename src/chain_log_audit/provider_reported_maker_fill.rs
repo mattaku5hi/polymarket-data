@@ -25,15 +25,44 @@ pub enum ProviderReportedMakerFillError {
     UnsupportedExchange,
 }
 
-/// Decode one bounded JSON-RPC log into the existing gross-plus-fee CTF fill
-/// shape. Only known first-party CTF V1/V2 exchange address/topic pairs are
-/// accepted; the fifth exchange and unknown emitters remain unsupported.
-pub fn decode_provider_reported_maker_fill(
+pub(super) struct ProviderReportedLogEnvelope {
+    pub(super) block_number: u64,
+    pub(super) transaction_index: u64,
+    pub(super) log_index: u64,
+    pub(super) address: String,
+    block_hash: String,
+    transaction_hash: String,
+    topics: Vec<String>,
+    data: String,
+}
+
+pub(super) struct NormalizedProviderReportedLog {
+    pub(super) block_number: u64,
+    pub(super) block_hash: String,
+    pub(super) transaction_hash: String,
+    pub(super) transaction_index: u64,
+    pub(super) log_index: u64,
+    pub(super) address: String,
+    pub(super) topics: Vec<String>,
+    pub(super) data: String,
+}
+
+pub(super) fn parse_provider_reported_log_envelope(
     raw_log: &Value,
-) -> Result<ChainMakerFill, ProviderReportedMakerFillError> {
+) -> Result<ProviderReportedLogEnvelope, ProviderReportedMakerFillError> {
+    parse_provider_reported_log_envelope_with_limit(
+        raw_log,
+        PROVIDER_REPORTED_MAKER_FILL_LOG_MAX_BYTES,
+    )
+}
+
+pub(super) fn parse_provider_reported_log_envelope_with_limit(
+    raw_log: &Value,
+    max_bytes: usize,
+) -> Result<ProviderReportedLogEnvelope, ProviderReportedMakerFillError> {
     let encoded =
         serde_json::to_vec(raw_log).map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
-    if encoded.len() > PROVIDER_REPORTED_MAKER_FILL_LOG_MAX_BYTES {
+    if encoded.len() > max_bytes {
         return Err(ProviderReportedMakerFillError::MalformedLog);
     }
     let row: RpcLog = serde_json::from_value(raw_log.clone())
@@ -41,18 +70,63 @@ pub fn decode_provider_reported_maker_fill(
     if row.removed {
         return Err(ProviderReportedMakerFillError::RemovedLog);
     }
-
-    let block_number = parse_hex_u64(&row.block_number)
-        .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
     let transaction_index = raw_log
         .get("transactionIndex")
         .and_then(Value::as_str)
         .ok_or(ProviderReportedMakerFillError::MalformedLog)?;
-    parse_hex_u64(transaction_index).map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
-    let log_index =
-        parse_hex_u64(&row.log_index).map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
-    let address =
-        validate_hex(&row.address, 20).map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
+    Ok(ProviderReportedLogEnvelope {
+        block_number: parse_hex_u64(&row.block_number)
+            .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?,
+        transaction_index: parse_hex_u64(transaction_index)
+            .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?,
+        log_index: parse_hex_u64(&row.log_index)
+            .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?,
+        address: validate_hex(&row.address, 20)
+            .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?,
+        block_hash: row.block_hash,
+        transaction_hash: row.transaction_hash,
+        topics: row.topics,
+        data: row.data,
+    })
+}
+
+pub(super) fn normalize_provider_reported_log(
+    row: ProviderReportedLogEnvelope,
+    data_limit_bytes: usize,
+) -> Result<NormalizedProviderReportedLog, ProviderReportedMakerFillError> {
+    let block_hash = validate_hex(&row.block_hash, 32)
+        .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
+    let transaction_hash = validate_hex(&row.transaction_hash, 32)
+        .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
+    let topics = row
+        .topics
+        .iter()
+        .map(|topic| {
+            validate_hex(topic, 32).map_err(|_| ProviderReportedMakerFillError::MalformedLog)
+        })
+        .collect::<Result<_, _>>()?;
+    let data = validate_hex_data_with_limit(&row.data, data_limit_bytes)
+        .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
+    Ok(NormalizedProviderReportedLog {
+        block_number: row.block_number,
+        block_hash,
+        transaction_hash,
+        transaction_index: row.transaction_index,
+        log_index: row.log_index,
+        address: row.address,
+        topics,
+        data,
+    })
+}
+
+/// Decode one bounded JSON-RPC log into the existing gross-plus-fee CTF fill
+/// shape. Only known first-party CTF V1/V2 exchange address/topic pairs are
+/// accepted; the fifth exchange and unknown emitters remain unsupported.
+pub fn decode_provider_reported_maker_fill(
+    raw_log: &Value,
+) -> Result<ChainMakerFill, ProviderReportedMakerFillError> {
+    let envelope = parse_provider_reported_log_envelope(raw_log)?;
+    let address = envelope.address.clone();
     let is_v1 = EXCHANGES[..2]
         .iter()
         .any(|exchange| exchange.eq_ignore_ascii_case(&address));
@@ -62,19 +136,13 @@ pub fn decode_provider_reported_maker_fill(
     if !is_v1 && !is_v2 {
         return Err(ProviderReportedMakerFillError::UnsupportedExchange);
     }
-    let block_hash = validate_hex(&row.block_hash, 32)
-        .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
-    let transaction_hash = validate_hex(&row.transaction_hash, 32)
-        .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
-    let topics: Vec<String> = row
-        .topics
-        .iter()
-        .map(|topic| {
-            validate_hex(topic, 32).map_err(|_| ProviderReportedMakerFillError::MalformedLog)
-        })
-        .collect::<Result<_, _>>()?;
-    let data = validate_hex_data_with_limit(&row.data, 5 * 32)
-        .map_err(|_| ProviderReportedMakerFillError::MalformedLog)?;
+    let row = normalize_provider_reported_log(envelope, 5 * 32)?;
+    let block_number = row.block_number;
+    let log_index = row.log_index;
+    let block_hash = row.block_hash;
+    let transaction_hash = row.transaction_hash;
+    let topics = row.topics;
+    let data = row.data;
     if topics.len() != 4 || data.len() != 2 + 5 * 64 {
         return Err(ProviderReportedMakerFillError::MalformedLog);
     }

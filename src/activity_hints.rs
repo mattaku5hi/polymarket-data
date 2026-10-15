@@ -295,6 +295,7 @@ impl PolymarketActivityHintClient {
         let base_url = validate_base_url(base_url)?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|_| ActivityHintInputError::InvalidEndpoint)?;
         Ok(Self { base_url, client })

@@ -55,6 +55,7 @@ mod fifth_native_module_operations;
 mod fifth_native_two_condition_activity;
 mod fifth_native_two_condition_splits;
 mod fifth_native_two_condition_trades;
+mod fifth_provider_reported_event;
 mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
 mod known_position_balances;
@@ -68,11 +69,19 @@ pub use ctf_operations::{
     CtfOperationClassificationEvidence, CtfOperationKind, CtfOperationTransactionFact,
     CtfOperationTransactionStatus,
 };
+#[cfg(test)]
+pub(crate) use fifth_binary_trades::tests::{
+    provider_mint_refund_settlement, provider_normal_buy_settlement,
+};
 pub use fifth_binary_trades::{
     BoundedFifthLegacyBinaryTradeError, FIFTH_LEGACY_BINARY_TRADE_POLICY_VERSION,
-    FifthLegacyBinaryTradeObservation, FifthLegacyBinaryTradeStatus,
-    FifthLegacyBinaryTradeUnavailableReason, FifthTradeBranch, FifthTradeOrderFillFact,
-    FifthTradeOwnerRole, FifthTradeTransactionFact,
+    FIFTH_PROVIDER_REPORTED_SETTLEMENT_POLICY_VERSION, FifthLegacyBinaryTradeObservation,
+    FifthLegacyBinaryTradeStatus, FifthLegacyBinaryTradeUnavailableReason, FifthTradeBranch,
+    FifthTradeOrderFillFact, FifthTradeOwnerRole, FifthTradeTransactionFact,
+    ProviderReportedFifthAsset, ProviderReportedFifthDirection, ProviderReportedFifthOwnerFill,
+    ProviderReportedFifthSettlement, ProviderReportedFifthSettlementError,
+    ProviderReportedFifthWalletLeg, decode_provider_reported_fifth_binary_settlement,
+    decode_provider_reported_fifth_settlement,
 };
 pub use fifth_code_context::{
     BoundedFifthCodeContextError, FIFTH_CODE_CONTEXT_POLICY_VERSION, FifthCodeContextObservation,
@@ -155,6 +164,13 @@ pub use fifth_native_two_condition_trades::{
     BoundedFifthNativeBinaryTwoConditionTradeError,
     FIFTH_NATIVE_TWO_CONDITION_TRADE_POLICY_VERSION, FifthNativeBinaryTwoConditionTradeObservation,
     FifthNativeTwoConditionTradeTransaction,
+};
+pub use fifth_provider_reported_event::{
+    FIFTH_PROVIDER_REPORTED_EVENT_LOG_MAX_BYTES, FIFTH_PROVIDER_REPORTED_EVENT_POLICY_VERSION,
+    FifthEventImplementationVersion, FifthEventObservationSource, ProviderReportedFifthEvent,
+    ProviderReportedFifthEventError, ProviderReportedFifthEventKind,
+    ProviderReportedFifthOrderFilled, ProviderReportedFifthOrdersMatched,
+    decode_provider_reported_fifth_event,
 };
 pub use fifth_receipt_maker_window::{
     BoundedFifthReceiptMakerWindowError, FIFTH_RECEIPT_MAKER_WINDOW_POLICY_VERSION,
@@ -10394,13 +10410,7 @@ fn exact_v1_direct_transfer_logs<'a>(
 fn decode_movement_observations(logs: &[ChainReceiptLog]) -> Vec<RawMovementObservation> {
     logs.iter()
         .filter_map(|log| {
-            let topic = log.topics.first()?.as_str();
-            let movement = match topic {
-                ERC20_TRANSFER => decode_erc20_transfer(log),
-                ERC1155_TRANSFER_SINGLE => decode_erc1155_single(log),
-                ERC1155_TRANSFER_BATCH => decode_erc1155_batch(log),
-                _ => return None,
-            };
+            let movement = decode_movement_fields(&log.topics, &log.data)?;
             Some(RawMovementObservation {
                 transaction_hash: log.transaction_hash.clone(),
                 transaction_index: log.transaction_index,
@@ -10415,15 +10425,34 @@ fn decode_movement_observations(logs: &[ChainReceiptLog]) -> Vec<RawMovementObse
         .collect()
 }
 
+fn decode_movement_fields(
+    topics: &[String],
+    data: &str,
+) -> Option<Result<ObservedAssetMovement, UnsupportedMovementReason>> {
+    match topics.first()?.as_str() {
+        ERC20_TRANSFER => Some(decode_erc20_transfer_fields(topics, data)),
+        ERC1155_TRANSFER_SINGLE => Some(decode_erc1155_single_fields(topics, data)),
+        ERC1155_TRANSFER_BATCH => Some(decode_erc1155_batch_fields(topics, data)),
+        _ => None,
+    }
+}
+
 fn decode_erc20_transfer(
     log: &ChainReceiptLog,
 ) -> Result<ObservedAssetMovement, UnsupportedMovementReason> {
-    if log.topics.len() != 3 {
+    decode_erc20_transfer_fields(&log.topics, &log.data)
+}
+
+fn decode_erc20_transfer_fields(
+    topics: &[String],
+    encoded_data: &str,
+) -> Result<ObservedAssetMovement, UnsupportedMovementReason> {
+    if topics.len() != 3 {
         return Err(UnsupportedMovementReason::WrongTopicCount);
     }
-    let from = indexed_address(&log.topics[1])?;
-    let to = indexed_address(&log.topics[2])?;
-    let data = movement_data(&log.data)?;
+    let from = indexed_address(&topics[1])?;
+    let to = indexed_address(&topics[2])?;
+    let data = movement_data(encoded_data)?;
     if data.len() != 32 {
         return Err(UnsupportedMovementReason::WrongDataLength);
     }
@@ -10464,12 +10493,6 @@ fn decode_erc1155_single_fields(
             Err(UnsupportedMovementReason::WrongTopicCount)
         }
     }
-}
-
-fn decode_erc1155_batch(
-    log: &ChainReceiptLog,
-) -> Result<ObservedAssetMovement, UnsupportedMovementReason> {
-    decode_erc1155_batch_fields(&log.topics, &log.data)
 }
 
 fn decode_erc1155_batch_fields(

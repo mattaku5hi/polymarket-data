@@ -16,9 +16,9 @@ use super::fifth_code_context::{EXCHANGE_PROXY, POSITION_MANAGER_PROXY};
 
 pub const FIFTH_RECEIPT_MAKER_WINDOW_POLICY_VERSION: &str =
     "fifth-exchange-rooted-receipt-maker-window/1";
-const ORDER_FILLED_SIGNATURE: &str =
+pub(super) const ORDER_FILLED_SIGNATURE: &str =
     "OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)";
-const ORDERS_MATCHED_SIGNATURE: &str =
+pub(super) const ORDERS_MATCHED_SIGNATURE: &str =
     "OrdersMatched(bytes32,address,uint8,uint256,uint256,uint256)";
 const UPGRADED_SIGNATURE: &str = "Upgraded(address)";
 
@@ -197,17 +197,17 @@ impl FifthReceiptMakerWindow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedOrderFilled {
-    order_hash: B256,
-    maker: String,
-    taker: String,
-    side: TradeSide,
-    token_id: U256,
-    maker_amount_filled: U256,
-    taker_amount_filled: U256,
-    fee_amount: U256,
-    builder: B256,
-    metadata: B256,
+pub(super) struct ParsedOrderFilled {
+    pub(super) order_hash: B256,
+    pub(super) maker: String,
+    pub(super) taker: String,
+    pub(super) side: TradeSide,
+    pub(super) token_id: U256,
+    pub(super) maker_amount_filled: U256,
+    pub(super) taker_amount_filled: U256,
+    pub(super) fee_amount: U256,
+    pub(super) builder: B256,
+    pub(super) metadata: B256,
 }
 
 impl ChainLogVerifier {
@@ -485,8 +485,14 @@ fn is_fifth_proxy_upgrade(log: &ChainReceiptLog) -> bool {
 fn decode_fifth_order_filled(
     log: &ChainReceiptLog,
 ) -> Result<ParsedOrderFilled, ChainLogAuditError> {
-    let topics = log.topics();
-    if topics.len() != 4 || log.data().len() != 2 + 7 * 64 {
+    decode_fifth_order_filled_fields(log.topics(), log.data())
+}
+
+pub(super) fn decode_fifth_order_filled_fields(
+    topics: &[String],
+    encoded_data: &str,
+) -> Result<ParsedOrderFilled, ChainLogAuditError> {
+    if topics.len() != 4 || encoded_data.len() != 2 + 7 * 64 {
         return Err(ChainLogAuditError::Unverified);
     }
     let order_hash = parse_fixed_b256(&topics[1])?;
@@ -496,7 +502,7 @@ fn decode_fifth_order_filled(
         return Err(ChainLogAuditError::Unverified);
     }
     let data = hex::decode(
-        log.data()
+        encoded_data
             .strip_prefix("0x")
             .ok_or(ChainLogAuditError::Unverified)?,
     )
@@ -533,14 +539,20 @@ fn decode_fifth_order_filled(
 fn decode_fifth_orders_matched(
     log: &ChainReceiptLog,
 ) -> Result<ParsedOrderFilled, ChainLogAuditError> {
-    let topics = log.topics();
-    if topics.len() != 3 || log.data().len() != 2 + 4 * 64 {
+    decode_fifth_orders_matched_fields(log.topics(), log.data())
+}
+
+pub(super) fn decode_fifth_orders_matched_fields(
+    topics: &[String],
+    encoded_data: &str,
+) -> Result<ParsedOrderFilled, ChainLogAuditError> {
+    if topics.len() != 3 || encoded_data.len() != 2 + 4 * 64 {
         return Err(ChainLogAuditError::Unverified);
     }
     let order_hash = parse_fixed_b256(&topics[1])?;
     let maker = topic_address(&topics[2]).ok_or(ChainLogAuditError::Unverified)?;
     let data = hex::decode(
-        log.data()
+        encoded_data
             .strip_prefix("0x")
             .ok_or(ChainLogAuditError::Unverified)?,
     )

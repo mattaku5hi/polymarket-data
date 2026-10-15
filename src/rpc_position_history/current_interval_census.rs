@@ -18,9 +18,9 @@ use crate::chain_log_audit::{
 
 use super::{
     CurrentIntervalLogFamily, MAX_HISTORY_REQUESTS, MAX_HISTORY_TOTAL_BYTES, RPC_CHAIN_ID,
-    ReadState, RpcCallSource, RpcPositionHistoryError, RpcPositionHistoryPage,
-    RpcPositionHistoryReader, RpcPositionHistoryRequest, RpcPositionHistoryRequestPhase,
-    parse_header, parse_quantity, quantity,
+    ReadState, RecordedRpcPositionHistoryPage, RpcCallSource, RpcPositionHistoryError,
+    RpcPositionHistoryPage, RpcPositionHistoryReader, RpcPositionHistoryRequest,
+    RpcPositionHistoryRequestPhase, parse_header, parse_quantity, quantity,
 };
 use crate::{
     collateral_cash::{PUSD_ADDRESS, USDCE_ADDRESS},
@@ -30,6 +30,9 @@ use crate::{
         normalize_log,
     },
 };
+
+#[cfg(feature = "chain-audit")]
+pub mod portfolio_flow;
 
 const ERC20_TRANSFER_TOPIC: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -160,7 +163,20 @@ impl RpcPositionHistoryReader {
         &self,
         request: &RpcCurrentIntervalCensusRequest,
     ) -> Result<RpcCurrentIntervalCensus, RpcPositionHistoryError> {
-        self.read_current_interval_inner(request, false)
+        self.read_current_interval_census_chunked(request, LOG_CHUNK_BLOCKS)
+            .await
+    }
+
+    /// Read a current interval using bounded log queries no wider than the
+    /// requested number of blocks. The transport and total request limits
+    /// still apply to the complete census.
+    pub async fn read_current_interval_census_chunked(
+        &self,
+        request: &RpcCurrentIntervalCensusRequest,
+        max_blocks_per_log_query: u64,
+    ) -> Result<RpcCurrentIntervalCensus, RpcPositionHistoryError> {
+        let mut source = RpcCallSource::network(self, false);
+        Self::read_current_interval_inner(request, false, max_blocks_per_log_query, &mut source)
             .await
             .map(|(census, _)| census)
     }
@@ -173,7 +189,22 @@ impl RpcPositionHistoryReader {
         &self,
         request: &RpcCurrentIntervalCensusRequest,
     ) -> Result<RpcCurrentIntervalOwnerFillCensus, RpcPositionHistoryError> {
-        let (census, owner_fills) = self.read_current_interval_inner(request, true).await?;
+        self.read_current_interval_owner_fills_chunked(request, LOG_CHUNK_BLOCKS)
+            .await
+    }
+
+    /// Read owner fills with the same bounded chunk width used by the transfer
+    /// census. Every chunk uses identical filters in live and recorded reads.
+    #[cfg(feature = "chain-audit")]
+    pub async fn read_current_interval_owner_fills_chunked(
+        &self,
+        request: &RpcCurrentIntervalCensusRequest,
+        max_blocks_per_log_query: u64,
+    ) -> Result<RpcCurrentIntervalOwnerFillCensus, RpcPositionHistoryError> {
+        let mut source = RpcCallSource::network(self, false);
+        let (census, owner_fills) =
+            Self::read_current_interval_inner(request, true, max_blocks_per_log_query, &mut source)
+                .await?;
         Ok(RpcCurrentIntervalOwnerFillCensus {
             census,
             owner_fills,
@@ -181,10 +212,14 @@ impl RpcPositionHistoryReader {
     }
 
     async fn read_current_interval_inner(
-        &self,
         request: &RpcCurrentIntervalCensusRequest,
         include_owner_fills: bool,
+        max_blocks_per_log_query: u64,
+        source: &mut RpcCallSource<'_>,
     ) -> Result<(RpcCurrentIntervalCensus, OwnerFillResult), RpcPositionHistoryError> {
+        if !(1..=LOG_CHUNK_BLOCKS).contains(&max_blocks_per_log_query) {
+            return Err(RpcPositionHistoryError::InvalidInput);
+        }
         if request.wallets.is_empty() || request.wallets.len() > MAX_WALLETS {
             return Err(RpcPositionHistoryError::InvalidInput);
         }
@@ -219,7 +254,7 @@ impl RpcPositionHistoryReader {
         {
             return Err(RpcPositionHistoryError::InvalidInput);
         }
-        let chunks = span.div_ceil(LOG_CHUNK_BLOCKS);
+        let chunks = span.div_ceil(max_blocks_per_log_query);
         // Five chain/finality/anchor calls, four filters per chunk, and at
         // most one timestamp header per distinct event block.
         let filters_per_chunk = if include_owner_fills { 5 } else { 4 };
@@ -251,8 +286,6 @@ impl RpcPositionHistoryReader {
             response_bytes: 0,
             next_id: 1,
         };
-        let mut source = RpcCallSource::network(self, false);
-
         let chain = source
             .call(
                 "eth_chainId",
@@ -327,7 +360,7 @@ impl RpcPositionHistoryReader {
         let mut chunk_start = log_from_block;
         while chunk_start <= request.through_block {
             let chunk_end = chunk_start
-                .saturating_add(LOG_CHUNK_BLOCKS - 1)
+                .saturating_add(max_blocks_per_log_query - 1)
                 .min(request.through_block);
             for (index, base_filter) in base_filters.iter().enumerate() {
                 let direction = if index % 2 == 0 {
@@ -535,6 +568,74 @@ impl RpcPositionHistoryReader {
         let fills = ();
         Ok((census, fills))
     }
+}
+
+/// Replays captured four-filter RPC frames without creating a network client.
+/// Timing fields report this local replay, not the original capture window.
+pub async fn reverify_recorded_current_interval_census(
+    request: &RpcCurrentIntervalCensusRequest,
+    pages: &[RecordedRpcPositionHistoryPage],
+) -> Result<RpcCurrentIntervalCensus, RpcPositionHistoryError> {
+    reverify_recorded_current_interval_census_chunked(request, pages, LOG_CHUNK_BLOCKS).await
+}
+
+/// Replays captured census frames using the chunk width expected by the
+/// capture. A transcript recorded with another width fails request validation.
+pub async fn reverify_recorded_current_interval_census_chunked(
+    request: &RpcCurrentIntervalCensusRequest,
+    pages: &[RecordedRpcPositionHistoryPage],
+    max_blocks_per_log_query: u64,
+) -> Result<RpcCurrentIntervalCensus, RpcPositionHistoryError> {
+    let mut source = RpcCallSource::Recorded {
+        pages,
+        next_page: 0,
+    };
+    let (census, _) = RpcPositionHistoryReader::read_current_interval_inner(
+        request,
+        false,
+        max_blocks_per_log_query,
+        &mut source,
+    )
+    .await?;
+    source.finish()?;
+    Ok(census)
+}
+
+/// Replays captured RPC frames without creating a reader or network client.
+/// The census timing fields report this local replay, not the original capture window;
+/// callers should retain original capture times alongside the recorded frames.
+#[cfg(feature = "chain-audit")]
+pub async fn reverify_recorded_current_interval_owner_fills(
+    request: &RpcCurrentIntervalCensusRequest,
+    pages: &[RecordedRpcPositionHistoryPage],
+) -> Result<RpcCurrentIntervalOwnerFillCensus, RpcPositionHistoryError> {
+    reverify_recorded_current_interval_owner_fills_chunked(request, pages, LOG_CHUNK_BLOCKS).await
+}
+
+/// Replays owner-fill frames using the chunk width expected by the capture.
+/// A transcript recorded with another width fails request validation.
+#[cfg(feature = "chain-audit")]
+pub async fn reverify_recorded_current_interval_owner_fills_chunked(
+    request: &RpcCurrentIntervalCensusRequest,
+    pages: &[RecordedRpcPositionHistoryPage],
+    max_blocks_per_log_query: u64,
+) -> Result<RpcCurrentIntervalOwnerFillCensus, RpcPositionHistoryError> {
+    let mut source = RpcCallSource::Recorded {
+        pages,
+        next_page: 0,
+    };
+    let (census, owner_fills) = RpcPositionHistoryReader::read_current_interval_inner(
+        request,
+        true,
+        max_blocks_per_log_query,
+        &mut source,
+    )
+    .await?;
+    source.finish()?;
+    Ok(RpcCurrentIntervalOwnerFillCensus {
+        census,
+        owner_fills,
+    })
 }
 
 fn read_header(
@@ -1410,6 +1511,7 @@ mod tests {
                 let filter = &params[0];
                 if filter["address"] == json!([PUSD_ADDRESS, USDCE_ADDRESS])
                     && filter["topics"][0] == ERC20_TRANSFER_TOPIC
+                    && filter_contains_block(filter, 15)
                     && filter["topics"][1].as_array().is_some_and(|topics| {
                         topics
                             .iter()
@@ -1420,6 +1522,7 @@ mod tests {
                 } else if filter["address"] == json!(TEST_OWNER_FILL_EXCHANGES)
                     && filter["topics"][0]
                         == json!([TEST_V1_ORDER_FILLED_TOPIC, TEST_V2_ORDER_FILLED_TOPIC])
+                    && filter_contains_block(filter, 15)
                 {
                     json!([mock_owner_fill()])
                 } else {
@@ -1429,6 +1532,11 @@ mod tests {
             _ => panic!("unexpected method"),
         };
         Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}))
+    }
+
+    fn filter_contains_block(filter: &Value, block: u64) -> bool {
+        parse_quantity(&filter["fromBlock"]).is_some_and(|from| from <= block)
+            && parse_quantity(&filter["toBlock"]).is_some_and(|through| block <= through)
     }
 
     fn mock_header(number: u64) -> Value {
@@ -1552,6 +1660,236 @@ mod tests {
                 .count(),
             4
         );
+        let recorded_pages = observation
+            .requests
+            .iter()
+            .map(|page| RecordedRpcPositionHistoryPage {
+                request_json: page.request_json().to_owned(),
+                response_json: page.response_json().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let replayed = reverify_recorded_current_interval_census(&request, &recorded_pages)
+            .await
+            .unwrap();
+        assert_eq!(replayed.wallets, observation.wallets);
+        assert_eq!(replayed.start_header, observation.start_header);
+        assert_eq!(replayed.end_header, observation.end_header);
+        assert_eq!(replayed.event_headers, observation.event_headers);
+        assert_eq!(replayed.logs, observation.logs);
+        assert_eq!(replayed.request_count, observation.request_count);
+        assert_eq!(replayed.response_bytes, observation.response_bytes);
+        assert_eq!(replayed.requests.len(), observation.requests.len());
+        for (replayed_page, captured_page) in replayed.requests.iter().zip(&observation.requests) {
+            assert_eq!(replayed_page.method(), captured_page.method());
+            assert_eq!(replayed_page.request_json(), captured_page.request_json());
+            assert_eq!(replayed_page.response_json(), captured_page.response_json());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn selectable_chunk_width_covers_ranges_and_recorded_replay_requires_same_width() {
+        let headers = BTreeMap::from([("finalized".to_owned(), mock_header(150))]);
+        let (reader, requests, server) = mock_reader_with_headers(headers).await;
+        let request = RpcCurrentIntervalCensusRequest {
+            wallets: vec![WALLET.to_owned()],
+            start_block: 10,
+            expected_start_hash: mock_header(10)["hash"].as_str().unwrap().to_owned(),
+            through_block: 150,
+            expected_through_hash: mock_header(150)["hash"].as_str().unwrap().to_owned(),
+            max_requests: 5 + 4 * 5 + MAX_EVENT_BLOCKS,
+            max_total_response_bytes: MAX_HISTORY_TOTAL_BYTES,
+            total_timeout: Duration::from_secs(5),
+        };
+
+        let chunked = reader
+            .read_current_interval_census_chunked(&request, 32)
+            .await
+            .unwrap();
+        let expected_ranges = [(11, 42), (43, 74), (75, 106), (107, 138), (139, 150)];
+        {
+            let calls = requests.lock().unwrap();
+            let log_ranges: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "eth_getLogs")
+                .map(|call| {
+                    let filter = &call["params"][0];
+                    (
+                        parse_quantity(&filter["fromBlock"]).unwrap(),
+                        parse_quantity(&filter["toBlock"]).unwrap(),
+                    )
+                })
+                .collect();
+            let expected_log_ranges: Vec<_> = expected_ranges
+                .iter()
+                .flat_map(|range| [*range; 4])
+                .collect();
+            assert_eq!(log_ranges, expected_log_ranges);
+        }
+        assert_eq!(chunked.request_count, 26);
+        assert_eq!(chunked.logs.len(), 1);
+
+        let recorded_pages = chunked
+            .requests
+            .iter()
+            .map(|page| RecordedRpcPositionHistoryPage {
+                request_json: page.request_json().to_owned(),
+                response_json: page.response_json().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let replayed =
+            reverify_recorded_current_interval_census_chunked(&request, &recorded_pages, 32)
+                .await
+                .unwrap();
+        assert_eq!(replayed.logs, chunked.logs);
+        assert_eq!(replayed.event_headers, chunked.event_headers);
+        assert_eq!(replayed.request_count, chunked.request_count);
+        assert_eq!(
+            reverify_recorded_current_interval_census_chunked(&request, &recorded_pages, 16)
+                .await
+                .unwrap_err(),
+            RpcPositionHistoryError::MalformedResponse
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chunk_width_validation_and_request_budget_fail_before_io() {
+        let (reader, requests, server) = mock_reader().await;
+        let mut request = RpcCurrentIntervalCensusRequest {
+            wallets: vec![WALLET.to_owned()],
+            start_block: 10,
+            expected_start_hash: mock_header(10)["hash"].as_str().unwrap().to_owned(),
+            through_block: 150,
+            expected_through_hash: mock_header(150)["hash"].as_str().unwrap().to_owned(),
+            max_requests: 24,
+            max_total_response_bytes: MAX_HISTORY_TOTAL_BYTES,
+            total_timeout: Duration::from_secs(5),
+        };
+        assert_eq!(
+            reader
+                .read_current_interval_census_chunked(&request, 32)
+                .await
+                .unwrap_err(),
+            RpcPositionHistoryError::RequestBudgetExceeded
+        );
+        assert!(requests.lock().unwrap().is_empty());
+
+        request.max_requests = 5 + 4 * 5 + MAX_EVENT_BLOCKS;
+        for width in [0, LOG_CHUNK_BLOCKS + 1] {
+            assert_eq!(
+                reader
+                    .read_current_interval_census_chunked(&request, width)
+                    .await
+                    .unwrap_err(),
+                RpcPositionHistoryError::InvalidInput
+            );
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn default_entry_point_is_equivalent_to_explicit_128_block_width() {
+        let (reader, _requests, server) = mock_reader().await;
+        let request = RpcCurrentIntervalCensusRequest {
+            wallets: vec![WALLET.to_owned()],
+            start_block: 10,
+            expected_start_hash: mock_header(10)["hash"].as_str().unwrap().to_owned(),
+            through_block: 20,
+            expected_through_hash: mock_header(20)["hash"].as_str().unwrap().to_owned(),
+            max_requests: 5 + 4 + MAX_EVENT_BLOCKS,
+            max_total_response_bytes: MAX_HISTORY_TOTAL_BYTES,
+            total_timeout: Duration::from_secs(5),
+        };
+        let default = reader.read_current_interval_census(&request).await.unwrap();
+        let explicit = reader
+            .read_current_interval_census_chunked(&request, LOG_CHUNK_BLOCKS)
+            .await
+            .unwrap();
+        assert_eq!(default.logs, explicit.logs);
+        assert_eq!(default.event_headers, explicit.event_headers);
+        assert_eq!(default.request_count, explicit.request_count);
+        assert_eq!(default.response_bytes, explicit.response_bytes);
+        assert_eq!(
+            default
+                .requests
+                .iter()
+                .map(|page| page.request_json())
+                .collect::<Vec<_>>(),
+            explicit
+                .requests
+                .iter()
+                .map(|page| page.request_json())
+                .collect::<Vec<_>>()
+        );
+        server.abort();
+    }
+
+    #[cfg(feature = "chain-audit")]
+    #[tokio::test]
+    async fn owner_fill_chunked_api_and_recorded_replay_share_the_width() {
+        let headers = BTreeMap::from([("finalized".to_owned(), mock_header(150))]);
+        let (reader, requests, server) = mock_reader_with_headers(headers).await;
+        let request = RpcCurrentIntervalCensusRequest {
+            wallets: vec![WALLET.to_owned()],
+            start_block: 10,
+            expected_start_hash: mock_header(10)["hash"].as_str().unwrap().to_owned(),
+            through_block: 150,
+            expected_through_hash: mock_header(150)["hash"].as_str().unwrap().to_owned(),
+            max_requests: 5 + 5 * 5 + MAX_EVENT_BLOCKS,
+            max_total_response_bytes: MAX_HISTORY_TOTAL_BYTES,
+            total_timeout: Duration::from_secs(5),
+        };
+        let captured = reader
+            .read_current_interval_owner_fills_chunked(&request, 32)
+            .await
+            .unwrap();
+        assert_eq!(captured.owner_fills.len(), 1);
+        assert_eq!(captured.census.request_count, 31);
+        let ranges: Vec<_> = {
+            let calls = requests.lock().unwrap();
+            calls
+                .iter()
+                .filter(|call| call["method"] == "eth_getLogs")
+                .map(|call| {
+                    let filter = &call["params"][0];
+                    (
+                        parse_quantity(&filter["fromBlock"]).unwrap(),
+                        parse_quantity(&filter["toBlock"]).unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let expected_ranges = [(11, 42), (43, 74), (75, 106), (107, 138), (139, 150)];
+        assert_eq!(
+            ranges,
+            expected_ranges
+                .iter()
+                .flat_map(|range| [*range; 5])
+                .collect::<Vec<_>>()
+        );
+        let recorded_pages = captured
+            .census
+            .requests
+            .iter()
+            .map(|page| RecordedRpcPositionHistoryPage {
+                request_json: page.request_json().to_owned(),
+                response_json: page.response_json().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let replayed =
+            reverify_recorded_current_interval_owner_fills_chunked(&request, &recorded_pages, 32)
+                .await
+                .unwrap();
+        assert_eq!(replayed.owner_fills, captured.owner_fills);
+        assert_eq!(replayed.census.logs, captured.census.logs);
+        assert_eq!(
+            reverify_recorded_current_interval_owner_fills(&request, &recorded_pages)
+                .await
+                .unwrap_err(),
+            RpcPositionHistoryError::MalformedResponse
+        );
         server.abort();
     }
 
@@ -1587,19 +1925,124 @@ mod tests {
         assert_eq!(observation.census.wallets.len(), MAX_WALLETS);
         assert_eq!(observation.census.request_count, 11);
         assert_eq!(observation.census.requests.len(), 11);
-        let calls = requests.lock().unwrap();
-        assert_eq!(calls.len(), 11);
-        let log_filters: Vec<_> = calls
+        {
+            let calls = requests.lock().unwrap();
+            assert_eq!(calls.len(), 11);
+            let log_filters: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "eth_getLogs")
+                .collect();
+            assert_eq!(log_filters.len(), 5);
+            assert_eq!(
+                log_filters[4]["params"][0]["topics"][2]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                MAX_WALLETS
+            );
+        }
+
+        let recorded_pages = observation
+            .census
+            .requests
             .iter()
-            .filter(|call| call["method"] == "eth_getLogs")
-            .collect();
-        assert_eq!(log_filters.len(), 5);
+            .map(|page| RecordedRpcPositionHistoryPage {
+                request_json: page.request_json().to_owned(),
+                response_json: page.response_json().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let grouped_fill_page = recorded_pages
+            .iter()
+            .find(|page| {
+                let request: Value = serde_json::from_str(&page.request_json).unwrap();
+                request["method"] == "eth_getLogs"
+                    && request["params"][0]["address"] == json!(TEST_OWNER_FILL_EXCHANGES)
+            })
+            .unwrap();
+        assert!(grouped_fill_page.request_json.len() > 4 * 1024);
+        assert!(grouped_fill_page.request_json.len() <= 16 * 1024);
+
+        let replayed = reverify_recorded_current_interval_owner_fills(&request, &recorded_pages)
+            .await
+            .unwrap();
+        assert_eq!(replayed.census.wallets, observation.census.wallets);
         assert_eq!(
-            log_filters[4]["params"][0]["topics"][2]
-                .as_array()
-                .unwrap()
-                .len(),
-            MAX_WALLETS
+            replayed.census.start_header,
+            observation.census.start_header
+        );
+        assert_eq!(replayed.census.end_header, observation.census.end_header);
+        assert_eq!(
+            replayed.census.event_headers,
+            observation.census.event_headers
+        );
+        assert_eq!(replayed.census.logs, observation.census.logs);
+        assert_eq!(replayed.owner_fills, observation.owner_fills);
+        assert_eq!(
+            replayed.census.request_count,
+            observation.census.request_count
+        );
+        assert_eq!(
+            replayed.census.response_bytes,
+            observation.census.response_bytes
+        );
+        assert_eq!(
+            replayed.census.requests.len(),
+            observation.census.requests.len()
+        );
+        for (replayed_page, captured_page) in replayed
+            .census
+            .requests
+            .iter()
+            .zip(&observation.census.requests)
+        {
+            assert_eq!(replayed_page.method(), captured_page.method());
+            assert_eq!(replayed_page.request_json(), captured_page.request_json());
+            assert_eq!(replayed_page.response_json(), captured_page.response_json());
+        }
+
+        assert_eq!(
+            reverify_recorded_current_interval_owner_fills(
+                &request,
+                &recorded_pages[..recorded_pages.len() - 1]
+            )
+            .await
+            .unwrap_err(),
+            RpcPositionHistoryError::MalformedResponse
+        );
+        let mut reordered = recorded_pages.clone();
+        reordered.swap(0, 1);
+        assert_eq!(
+            reverify_recorded_current_interval_owner_fills(&request, &reordered)
+                .await
+                .unwrap_err(),
+            RpcPositionHistoryError::MalformedResponse
+        );
+        let mut extra = recorded_pages.clone();
+        extra.push(recorded_pages[0].clone());
+        assert_eq!(
+            reverify_recorded_current_interval_owner_fills(&request, &extra)
+                .await
+                .unwrap_err(),
+            RpcPositionHistoryError::MalformedResponse
+        );
+        let mut changed_filter = recorded_pages.clone();
+        let grouped_fill_index = changed_filter
+            .iter()
+            .position(|page| {
+                let rpc_request: Value = serde_json::from_str(&page.request_json).unwrap();
+                rpc_request["method"] == "eth_getLogs"
+                    && rpc_request["params"][0]["address"] == json!(TEST_OWNER_FILL_EXCHANGES)
+            })
+            .unwrap();
+        let mut altered_request: Value =
+            serde_json::from_str(&changed_filter[grouped_fill_index].request_json).unwrap();
+        altered_request["params"][0]["fromBlock"] = json!("0x10");
+        changed_filter[grouped_fill_index].request_json = altered_request.to_string();
+        assert_eq!(
+            reverify_recorded_current_interval_owner_fills(&request, &changed_filter)
+                .await
+                .unwrap_err(),
+            RpcPositionHistoryError::MalformedResponse
         );
         server.abort();
     }

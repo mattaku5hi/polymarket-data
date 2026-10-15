@@ -17,6 +17,9 @@ use crate::position_history::{
 };
 
 pub mod current_interval_census;
+pub mod current_interval_transactions;
+#[cfg(feature = "chain-audit")]
+pub mod fifth_binary_context;
 
 #[cfg(feature = "chain-audit")]
 use crate::position_history::{

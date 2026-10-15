@@ -315,12 +315,23 @@ async fn original_context_deadline_is_preserved_and_below_precision_budget_refus
         ),
         Err(ExecutionQuoteError::BuyQuantityPrecision)
     );
-    assert!(
-        estimate_all_in_buy_execution_quote(&ctx, Decimal::ONE, Duration::from_millis(10),).is_ok()
-    );
-    tokio::time::sleep(Duration::from_millis(15)).await;
+    tokio::time::pause();
+    let max_age = Duration::from_secs(10);
+    let deadline = ctx.local_valid_until(max_age).unwrap();
+    let quote = estimate_all_in_buy_execution_quote(&ctx, Decimal::ONE, max_age).unwrap();
+    assert_eq!(quote.valid_until(), deadline);
+    tokio::time::advance(deadline - tokio::time::Instant::now() - Duration::from_nanos(1)).await;
+    assert!(quote.check_validity().is_ok());
     assert_eq!(
-        estimate_all_in_buy_execution_quote(&ctx, Decimal::ONE, Duration::from_millis(10),),
+        estimate_all_in_buy_execution_quote(&ctx, Decimal::ONE, max_age)
+            .unwrap()
+            .valid_until(),
+        deadline
+    );
+    tokio::time::advance(Duration::from_nanos(1)).await;
+    assert_eq!(quote.check_validity(), Err(ExecutionQuoteError::Expired));
+    assert_eq!(
+        estimate_all_in_buy_execution_quote(&ctx, Decimal::ONE, max_age),
         Err(ExecutionQuoteError::Expired)
     );
 }

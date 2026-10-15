@@ -80,6 +80,9 @@ A bounded 2026-09-30 public probe found CloudFront `Cache-Control: public, max-a
 
 With the existing `chain-audit` feature, `activity_hints::PolymarketActivityHintClient::acquire_wallet_activity_hints` walks the default activity filter and explicit `TIP` filter using HTTP-only `WalletActivityHintLimits`. It keeps raw activity rows and per-pass/page/row occurrence positions without constructing a receipt verifier or sending RPC requests. Both filters retain `start`/`end` and other request parameters on cursor pages. Even two exhausted passes are hints, not proof of complete wallet history, balances, or ROI; callers must inspect `is_complete()` and keep venue-reported source semantics explicit.
 
+Current provider-reported portfolio flow APIs, bounds and unsupported cases are
+documented in [CURRENT_PORTFOLIO_FLOWS.md](docs/CURRENT_PORTFOLIO_FLOWS.md).
+
 ## CLOB book snapshot
 
 ```rust,ignore
