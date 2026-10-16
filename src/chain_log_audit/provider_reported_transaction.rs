@@ -8,8 +8,9 @@ use super::provider_reported_maker_fill::{
     normalize_provider_reported_log, parse_provider_reported_log_envelope_with_limit,
 };
 use super::{
-    MAX_RESPONSE_BYTES, POLYGON_CHAIN_ID, encode_signed_transaction_with_sender_recovery, field,
-    parse_hex_u64, validate_hex,
+    BOR_FEE_LOG_ADDRESS, MAX_RESPONSE_BYTES, POLYGON_CHAIN_ID,
+    encode_signed_transaction_with_sender_recovery, field, is_bor_fee_log, parse_hex_u64,
+    validate_hex,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub(super) struct BoundProviderTransaction {
     pub recovered_from: Address,
     pub value: U256,
     pub logs: Vec<ProviderTransactionLog>,
+    pub(super) bor_fee_log: Option<ProviderTransactionLog>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +146,7 @@ pub(super) fn bind_provider_transaction(
         .get("logs")
         .and_then(Value::as_array)
         .ok_or(ProviderTransactionBindingError::Receipt)?;
-    let mut logs = Vec::with_capacity(raw_logs.len());
+    let mut normalized_logs = Vec::with_capacity(raw_logs.len());
     let mut previous_log_index = None;
     for raw_log in raw_logs {
         let envelope = parse_provider_reported_log_envelope_with_limit(raw_log, MAX_RESPONSE_BYTES)
@@ -160,12 +162,30 @@ pub(super) fn bind_provider_transaction(
             return Err(ProviderTransactionBindingError::Receipt);
         }
         previous_log_index = Some(normalized.log_index);
-        logs.push(ProviderTransactionLog {
+        normalized_logs.push(normalized);
+    }
+
+    let mut logs = Vec::with_capacity(normalized_logs.len());
+    let mut bor_fee_log = None;
+    for (index, (raw_log, normalized)) in raw_logs.iter().zip(normalized_logs).enumerate() {
+        let log = ProviderTransactionLog {
             log_index: normalized.log_index,
             address: normalized.address,
             topics: normalized.topics,
             data: normalized.data,
-        });
+        };
+        if log.address == BOR_FEE_LOG_ADDRESS {
+            // Bor v2.10.2's source-pinned final system fee observation is
+            // retained separately; it is not an EVM transfer or PUSD flow.
+            let source_shape =
+                is_bor_fee_log(raw_log).map_err(|_| ProviderTransactionBindingError::Receipt)?;
+            if !source_shape || index + 1 != raw_logs.len() || bor_fee_log.is_some() {
+                return Err(ProviderTransactionBindingError::Receipt);
+            }
+            bor_fee_log = Some(log);
+        } else {
+            logs.push(log);
+        }
     }
     Ok(BoundProviderTransaction {
         transaction_hash,
@@ -178,6 +198,7 @@ pub(super) fn bind_provider_transaction(
         recovered_from,
         value: encoded.value,
         logs,
+        bor_fee_log,
     })
 }
 

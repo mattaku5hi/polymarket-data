@@ -591,12 +591,19 @@ fn build_complementary_expectations(
         } else {
             maker_cash.checked_add(*maker_fee)?
         };
+        // Trading.sol emits BUY-active maker fees before net cash, but SELL-active maker fees after cash.
+        if active.side == FifthOrderSide::Buy && !maker_fee.is_zero() {
+            expected.push(Expected::Fee {
+                receiver: Address::ZERO,
+                amount: *maker_fee,
+            });
+        }
         expected.push(Expected::Cash {
             from: cash_from,
             to: cash_to,
             amount: cash_amount,
         });
-        if !maker_fee.is_zero() {
+        if active.side == FifthOrderSide::Sell && !maker_fee.is_zero() {
             expected.push(Expected::Fee {
                 receiver: Address::ZERO,
                 amount: *maker_fee,
@@ -625,9 +632,6 @@ fn build_complementary_expectations(
         .checked_mul(active.taker_amount)?
         .checked_div(active.maker_amount)?;
     if active_taking < active_minimum_taking {
-        return None;
-    }
-    if active_taking > active.taker_amount {
         return None;
     }
     if call.active_fee
@@ -902,6 +906,12 @@ pub(crate) mod tests {
     use serde_json::json;
 
     fn fixture() -> (Value, Value, String, RpcCurrentCtfV2Context) {
+        fixture_with_active_quote(500)
+    }
+
+    fn fixture_with_active_quote(
+        active_quote: u64,
+    ) -> (Value, Value, String, RpcCurrentCtfV2Context) {
         let owner = Address::from_str("0x1111111111111111111111111111111111111111").unwrap();
         let maker_a = Address::from_str("0x2222222222222222222222222222222222222222").unwrap();
         let maker_b = Address::from_str("0x3333333333333333333333333333333333333333").unwrap();
@@ -911,7 +921,7 @@ pub(crate) mod tests {
             owner,
             id,
             U256::from(1_000),
-            U256::from(500),
+            U256::from(active_quote),
             FifthOrderSide::Buy,
             0xaa,
             0xbb,
@@ -971,6 +981,14 @@ pub(crate) mod tests {
                 data(&[id, U256::from(50)]),
             ),
             log(
+                EXCHANGE,
+                vec![
+                    topic_hash(FEE_CHARGED_SIGNATURE),
+                    topic_address(fee_receiver),
+                ],
+                data(&[U256::from(5)]),
+            ),
+            log(
                 PUSD_ADDRESS,
                 vec![
                     topic_hash(TRANSFER_SIGNATURE),
@@ -978,14 +996,6 @@ pub(crate) mod tests {
                     topic_address(maker_a),
                 ],
                 data(&[U256::from(95)]),
-            ),
-            log(
-                EXCHANGE,
-                vec![
-                    topic_hash(FEE_CHARGED_SIGNATURE),
-                    topic_address(fee_receiver),
-                ],
-                data(&[U256::from(5)]),
             ),
             log(
                 EXCHANGE,
@@ -1011,6 +1021,14 @@ pub(crate) mod tests {
                 data(&[id, U256::from(50)]),
             ),
             log(
+                EXCHANGE,
+                vec![
+                    topic_hash(FEE_CHARGED_SIGNATURE),
+                    topic_address(fee_receiver),
+                ],
+                data(&[U256::from(7)]),
+            ),
+            log(
                 PUSD_ADDRESS,
                 vec![
                     topic_hash(TRANSFER_SIGNATURE),
@@ -1018,14 +1036,6 @@ pub(crate) mod tests {
                     topic_address(maker_b),
                 ],
                 data(&[U256::from(93)]),
-            ),
-            log(
-                EXCHANGE,
-                vec![
-                    topic_hash(FEE_CHARGED_SIGNATURE),
-                    topic_address(fee_receiver),
-                ],
-                data(&[U256::from(7)]),
             ),
             log(
                 EXCHANGE,
@@ -1422,6 +1432,30 @@ pub(crate) mod tests {
         json!({"address":address,"topics":topics,"data":data})
     }
 
+    fn bor_fee_log(receipt: &Value, index: usize) -> Value {
+        let mut row = log(
+            super::super::BOR_FEE_LOG_ADDRESS,
+            vec![
+                super::super::BOR_FEE_LOG_TOPIC.to_owned(),
+                topic_address(Address::from_str(super::super::BOR_FEE_LOG_ADDRESS).unwrap()),
+                topic_address(
+                    Address::from_str("0x1111111111111111111111111111111111111111").unwrap(),
+                ),
+                topic_address(
+                    Address::from_str("0x2222222222222222222222222222222222222222").unwrap(),
+                ),
+            ],
+            data(&[U256::ONE, U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO]),
+        );
+        row["blockNumber"] = receipt["blockNumber"].clone();
+        row["blockHash"] = receipt["blockHash"].clone();
+        row["transactionHash"] = receipt["transactionHash"].clone();
+        row["transactionIndex"] = receipt["transactionIndex"].clone();
+        row["logIndex"] = json!(format!("0x{index:x}"));
+        row["removed"] = json!(false);
+        row
+    }
+
     #[test]
     fn exact_provider_reported_complementary_buy_is_decoded_and_bound() {
         let (transaction, receipt, owner, context) = fixture();
@@ -1525,6 +1559,106 @@ pub(crate) mod tests {
         assert_eq!(
             maker_b_settlement.wallet_legs()[1].direction(),
             ProviderReportedCtfV2Direction::Inflow
+        );
+    }
+
+    #[test]
+    fn complementary_buy_accepts_source_valid_price_improvement_above_active_quote() {
+        let (transaction, receipt, owner, context) = fixture_with_active_quote(80);
+        let settlement = decode_provider_reported_ctf_v2_complementary_settlement(
+            &transaction,
+            &receipt,
+            &owner,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(settlement.owner_fills().len(), 1);
+        assert_eq!(settlement.owner_fills()[0].gross_making(), U256::from(200));
+        // The signed order quotes 80 shares for its full 1000 cash amount,
+        // hence only 16 minimum shares for this 200 cash fill. The actual
+        // 100 shares exceed even the full-order quote, which is not a cap.
+        assert_eq!(settlement.owner_fills()[0].gross_taking(), U256::from(100));
+        assert!(settlement.owner_fills()[0].gross_taking() > U256::from(80));
+    }
+
+    #[test]
+    fn final_source_pinned_bor_fee_is_separated_from_exact_evm_settlement_logs() {
+        let (transaction, mut receipt, owner, context) = fixture();
+        let log_count = receipt["logs"].as_array().unwrap().len();
+        let fee = bor_fee_log(&receipt, log_count);
+        receipt["logs"].as_array_mut().unwrap().push(fee);
+
+        let bound = bind_provider_transaction(&transaction, &receipt).unwrap();
+        assert_eq!(bound.logs.len(), log_count);
+        let fee_log = bound.bor_fee_log.as_ref().unwrap();
+        assert_eq!(fee_log.address, super::super::BOR_FEE_LOG_ADDRESS);
+        assert_eq!(fee_log.log_index, log_count as u64);
+
+        let with_fee = decode_provider_reported_ctf_v2_complementary_settlement(
+            &transaction,
+            &receipt,
+            &owner,
+            &context,
+        )
+        .unwrap();
+        let (_, original, _, _) = fixture();
+        let without_fee = decode_provider_reported_ctf_v2_complementary_settlement(
+            &transaction,
+            &original,
+            &owner,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(with_fee.wallet_legs(), without_fee.wallet_legs());
+        assert_eq!(with_fee.owner_fills(), without_fee.owner_fills());
+    }
+
+    #[test]
+    fn malformed_duplicate_and_nonfinal_bor_fee_rows_are_rejected() {
+        let (transaction, receipt, _, _) = fixture();
+        let log_count = receipt["logs"].as_array().unwrap().len();
+
+        let mut malformed = receipt.clone();
+        let mut row = bor_fee_log(&receipt, log_count);
+        row["topics"][0] = json!(format!("0x{}", "ff".repeat(32)));
+        malformed["logs"].as_array_mut().unwrap().push(row);
+        assert_eq!(
+            bind_provider_transaction(&transaction, &malformed),
+            Err(ProviderTransactionBindingError::Receipt)
+        );
+
+        let mut duplicate = receipt.clone();
+        let first_fee = bor_fee_log(&receipt, log_count);
+        let second_fee = bor_fee_log(&receipt, log_count + 1);
+        duplicate["logs"].as_array_mut().unwrap().push(first_fee);
+        duplicate["logs"].as_array_mut().unwrap().push(second_fee);
+        assert_eq!(
+            bind_provider_transaction(&transaction, &duplicate),
+            Err(ProviderTransactionBindingError::Receipt)
+        );
+
+        let mut nonfinal = receipt.clone();
+        let fee = bor_fee_log(&receipt, log_count);
+        nonfinal["logs"].as_array_mut().unwrap().push(fee);
+        let mut after_fee = log(
+            PUSD_ADDRESS,
+            vec![
+                topic_hash(TRANSFER_SIGNATURE),
+                topic_address(Address::ZERO),
+                topic_address(Address::ZERO),
+            ],
+            data(&[U256::ONE]),
+        );
+        after_fee["blockNumber"] = receipt["blockNumber"].clone();
+        after_fee["blockHash"] = receipt["blockHash"].clone();
+        after_fee["transactionHash"] = receipt["transactionHash"].clone();
+        after_fee["transactionIndex"] = receipt["transactionIndex"].clone();
+        after_fee["logIndex"] = json!(format!("0x{:x}", log_count + 1));
+        after_fee["removed"] = json!(false);
+        nonfinal["logs"].as_array_mut().unwrap().push(after_fee);
+        assert_eq!(
+            bind_provider_transaction(&transaction, &nonfinal),
+            Err(ProviderTransactionBindingError::Receipt)
         );
     }
 
@@ -1730,11 +1864,25 @@ pub(crate) mod tests {
     fn fee_and_ordered_event_values_must_match_calldata() {
         let (transaction, receipt, owner, context) = fixture();
         let mut changed_fee = receipt.clone();
-        changed_fee["logs"][2]["data"] = json!(data(&[U256::from(6)]));
+        changed_fee["logs"][1]["data"] = json!(data(&[U256::from(6)]));
         assert_eq!(
             decode_provider_reported_ctf_v2_complementary_settlement(
                 &transaction,
                 &changed_fee,
+                &owner,
+                &context,
+            ),
+            Err(ProviderReportedCtfV2SettlementError::SettlementMismatch)
+        );
+
+        let mut cash_before_fee = receipt.clone();
+        cash_before_fee["logs"].as_array_mut().unwrap().swap(1, 2);
+        cash_before_fee["logs"][1]["logIndex"] = json!("0x1");
+        cash_before_fee["logs"][2]["logIndex"] = json!("0x2");
+        assert_eq!(
+            decode_provider_reported_ctf_v2_complementary_settlement(
+                &transaction,
+                &cash_before_fee,
                 &owner,
                 &context,
             ),

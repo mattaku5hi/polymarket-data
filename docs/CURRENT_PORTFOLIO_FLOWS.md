@@ -105,3 +105,28 @@ budgets. Artifacts with V2 context use schema version2. Version1 artifacts
 remain replayable and retain their original field shape when reserialized.
 Source-model synthetic fixtures exercise both active and maker roles with
 nonzero fees; they are not evidence of a real executed transaction.
+
+
+## Source-order and Polygon system-fee compatibility
+
+The standard complementary BUY profile follows the pinned source order:
+position transfer, optional maker FeeCharged, net collateral transfer,
+OrderFilled. The complementary SELL sequence remains position, collateral,
+optional fee event, fill. Exact fixtures reject the former incorrect BUY
+event order. The active order's taking amount is a minimum ratio quote;
+price-improved proceeds may exceed that quote. A regression reproduces the
+old rejection before accepting the source-valid observation.
+
+Provider transaction binding retains at most one final Polygon Bor native-fee
+observation separately from the exact EVM settlement log sequence. It uses
+the existing source-pinned emitter0x1010/event shape guard and checks all
+receipt locators/order before separating the row. Malformed, duplicated or
+non-final native-fee rows are rejected. The observation is not pUSD movement
+and is not used to infer total gas or capital flow. Raw receipts remain
+complete in saved acquisition frames. Rooted APIs retain their existing guards.
+
+Artifact field shape compatibility does not preserve an incorrect reduction:
+strict offline replay still compares the recomputed report with the saved
+report. An old wrong-order projection or a formerly Unknown observation whose
+classification changes can therefore be refused after a decoder correction.
+No old report is silently upgraded to known coverage.
