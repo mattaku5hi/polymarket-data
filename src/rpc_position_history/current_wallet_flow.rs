@@ -1,8 +1,8 @@
 //! Bounded, provider-reported source-wallet flow capture and offline replay.
 //!
 //! This module owns orchestration for Activity, current transfer/fill census,
-//! transaction/receipt and optional fifth module context. Its artifact is an
-//! endpoint-free transcript, not proof of complete wallet history or NAV.
+//! transaction/receipt and optional fifth/V2 settlement contexts. Its artifact
+//! is an endpoint-free transcript, not proof of complete wallet history or NAV.
 
 use std::{collections::BTreeSet, time::Duration};
 
@@ -20,12 +20,19 @@ use crate::{
         MAX_ACTIVITY_PAGE_SIZE, PolymarketActivityHintClient, WalletActivityHintLimits,
     },
     chain_log_audit::{
-        ProviderReportedFifthSettlement, decode_provider_reported_fifth_binary_settlement,
+        ProviderReportedCtfV2Settlement, ProviderReportedFifthSettlement,
+        decode_provider_reported_ctf_v2_complementary_settlement,
+        decode_provider_reported_fifth_binary_settlement,
+        provider_reported_ctf_v2_settlement_context_candidate,
         provider_reported_fifth_settlement_context_candidate,
     },
     rpc_position_history::{
         RecordedRpcPositionHistoryPage, RpcPositionHistoryError, RpcPositionHistoryPage,
         RpcPositionHistoryReader,
+        ctf_v2_context::{
+            RpcCurrentCtfV2Context, RpcCurrentCtfV2ContextRequest,
+            reverify_recorded_current_ctf_v2_context,
+        },
         current_interval_census::{
             RpcCurrentIntervalCensus, RpcCurrentIntervalCensusRequest,
             RpcCurrentIntervalOwnerFillCensus,
@@ -45,9 +52,11 @@ use crate::{
 use super::current_interval_census::portfolio_flow::{
     SourceWalletActivityWindow, SourceWalletFlowReduction,
     reduce_source_wallet_flows_with_fifth_settlements,
+    reduce_source_wallet_flows_with_provider_settlements,
 };
 
-pub const CURRENT_WALLET_FLOW_ARTIFACT_VERSION: u32 = 1;
+pub const CURRENT_WALLET_FLOW_ARTIFACT_VERSION: u32 = 2;
+const LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION: u32 = 1;
 pub const CURRENT_WALLET_FLOW_DEFAULT_ACTIVITY_REQUESTS: usize = 8;
 pub const CURRENT_WALLET_FLOW_DEFAULT_RPC_REQUESTS: usize = 256;
 pub const CURRENT_WALLET_FLOW_DEFAULT_RAW_BYTES: usize = 32 * 1024 * 1024;
@@ -182,6 +191,11 @@ impl CurrentWalletFlowObservation {
     }
 
     #[must_use]
+    pub fn ctf_v2_context_count(&self) -> usize {
+        self.packet.ctf_v2_contexts.len()
+    }
+
+    #[must_use]
     pub fn total_rpc_request_count(&self) -> usize {
         self.packet
             .census
@@ -189,6 +203,12 @@ impl CurrentWalletFlowObservation {
             .saturating_add(self.packet.transactions.request_count)
             .saturating_add(saturating_sum(
                 self.packet.contexts.iter().map(|item| item.request_count),
+            ))
+            .saturating_add(saturating_sum(
+                self.packet
+                    .ctf_v2_contexts
+                    .iter()
+                    .map(|item| item.request_count),
             ))
     }
 
@@ -201,6 +221,12 @@ impl CurrentWalletFlowObservation {
             .saturating_add(self.packet.transactions.response_bytes)
             .saturating_add(saturating_sum(
                 self.packet.contexts.iter().map(|item| item.response_bytes),
+            ))
+            .saturating_add(saturating_sum(
+                self.packet
+                    .ctf_v2_contexts
+                    .iter()
+                    .map(|item| item.response_bytes),
             ))
     }
 
@@ -226,7 +252,9 @@ impl CurrentWalletFlowObservation {
         }
         let packet: CurrentWalletFlowPacket =
             serde_json::from_slice(bytes).map_err(|_| CurrentWalletFlowError::InvalidArtifact)?;
-        if packet.version != CURRENT_WALLET_FLOW_ARTIFACT_VERSION {
+        if packet.version != LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+            && packet.version != CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+        {
             return Err(CurrentWalletFlowError::UnsupportedVersion);
         }
         packet.verify_sha256()?;
@@ -412,6 +440,8 @@ pub async fn capture_current_wallet_flow_observation(
 
     let mut context_packets = Vec::new();
     let mut skipped_context_blocks = 0usize;
+    let mut ctf_v2_context_packets = Vec::new();
+    let mut skipped_ctf_v2_context_blocks = 0usize;
     if let Some(capture) = &transactions {
         let mut candidates = BTreeSet::new();
         for tx in &capture.transactions {
@@ -447,9 +477,49 @@ pub async fn capture_current_wallet_flow_observation(
                 .ok_or(CurrentWalletFlowError::CaptureFailed)?;
             context_packets.push(ContextPacket::from_capture(&context, context_request));
         }
+
+        let mut ctf_v2_candidates = BTreeSet::new();
+        for tx in &capture.transactions {
+            if let Some(anchor) =
+                provider_reported_ctf_v2_settlement_context_candidate(&tx.transaction)
+            {
+                ctf_v2_candidates.insert(anchor);
+            }
+        }
+        for (block_number, expected_hash) in ctf_v2_candidates {
+            if remaining_rpc < 5 || remaining_bytes == 0 {
+                skipped_ctf_v2_context_blocks += 1;
+                continue;
+            }
+            let context_request = RpcCurrentCtfV2ContextRequest {
+                block_number,
+                expected_hash,
+                max_requests: remaining_rpc.min(256),
+                max_total_response_bytes: remaining_bytes.min(256 * 1024),
+                total_timeout: remaining(deadline)?.min(Duration::from_secs(30)),
+            };
+            let context = timeout(
+                remaining(deadline)?,
+                rpc_reader.read_current_ctf_v2_context(&census.census, &context_request),
+            )
+            .await
+            .map_err(|_| CurrentWalletFlowError::CaptureFailed)??;
+            remaining_rpc = remaining_rpc
+                .checked_sub(context.request_count())
+                .ok_or(CurrentWalletFlowError::CaptureFailed)?;
+            remaining_bytes = remaining_bytes
+                .checked_sub(context.response_bytes())
+                .ok_or(CurrentWalletFlowError::CaptureFailed)?;
+            ctf_v2_context_packets
+                .push(CtfV2ContextPacket::from_capture(&context, context_request));
+        }
     }
     let mut packet = CurrentWalletFlowPacket {
-        version: CURRENT_WALLET_FLOW_ARTIFACT_VERSION,
+        version: if ctf_v2_context_packets.is_empty() && skipped_ctf_v2_context_blocks == 0 {
+            LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+        } else {
+            CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+        },
         source: "provider_reported".to_owned(),
         capture_started_at,
         capture_completed_at: Utc::now(),
@@ -460,6 +530,8 @@ pub async fn capture_current_wallet_flow_observation(
         contexts: context_packets,
         skipped_candidate_transactions,
         skipped_context_blocks,
+        ctf_v2_contexts: ctf_v2_context_packets,
+        skipped_ctf_v2_context_blocks,
         reduction: FlowPacket::empty(),
         content_sha256: String::new(),
     };
@@ -553,6 +625,37 @@ fn decode_fifth_settlements(
         .collect()
 }
 
+fn decode_ctf_v2_settlements(
+    wallet: &str,
+    transactions: Option<&RpcCurrentIntervalTransactions>,
+    contexts: &[RpcCurrentCtfV2Context],
+) -> Vec<ProviderReportedCtfV2Settlement> {
+    let Some(transactions) = transactions else {
+        return Vec::new();
+    };
+    transactions
+        .transactions
+        .iter()
+        .filter_map(|tx| {
+            let context = contexts.iter().find(|context| {
+                provider_reported_ctf_v2_settlement_context_candidate(&tx.transaction).is_some_and(
+                    |(block, hash)| {
+                        block == context.block_number()
+                            && hash.eq_ignore_ascii_case(context.block_hash())
+                    },
+                )
+            })?;
+            decode_provider_reported_ctf_v2_complementary_settlement(
+                &tx.transaction,
+                &tx.receipt,
+                wallet,
+                context,
+            )
+            .ok()
+        })
+        .collect()
+}
+
 fn mark_unknown_for_limits(reduction: &mut SourceWalletFlowReduction) {
     use super::current_interval_census::portfolio_flow::{
         SourceFlowCoverage, SourceFlowReason, UnresolvedSourceMovement,
@@ -599,6 +702,14 @@ struct CurrentWalletFlowPacket {
     skipped_context_blocks: usize,
     reduction: FlowPacket,
     content_sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ctf_v2_contexts: Vec<CtfV2ContextPacket>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    skipped_ctf_v2_context_blocks: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 impl CurrentWalletFlowPacket {
@@ -624,7 +735,8 @@ impl CurrentWalletFlowPacket {
         &self,
     ) -> Result<SourceWalletFlowReduction, CurrentWalletFlowError> {
         self.validate_capture_windows()?;
-        let (owner_census, transactions, contexts) = self.replay_components().await?;
+        let (owner_census, transactions, contexts, ctf_v2_contexts) =
+            self.replay_components().await?;
         self.activity
             .validate(&self.request, &owner_census.census)?;
         if self.capture_completed_at < self.capture_started_at
@@ -641,6 +753,11 @@ impl CurrentWalletFlowPacket {
                 .saturating_add(saturating_sum(
                     self.contexts.iter().map(|context| context.request_count),
                 ))
+                .saturating_add(saturating_sum(
+                    self.ctf_v2_contexts
+                        .iter()
+                        .map(|context| context.request_count),
+                ))
                 > self.request.limits.max_rpc_requests
             || self
                 .census
@@ -649,11 +766,26 @@ impl CurrentWalletFlowPacket {
                 .saturating_add(saturating_sum(
                     self.contexts.iter().map(|context| context.response_bytes),
                 ))
+                .saturating_add(saturating_sum(
+                    self.ctf_v2_contexts
+                        .iter()
+                        .map(|context| context.response_bytes),
+                ))
                 .saturating_add(self.activity.total_response_bytes)
                 > self.request.limits.max_raw_response_bytes
-            || self.contexts.len() > self.request.limits.max_candidate_transactions
+            || self
+                .contexts
+                .len()
+                .saturating_add(self.ctf_v2_contexts.len())
+                > self.request.limits.max_candidate_transactions
             || self.skipped_candidate_transactions > 20_000
             || self.skipped_context_blocks > self.request.limits.max_candidate_transactions
+            || self.skipped_ctf_v2_context_blocks > self.request.limits.max_candidate_transactions
+            || (self.version == LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+                && (!self.ctf_v2_contexts.is_empty() || self.skipped_ctf_v2_context_blocks > 0))
+            || (self.version == CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+                && self.ctf_v2_contexts.is_empty()
+                && self.skipped_ctf_v2_context_blocks == 0)
         {
             return Err(CurrentWalletFlowError::InvalidArtifact);
         }
@@ -667,14 +799,31 @@ impl CurrentWalletFlowPacket {
             tip_pass: self.activity.tip_pass.to_summary(),
             occurrences: &occurrences,
         };
-        let settlements =
+        let fifth_settlements =
             decode_fifth_settlements(&self.request.wallet, transactions.as_ref(), &contexts);
-        let mut reduction = reduce_source_wallet_flows_with_fifth_settlements(
-            activity,
-            &owner_census,
-            &settlements,
+        let ctf_v2_settlements = decode_ctf_v2_settlements(
+            &self.request.wallet,
+            transactions.as_ref(),
+            &ctf_v2_contexts,
         );
-        if self.skipped_candidate_transactions > 0 || self.skipped_context_blocks > 0 {
+        let mut reduction = if self.version == LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION {
+            reduce_source_wallet_flows_with_fifth_settlements(
+                activity,
+                &owner_census,
+                &fifth_settlements,
+            )
+        } else {
+            reduce_source_wallet_flows_with_provider_settlements(
+                activity,
+                &owner_census,
+                &fifth_settlements,
+                &ctf_v2_settlements,
+            )
+        };
+        if self.skipped_candidate_transactions > 0
+            || self.skipped_context_blocks > 0
+            || self.skipped_ctf_v2_context_blocks > 0
+        {
             mark_unknown_for_limits(&mut reduction);
         }
         Ok(reduction)
@@ -751,6 +900,23 @@ impl CurrentWalletFlowPacket {
             }
             previous_completed = context.completed_at;
         }
+        for context in &self.ctf_v2_contexts {
+            if context.started_at < previous_completed
+                || context.started_at > context.completed_at
+                || context.completed_at > self.capture_completed_at
+                || context.completed_at > now
+                || elapsed_exceeds(
+                    context.started_at,
+                    context.completed_at,
+                    Duration::from_secs(30),
+                )
+                || context.request.timeout_millis == 0
+                || context.request.timeout_millis > duration_millis(limits.total_timeout)
+            {
+                return Err(CurrentWalletFlowError::InvalidArtifact);
+            }
+            previous_completed = context.completed_at;
+        }
         Ok(())
     }
 
@@ -761,6 +927,7 @@ impl CurrentWalletFlowPacket {
             RpcCurrentIntervalOwnerFillCensus,
             Option<RpcCurrentIntervalTransactions>,
             Vec<RpcCurrentFifthBinaryContext>,
+            Vec<RpcCurrentCtfV2Context>,
         ),
         CurrentWalletFlowError,
     > {
@@ -858,6 +1025,31 @@ impl CurrentWalletFlowPacket {
             }
             contexts.push(context);
         }
+        let mut ctf_v2_contexts = Vec::with_capacity(self.ctf_v2_contexts.len());
+        let mut ctf_v2_context_anchors = BTreeSet::new();
+        for packet in &self.ctf_v2_contexts {
+            let request = packet.request.to_sdk_request()?;
+            if !ctf_v2_context_anchors.insert((request.block_number, request.expected_hash.clone()))
+            {
+                return Err(CurrentWalletFlowError::InvalidArtifact);
+            }
+            let context = reverify_recorded_current_ctf_v2_context(
+                &owner_census.census,
+                &request,
+                &packet.pages.to_sdk(),
+            )
+            .await?;
+            if context.request_count() != packet.request_count
+                || context.response_bytes() != packet.response_bytes
+                || context.source()
+                    != crate::rpc_position_history::ctf_v2_context::RpcCurrentCtfV2ContextSource::ProviderReported
+                || context.implementation_version()
+                    != crate::rpc_position_history::ctf_v2_context::RpcCurrentCtfV2ImplementationVersion::Unbound
+            {
+                return Err(CurrentWalletFlowError::InvalidArtifact);
+            }
+            ctf_v2_contexts.push(context);
+        }
         let required_context_anchors = transactions
             .as_ref()
             .into_iter()
@@ -874,9 +1066,25 @@ impl CurrentWalletFlowPacket {
         {
             return Err(CurrentWalletFlowError::InvalidArtifact);
         }
+        let required_ctf_v2_context_anchors = transactions
+            .as_ref()
+            .into_iter()
+            .flat_map(|capture| capture.transactions.iter())
+            .filter_map(|tx| provider_reported_ctf_v2_settlement_context_candidate(&tx.transaction))
+            .collect::<BTreeSet<_>>();
+        if ctf_v2_context_anchors
+            .iter()
+            .any(|anchor| !required_ctf_v2_context_anchors.contains(anchor))
+            || required_ctf_v2_context_anchors
+                .len()
+                .saturating_sub(ctf_v2_context_anchors.len())
+                != self.skipped_ctf_v2_context_blocks
+        {
+            return Err(CurrentWalletFlowError::InvalidArtifact);
+        }
         self.activity
             .validate(&self.request, &owner_census.census)?;
-        Ok((owner_census, transactions, contexts))
+        Ok((owner_census, transactions, contexts, ctf_v2_contexts))
     }
 }
 
@@ -1468,6 +1676,68 @@ impl ContextRequestPacket {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+struct CtfV2ContextPacket {
+    request: CtfV2ContextRequestPacket,
+    pages: RpcPages,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    request_count: usize,
+    response_bytes: usize,
+}
+
+impl CtfV2ContextPacket {
+    fn from_capture(
+        context: &RpcCurrentCtfV2Context,
+        request: RpcCurrentCtfV2ContextRequest,
+    ) -> Self {
+        Self {
+            request: CtfV2ContextRequestPacket::from_request(&request),
+            pages: RpcPages::from_pages(context.requests()),
+            started_at: context.started_at(),
+            completed_at: context.completed_at(),
+            request_count: context.request_count(),
+            response_bytes: context.response_bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CtfV2ContextRequestPacket {
+    block_number: u64,
+    expected_hash: String,
+    max_requests: usize,
+    max_total_response_bytes: usize,
+    timeout_millis: u64,
+}
+
+impl CtfV2ContextRequestPacket {
+    fn from_request(request: &RpcCurrentCtfV2ContextRequest) -> Self {
+        Self {
+            block_number: request.block_number,
+            expected_hash: request.expected_hash.clone(),
+            max_requests: request.max_requests,
+            max_total_response_bytes: request.max_total_response_bytes,
+            timeout_millis: request.total_timeout.as_millis().try_into().unwrap_or(1),
+        }
+    }
+
+    fn to_sdk_request(&self) -> Result<RpcCurrentCtfV2ContextRequest, CurrentWalletFlowError> {
+        if self.timeout_millis == 0 {
+            return Err(CurrentWalletFlowError::InvalidArtifact);
+        }
+        Ok(RpcCurrentCtfV2ContextRequest {
+            block_number: self.block_number,
+            expected_hash: self.expected_hash.clone(),
+            max_requests: self.max_requests,
+            max_total_response_bytes: self.max_total_response_bytes,
+            total_timeout: Duration::from_millis(self.timeout_millis),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct FlowPacket {
     wallet: String,
     start_block: u64,
@@ -1789,6 +2059,13 @@ mod tests {
             .await
             .unwrap();
         let artifact = captured.to_artifact().unwrap();
+        let legacy_packet: Value = serde_json::from_slice(&artifact).unwrap();
+        assert_eq!(
+            legacy_packet["version"],
+            LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+        );
+        assert!(legacy_packet.get("ctf_v2_contexts").is_none());
+        assert!(legacy_packet.get("skipped_ctf_v2_context_blocks").is_none());
         let replayed = CurrentWalletFlowObservation::from_artifact(&artifact)
             .await
             .unwrap();
@@ -1805,6 +2082,7 @@ mod tests {
         );
         assert_eq!(replayed.census_log_count(), captured.census_log_count());
         assert_eq!(replayed.owner_fill_count(), captured.owner_fill_count());
+        assert_eq!(replayed.to_artifact().unwrap(), artifact);
         assert_eq!(
             replayed.total_rpc_request_count(),
             captured.total_rpc_request_count()

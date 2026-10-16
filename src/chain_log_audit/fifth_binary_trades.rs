@@ -12,13 +12,9 @@ use super::fifth_match_orders_call::{
 use super::fifth_provider_reported_event::{
     FifthEventImplementationVersion, FifthEventObservationSource,
 };
-use super::provider_reported_maker_fill::{
-    normalize_provider_reported_log, parse_provider_reported_log_envelope_with_limit,
-};
 use super::{
     ChainLogAuditError, ChainLogVerifier, ChainReceiptIntervalTransaction, MAX_RESPONSE_BYTES,
-    POLYGON_CHAIN_ID, TransactionRequestBudget, encode_signed_transaction_with_sender_recovery,
-    field, parse_hex_u64, validate_hex,
+    POLYGON_CHAIN_ID, TransactionRequestBudget, field, parse_hex_u64, validate_hex,
 };
 use crate::TradeSide;
 use crate::rpc_position_history::fifth_binary_context::{
@@ -878,12 +874,11 @@ fn classify_transaction_view(
             FifthLegacyBinaryTradeUnavailableReason::UnsupportedOwnerRole,
         );
     }
-    if logs.len() != settlement.expected_logs.len()
-        || logs
-            .iter()
-            .zip(&settlement.expected_logs)
-            .any(|(actual, expected)| !expected.matches_fields(actual, module_address))
-    {
+    if !super::provider_reported_transaction::match_ordered_logs(
+        &settlement.expected_logs,
+        logs,
+        |expected, actual| expected.matches_fields(actual, module_address),
+    ) {
         return TransactionProjectionClassification::Unavailable(
             FifthLegacyBinaryTradeUnavailableReason::SourceSettlementMismatch,
         );
@@ -1075,151 +1070,51 @@ pub fn decode_provider_reported_fifth_settlement(
         return Err(ProviderReportedFifthSettlementError::InvalidInput);
     }
 
-    let encoded = encode_signed_transaction_with_sender_recovery(transaction, true)
-        .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?;
-    let transaction_hash = validate_hex(
-        field(transaction, "hash")
-            .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?,
-        32,
-    )
-    .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?;
-    if format!("{:#x}", encoded.hash) != transaction_hash
-        || encoded.eip155_chain_id != Some(U256::from(POLYGON_CHAIN_ID))
-        || encoded.to.len() != 20
-    {
-        return Err(ProviderReportedFifthSettlementError::MalformedTransaction);
-    }
-    let recovered = encoded
-        .recovered_sender
-        .ok_or(ProviderReportedFifthSettlementError::MalformedTransaction)?;
-    let reported_from = validate_hex(
-        field(transaction, "from")
-            .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?,
-        20,
-    )
-    .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?;
-    if format!("{recovered:#x}") != reported_from {
-        return Err(ProviderReportedFifthSettlementError::MalformedTransaction);
-    }
-    if let Some(chain_id) = transaction.get("chainId") {
-        let Some(chain_id_text) = chain_id.as_str() else {
-            return Err(ProviderReportedFifthSettlementError::MalformedTransaction);
-        };
-        if chain_id_text != format!("{:#x}", POLYGON_CHAIN_ID) {
-            return Err(ProviderReportedFifthSettlementError::MalformedTransaction);
+    let bound =
+        super::provider_reported_transaction::bind_provider_transaction(transaction, receipt)
+            .map_err(|error| {
+                match error {
+        super::provider_reported_transaction::ProviderTransactionBindingError::Transaction => {
+            ProviderReportedFifthSettlementError::MalformedTransaction
+        }
+        super::provider_reported_transaction::ProviderTransactionBindingError::Receipt => {
+            ProviderReportedFifthSettlementError::MalformedReceipt
         }
     }
-
-    let block_number = parse_hex_u64(
-        field(transaction, "blockNumber")
-            .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?,
-    )
-    .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?;
-    let block_hash = validate_hex(
-        field(transaction, "blockHash")
-            .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?,
-        32,
-    )
-    .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?;
-    let transaction_index = parse_hex_u64(
-        field(transaction, "transactionIndex")
-            .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?,
-    )
-    .map_err(|_| ProviderReportedFifthSettlementError::MalformedTransaction)?;
-
-    if validate_hex(
-        field(receipt, "transactionHash")
-            .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?,
-        32,
-    )
-    .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?
-        != transaction_hash
-        || parse_hex_u64(
-            field(receipt, "blockNumber")
-                .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?,
-        )
-        .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?
-            != block_number
-        || validate_hex(
-            field(receipt, "blockHash")
-                .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?,
-            32,
-        )
-        .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?
-            != block_hash
-        || parse_hex_u64(
-            field(receipt, "transactionIndex")
-                .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?,
-        )
-        .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?
-            != transaction_index
-        || parse_hex_u64(
-            field(receipt, "status")
-                .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?,
-        )
-        .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?
-            != 1
-        || parse_hex_u64(
-            field(receipt, "type")
-                .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?,
-        )
-        .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?
-            != u64::from(encoded.transaction_type)
-    {
-        return Err(ProviderReportedFifthSettlementError::MalformedReceipt);
-    }
-
-    let raw_logs = receipt
-        .get("logs")
-        .and_then(Value::as_array)
-        .ok_or(ProviderReportedFifthSettlementError::MalformedReceipt)?;
-    let mut logs = Vec::with_capacity(raw_logs.len());
-    let mut previous_log_index = None;
-    for raw_log in raw_logs {
-        let envelope = parse_provider_reported_log_envelope_with_limit(raw_log, MAX_RESPONSE_BYTES)
-            .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?;
-        let normalized = normalize_provider_reported_log(envelope, MAX_RESPONSE_BYTES)
-            .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?;
-        if normalized.transaction_hash != transaction_hash
-            || normalized.block_number != block_number
-            || normalized.block_hash != block_hash
-            || normalized.transaction_index != transaction_index
-            || previous_log_index.is_some_and(|previous| normalized.log_index <= previous)
-        {
-            return Err(ProviderReportedFifthSettlementError::MalformedReceipt);
-        }
-        previous_log_index = Some(normalized.log_index);
-        logs.push(TransactionLogView {
-            block_log_index: normalized.log_index,
-            address: normalized.address,
-            topics: normalized.topics,
-            data: normalized.data,
-        });
-    }
-
-    let to = format!("0x{}", hex::encode(&encoded.to));
+            })?;
+    let transaction_hash = bound.transaction_hash.clone();
+    let block_number = bound.block_number;
+    let block_hash = bound.block_hash.clone();
+    let transaction_index = bound.transaction_index;
+    let status = bound.status;
+    let to = bound.to.clone();
+    let recovered_from = format!("{:#x}", bound.recovered_from);
+    let logs = bound
+        .logs
+        .iter()
+        .map(|log| TransactionLogView {
+            block_log_index: log.log_index,
+            address: log.address.clone(),
+            topics: log.topics.clone(),
+            data: log.data.clone(),
+        })
+        .collect::<Vec<_>>();
     let has_owner_activity = logs
         .iter()
         .any(|log| provider_log_mentions_owner(log, owner_address, position_ids));
     let has_owner_exchange_event = logs
         .iter()
         .any(|log| exchange_log_mentions_owner_fields(log, owner_address));
-    let recovered_from = format!("{recovered:#x}");
-    let status = parse_hex_u64(
-        field(receipt, "status")
-            .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?,
-    )
-    .map_err(|_| ProviderReportedFifthSettlementError::MalformedReceipt)?;
     let projection = match classify_transaction_view(
         TransactionView {
             transaction_hash: &transaction_hash,
             transaction_index,
             status,
             to: Some(&to),
-            input: Some(&encoded.input),
+            input: Some(&bound.input),
             recovered_from: Some(&recovered_from),
-            value: encoded.value,
-            replay_protected_sender: encoded.eip155_chain_id == Some(U256::from(POLYGON_CHAIN_ID)),
+            value: bound.value,
+            replay_protected_sender: true,
             logs: &logs,
             has_owner_activity,
             has_owner_exchange_event,

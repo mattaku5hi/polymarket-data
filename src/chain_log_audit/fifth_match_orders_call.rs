@@ -172,7 +172,7 @@ fn decode_u256_array(
     Some((values, end))
 }
 
-fn decode_order_tuple(args: &[u8], start: usize) -> Option<(FifthMatchOrder, usize)> {
+pub(super) fn decode_order_tuple(args: &[u8], start: usize) -> Option<(FifthMatchOrder, usize)> {
     let head_end = start.checked_add(ORDER_HEAD_BYTES)?;
     if head_end > args.len() || word_usize(args, start.checked_add(11 * 32)?)? != ORDER_HEAD_BYTES {
         return None;
@@ -255,7 +255,7 @@ fn word_b256(args: &[u8], offset: usize) -> Option<B256> {
 /// EIP-712 struct hash from the source's exact eleven-field schema. This is a
 /// hash primitive only; it does not establish deployed code or signature
 /// validity. Callers must bind the supplied verifying proxy and version.
-pub fn fifth_order_struct_hash(order: &FifthMatchOrder) -> B256 {
+pub(super) fn fifth_order_struct_hash(order: &FifthMatchOrder) -> B256 {
     let mut encoded = Vec::with_capacity(12 * 32);
     encoded.extend_from_slice(&ORDER_TYPEHASH);
     append_u256(&mut encoded, order.salt);

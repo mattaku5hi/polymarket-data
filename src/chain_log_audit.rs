@@ -37,6 +37,7 @@ pub use genesis_position_opening::{
 mod ctf_condition_state;
 mod ctf_operations;
 mod ctf_position_identity;
+mod ctf_v2_provider_settlement;
 mod fifth_binary_trades;
 mod fifth_code_context;
 mod fifth_direct_legacy_migration;
@@ -60,6 +61,7 @@ mod fifth_receipt_maker_window;
 mod fifth_selected_balances;
 mod known_position_balances;
 mod provider_reported_maker_fill;
+mod provider_reported_transaction;
 mod recorded_owner_fill_signals;
 mod selected_owner_watch;
 mod selected_owner_window;
@@ -68,6 +70,15 @@ mod v2_owner_fill_signals;
 pub use ctf_operations::{
     CtfOperationClassificationEvidence, CtfOperationKind, CtfOperationTransactionFact,
     CtfOperationTransactionStatus,
+};
+#[cfg(test)]
+pub(crate) use ctf_v2_provider_settlement::tests::provider_ctf_v2_normal_complementary_settlement;
+pub use ctf_v2_provider_settlement::{
+    ProviderReportedCtfV2Direction, ProviderReportedCtfV2OrderRole, ProviderReportedCtfV2OwnerFill,
+    ProviderReportedCtfV2Settlement, ProviderReportedCtfV2SettlementError,
+    ProviderReportedCtfV2Side, ProviderReportedCtfV2WalletLeg,
+    decode_provider_reported_ctf_v2_complementary_settlement,
+    provider_reported_ctf_v2_settlement_context_candidate,
 };
 #[cfg(test)]
 pub(crate) use fifth_binary_trades::tests::{

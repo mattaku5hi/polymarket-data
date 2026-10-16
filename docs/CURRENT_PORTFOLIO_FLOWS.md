@@ -41,7 +41,7 @@ qualification, NAV, high-water state or an execution guarantee.
 With `chain-audit`, `current_wallet_flow::capture_current_wallet_flow_observation`
 acquires one wallet's declared block/hash interval, derives Activity bounds from
 its headers, reads32-block log chunks and selected transactions/receipts, and
-resolves fifth BinaryModule context where needed. Defaults cap the entire
+resolves fifth BinaryModule or standard CTF V2 asset context where needed. Defaults cap the entire
 capture at8 Activity requests,256 RPC calls,32MiB raw response bodies,120seconds
 and32 candidate transactions. Each subsequent phase receives only the remaining
 global budget; there are no automatic retries. Unsupported or omitted candidate
@@ -66,5 +66,42 @@ The extra builder/metadata words remain in the raw RPC frame and are not another
 fee or cash flow. Five/six/eight-word V2 payloads are rejected; the full payload
 is passed to the existing gross-plus-fee decoder. A bounded real capture exposed
 the previous five-word V2 limit; corrected full-width golden fixtures now cover
-this mismatch. Parsing a V2 event does not enable its still-unsupported complete
-CTF V2 settlement attribution in the current flow reducer.
+this mismatch. Event parsing alone does not establish net settlement; the explicit
+standard V2 complementary profile below is a separate decoder and reducer input.
+
+
+## Standard CTF V2 complementary settlements
+
+With `chain-audit`, `ctf_v2_context` reads `getCollateral()` and `getCtf()`
+at one selected census event block. Five ordinary RPC calls (chain, before
+header, two getters, after header),256KiB and30seconds bind the observed pUSD
+and CTF addresses to the declared block/hash. This is provider-reported,
+implementation-Unbound context, without authenticated code or state proof.
+
+`decode_provider_reported_ctf_v2_complementary_settlement` supports only the
+standard E111 V2 Exchange's all-complementary `matchOrders` profile. The
+V2 call has seven top-level arguments, selector0x3c2b4399 and EIP712 domain
+version2; the fifth Exchange's five-argument/domain3 profile stays distinct.
+Shared nested-order decoding and signed outer transaction/receipt binding do
+not merge those profiles. The V2 decoder requires exact complete ordered
+collateral/position transfers, FeeCharged, OrderFilled and OrdersMatched logs;
+fees stay separate from gross fills. Fee receiver observations must match
+the actual final batch transfer. It does not prove order authorization, EVM
+execution or deployed runtime identity. NegRisk, mint/merge, mixed-token calls,
+self-crosses and unsupported conversions remain outside this profile.
+
+The additive combined reducer accepts separate opaque fifth and V2 settlement
+inputs. It consumes only exact wallet legs, including both endpoints, assets,
+amounts and complete locators; it never suppresses a whole transaction merely
+because one trade matched. Present V2 Activity TRADE rows must have exact
+aggregate share totals by transaction, full token ID, side and block timestamp.
+One aggregate row or split rows may corroborate the same total; duplicate or
+partial totals remain Unknown. This does not establish row-to-fill identity or
+a gross/net meaning for Activity `usdc_size`. Absent Activity trades can be
+accepted only through the complete declared owner-leg projection.
+
+The bounded wallet facade includes the new context within the existing global
+budgets. Artifacts with V2 context use schema version2. Version1 artifacts
+remain replayable and retain their original field shape when reserialized.
+Source-model synthetic fixtures exercise both active and maker roles with
+nonzero fees; they are not evidence of a real executed transaction.

@@ -13,8 +13,10 @@ use crate::{
         ActivityHintPassSummary,
     },
     chain_log_audit::{
-        FifthEventImplementationVersion, FifthEventObservationSource, ProviderReportedFifthAsset,
-        ProviderReportedFifthDirection, ProviderReportedFifthSettlement,
+        FifthEventImplementationVersion, FifthEventObservationSource,
+        ProviderReportedCtfV2Direction, ProviderReportedCtfV2Settlement, ProviderReportedCtfV2Side,
+        ProviderReportedFifthAsset, ProviderReportedFifthDirection,
+        ProviderReportedFifthSettlement,
     },
     collateral_cash::CollateralAsset,
     position_history::erc1155_abi::{DecodedTransfer, decode_fields},
@@ -24,7 +26,6 @@ use crate::{
     },
 };
 
-#[cfg(test)]
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const MAX_FLOW_ACTIVITY_OCCURRENCES: usize = 20_000;
 const MAX_FLOW_ACTIVITY_ROW_BYTES: usize = 64 * 1024;
@@ -62,6 +63,7 @@ pub enum SourceFlowReason {
     InvalidCensusEntry,
     UnsupportedTradeVenueOrAssets,
     UnsupportedFifthSettlement,
+    UnsupportedCtfV2Settlement,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -168,13 +170,25 @@ pub fn reduce_source_wallet_flows_with_fifth_settlements(
     census: &RpcCurrentIntervalOwnerFillCensus,
     settlements: &[ProviderReportedFifthSettlement],
 ) -> SourceWalletFlowReduction {
-    reduce_source_wallet_flow_parts_with_fifth(activity, census, settlements)
+    reduce_source_wallet_flow_parts(activity, census, settlements, &[])
 }
 
-fn reduce_source_wallet_flow_parts_with_fifth(
+/// Add the supported standard CTF V2 complementary-settlement profile while
+/// retaining the existing fifth profile as a separate typed input.
+pub fn reduce_source_wallet_flows_with_provider_settlements(
+    activity: SourceWalletActivityWindow<'_>,
+    census: &RpcCurrentIntervalOwnerFillCensus,
+    fifth_settlements: &[ProviderReportedFifthSettlement],
+    ctf_v2_settlements: &[ProviderReportedCtfV2Settlement],
+) -> SourceWalletFlowReduction {
+    reduce_source_wallet_flow_parts(activity, census, fifth_settlements, ctf_v2_settlements)
+}
+
+fn reduce_source_wallet_flow_parts(
     activity: SourceWalletActivityWindow<'_>,
     owner_census: &RpcCurrentIntervalOwnerFillCensus,
     fifth_settlements: &[ProviderReportedFifthSettlement],
+    ctf_v2_settlements: &[ProviderReportedCtfV2Settlement],
 ) -> SourceWalletFlowReduction {
     let SourceWalletActivityWindow {
         wallet: raw_wallet,
@@ -197,14 +211,26 @@ fn reduce_source_wallet_flow_parts_with_fifth(
         capital_flows: Vec::new(),
         unresolved: Vec::new(),
     };
+    let settlement_count = fifth_settlements
+        .len()
+        .checked_add(ctf_v2_settlements.len());
     let settlement_items = fifth_settlements
         .iter()
         .try_fold(0_usize, |total, settlement| {
             total
                 .checked_add(settlement.wallet_legs().len())?
                 .checked_add(settlement.owner_fills().len())
+        })
+        .and_then(|total| {
+            ctf_v2_settlements
+                .iter()
+                .try_fold(total, |total, settlement| {
+                    total
+                        .checked_add(settlement.wallet_legs().len())?
+                        .checked_add(settlement.owner_fills().len())
+                })
         });
-    if fifth_settlements.len() > 32
+    if settlement_count.is_none_or(|count| count > 32)
         || settlement_items.is_none_or(|items| items > MAX_FLOW_POSITION_ITEMS)
     {
         result.coverage = SourceFlowCoverage::Unknown;
@@ -747,6 +773,60 @@ fn reduce_source_wallet_flow_parts_with_fifth(
         }
     }
 
+    let mut ctf_v2_transactions = HashSet::new();
+    for settlement in ctf_v2_settlements {
+        let transaction_hash = settlement.transaction_hash().to_owned();
+        let matching_activity: Vec<_> = occurrences
+            .iter()
+            .enumerate()
+            .filter(|(_, occurrence)| {
+                occurrence
+                    .transaction_hash
+                    .eq_ignore_ascii_case(&transaction_hash)
+                    && classify_kind(occurrence) == ActivityKind::Trade
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in &matching_activity {
+            consumed_activity[*index] = true;
+        }
+        if !ctf_v2_transactions.insert(transaction_hash)
+            || !ctf_v2_settlement_scope_valid(settlement, &wallet, census)
+            || !ctf_v2_activity_fills_match(settlement, &matching_activity, occurrences, census)
+        {
+            unknown!(
+                None,
+                matching_activity
+                    .first()
+                    .map(|index| activity_locator(&occurrences[*index])),
+                SourceFlowReason::UnsupportedCtfV2Settlement
+            );
+            continue;
+        }
+        let Some((cash_indexes, position_indexes)) = ctf_v2_settlement_census_matches(
+            settlement,
+            &cash,
+            &positions,
+            &consumed_cash,
+            &consumed_positions,
+        ) else {
+            unknown!(
+                None,
+                matching_activity
+                    .first()
+                    .map(|index| activity_locator(&occurrences[*index])),
+                SourceFlowReason::UnsupportedCtfV2Settlement
+            );
+            continue;
+        };
+        for index in cash_indexes {
+            consumed_cash[index] = true;
+        }
+        for index in position_indexes {
+            consumed_positions[index] = true;
+        }
+    }
+
     // CTF V1 trades are internal only when zero-fee fill, cash leg and
     // position leg each have a unique exact match.
     for (activity_index, occurrence) in occurrences.iter().enumerate() {
@@ -1077,6 +1157,293 @@ fn fifth_settlement_scope_valid(
             .iter()
             .all(|fill| fill.token_id() != alloy_primitives::U256::ZERO)
         && transaction_hash == settlement.transaction_hash().to_ascii_lowercase()
+}
+
+fn ctf_v2_settlement_scope_valid(
+    settlement: &ProviderReportedCtfV2Settlement,
+    wallet: &str,
+    census: &RpcCurrentIntervalCensus,
+) -> bool {
+    let owner = format!("{:#x}", settlement.owner());
+    let transaction_hash = settlement.transaction_hash();
+    let block_hash = settlement.block_hash();
+    let collateral_address = format!("{:#x}", settlement.collateral_address());
+    let ctf_address = format!("{:#x}", settlement.ctf_address());
+    let supported_collateral = collateral_address
+        .eq_ignore_ascii_case(crate::collateral_cash::CollateralAsset::Pusd.address());
+    let owner_token_id = settlement.owner_fills().first().map(|fill| fill.token_id());
+    let mut fill_log_indexes = HashSet::new();
+    owner.eq_ignore_ascii_case(wallet)
+        && settlement.chain_id() == 137
+        && settlement.context_source()
+            == crate::rpc_position_history::ctf_v2_context::RpcCurrentCtfV2ContextSource::ProviderReported
+        && settlement.implementation_version()
+            == crate::rpc_position_history::ctf_v2_context::RpcCurrentCtfV2ImplementationVersion::Unbound
+        && supported_collateral
+        && !ctf_address.eq_ignore_ascii_case(&collateral_address)
+        && ctf_address != ZERO_ADDRESS
+        && !settlement.wallet_legs().is_empty()
+        && !settlement.owner_fills().is_empty()
+        && {
+            let mut leg_log_indexes = HashSet::new();
+            settlement
+                .wallet_legs()
+                .iter()
+                .all(|leg| leg_log_indexes.insert(leg.log_index()))
+                && settlement.wallet_legs().iter().any(|leg| {
+                    format!("{:#x}", leg.asset_address())
+                        .eq_ignore_ascii_case(&collateral_address)
+                })
+                && settlement.wallet_legs().iter().any(|leg| {
+                    format!("{:#x}", leg.asset_address()).eq_ignore_ascii_case(&ctf_address)
+                })
+        }
+        && settlement.wallet_legs().iter().all(|leg| {
+            let asset_address = format!("{:#x}", leg.asset_address());
+            let from = format!("{:#x}", leg.from());
+            let to = format!("{:#x}", leg.to());
+            let direction_matches_owner = match leg.direction() {
+                ProviderReportedCtfV2Direction::Inflow => {
+                    to.eq_ignore_ascii_case(&owner) && !from.eq_ignore_ascii_case(&owner)
+                }
+                ProviderReportedCtfV2Direction::Outflow => {
+                    from.eq_ignore_ascii_case(&owner) && !to.eq_ignore_ascii_case(&owner)
+                }
+            };
+            leg.amount() != alloy_primitives::U256::ZERO
+                && direction_matches_owner
+                && crate::position_history::normalize_address(&from).is_some()
+                && crate::position_history::normalize_address(&to).is_some()
+                && ((asset_address.eq_ignore_ascii_case(&collateral_address)
+                    && leg.token_id().is_none())
+                    || (asset_address.eq_ignore_ascii_case(&ctf_address)
+                        && leg.token_id().is_some_and(|id| {
+                            id != alloy_primitives::U256::ZERO && Some(id) == owner_token_id
+                        })))
+        })
+        && settlement
+            .owner_fills()
+            .iter()
+            .all(|fill| {
+                fill.token_id() != alloy_primitives::U256::ZERO
+                    && fill.gross_making() != alloy_primitives::U256::ZERO
+                    && fill.gross_taking() != alloy_primitives::U256::ZERO
+                    && Some(fill.token_id()) == owner_token_id
+                    && fill_log_indexes.insert(fill.log_index())
+            })
+        && settlement.block_number() > census.start_block
+        && settlement.block_number() <= census.through_block
+        && census.event_headers.iter().any(|header| {
+            header.number == settlement.block_number()
+                && header.hash.eq_ignore_ascii_case(block_hash)
+                && header.timestamp > census.start_header.timestamp
+                && header.timestamp <= census.end_header.timestamp
+        })
+        && crate::position_history::normalize_hash(transaction_hash).as_deref()
+            == Some(transaction_hash)
+        && crate::position_history::normalize_hash(block_hash).as_deref() == Some(block_hash)
+}
+
+fn ctf_v2_activity_fills_match(
+    settlement: &ProviderReportedCtfV2Settlement,
+    activity_indexes: &[usize],
+    occurrences: &[ActivityHintOccurrence],
+    census: &RpcCurrentIntervalCensus,
+) -> bool {
+    if activity_indexes.is_empty() {
+        return true;
+    }
+    let transaction_hash = settlement.transaction_hash().to_owned();
+    let block_hash = settlement.block_hash();
+    let Some(timestamp) = census
+        .event_headers
+        .iter()
+        .find(|header| {
+            header.number == settlement.block_number()
+                && header.hash.eq_ignore_ascii_case(block_hash)
+        })
+        .map(|header| header.timestamp)
+    else {
+        return false;
+    };
+    let Ok(timestamp) = i64::try_from(timestamp) else {
+        return false;
+    };
+    if activity_indexes.iter().any(|index| {
+        !occurrences[*index]
+            .transaction_hash
+            .eq_ignore_ascii_case(&transaction_hash)
+    }) {
+        return false;
+    }
+    let mut expected = HashMap::<(String, u8), u128>::new();
+    for fill in settlement.owner_fills() {
+        let share_amount = if fill.side() == ProviderReportedCtfV2Side::Buy {
+            fill.gross_taking()
+        } else {
+            fill.gross_making()
+        };
+        let Ok(share_amount) = share_amount.to_string().parse::<u128>() else {
+            return false;
+        };
+        if share_amount == 0 {
+            return false;
+        }
+        let side = match fill.side() {
+            ProviderReportedCtfV2Side::Buy => 0,
+            ProviderReportedCtfV2Side::Sell => 1,
+        };
+        let total = expected
+            .entry((fill.token_id().to_string(), side))
+            .or_default();
+        let Some(sum) = total.checked_add(share_amount) else {
+            return false;
+        };
+        *total = sum;
+    }
+    let mut observed = HashMap::<(String, u8), u128>::new();
+    for index in activity_indexes {
+        let occurrence = &occurrences[*index];
+        if occurrence.timestamp != timestamp {
+            return false;
+        }
+        let Some(token_id) = occurrence.raw.get("asset").and_then(value_string) else {
+            return false;
+        };
+        let Some(side) = occurrence
+            .raw
+            .get("side")
+            .and_then(value_string)
+            .map(|value| value.to_ascii_uppercase())
+        else {
+            return false;
+        };
+        let side = match side.as_str() {
+            "BUY" => 0,
+            "SELL" => 1,
+            _ => return false,
+        };
+        let Some(size) = occurrence
+            .raw
+            .get("size")
+            .and_then(parse_decimal_microunits)
+        else {
+            return false;
+        };
+        if size == 0 {
+            return false;
+        }
+        let total = observed.entry((token_id, side)).or_default();
+        let Some(sum) = total.checked_add(size) else {
+            return false;
+        };
+        *total = sum;
+    }
+    observed == expected
+}
+
+fn ctf_v2_settlement_census_matches(
+    settlement: &ProviderReportedCtfV2Settlement,
+    cash: &[CashMovement<'_>],
+    positions: &[PositionMovement<'_>],
+    consumed_cash: &[bool],
+    consumed_positions: &[bool],
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    use crate::collateral_cash::CollateralAsset;
+
+    let transaction_hash = settlement.transaction_hash();
+    let block_hash = settlement.block_hash();
+    let collateral_address = format!("{:#x}", settlement.collateral_address());
+    let ctf_address = format!("{:#x}", settlement.ctf_address());
+    if !collateral_address.eq_ignore_ascii_case(CollateralAsset::Pusd.address()) {
+        return None;
+    }
+    let collateral_asset = (RpcCurrentIntervalAsset::Pusd, CollateralAsset::Pusd);
+    let mut cash_indexes = Vec::new();
+    let mut position_indexes = Vec::new();
+    for leg in settlement.wallet_legs() {
+        let amount = leg.amount().to_string().parse::<u128>().ok()?;
+        let log_index = leg.log_index();
+        let locator = format!("137:{transaction_hash}:{log_index}");
+        let from = format!("{:#x}", leg.from());
+        let to = format!("{:#x}", leg.to());
+        let asset_address = format!("{:#x}", leg.asset_address());
+        match (
+            asset_address.eq_ignore_ascii_case(&collateral_address),
+            leg.token_id(),
+        ) {
+            (true, None) => {
+                let incoming = leg.direction() == ProviderReportedCtfV2Direction::Inflow;
+                let matches = cash
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, movement)| {
+                        !consumed_cash[*index]
+                            && movement.log.locator.eq_ignore_ascii_case(&locator)
+                            && movement
+                                .log
+                                .transaction_hash
+                                .eq_ignore_ascii_case(transaction_hash)
+                            && movement.log.block_number == settlement.block_number()
+                            && movement.log.block_hash.eq_ignore_ascii_case(block_hash)
+                            && movement.log.transaction_index == settlement.transaction_index()
+                            && movement.log.asset == collateral_asset.0
+                            && movement.asset == collateral_asset.1
+                            && movement.incoming == incoming
+                            && movement.amount == amount
+                            && movement.log.from.eq_ignore_ascii_case(&from)
+                            && movement.log.to.eq_ignore_ascii_case(&to)
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    return None;
+                }
+                cash_indexes.push(matches[0]);
+            }
+            (false, Some(token_id)) if asset_address.eq_ignore_ascii_case(&ctf_address) => {
+                let incoming = leg.direction() == ProviderReportedCtfV2Direction::Inflow;
+                let token_id = token_id.to_string();
+                let matches = positions
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, movement)| {
+                        !consumed_positions[*index]
+                            && movement.log.locator.eq_ignore_ascii_case(&locator)
+                            && movement
+                                .log
+                                .transaction_hash
+                                .eq_ignore_ascii_case(transaction_hash)
+                            && movement.log.block_number == settlement.block_number()
+                            && movement.log.block_hash.eq_ignore_ascii_case(block_hash)
+                            && movement.log.transaction_index == settlement.transaction_index()
+                            && movement.log.asset == RpcCurrentIntervalAsset::Ctf
+                            && movement.incoming == incoming
+                            && movement.token_id == token_id
+                            && movement.amount == amount
+                            && movement.log.from.eq_ignore_ascii_case(&from)
+                            && movement.log.to.eq_ignore_ascii_case(&to)
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    return None;
+                }
+                position_indexes.push(matches[0]);
+            }
+            _ => return None,
+        }
+    }
+    let mut unique_cash = HashSet::new();
+    let mut unique_positions = HashSet::new();
+    if !cash_indexes.iter().all(|index| unique_cash.insert(*index))
+        || !position_indexes
+            .iter()
+            .all(|index| unique_positions.insert(*index))
+    {
+        return None;
+    }
+    Some((cash_indexes, position_indexes))
 }
 
 fn fifth_activity_fills_match(
@@ -1653,6 +2020,54 @@ mod tests {
         .expect("well-formed settlement ERC-1155 transfer")
     }
 
+    fn ctf_v2_position_log(
+        settlement: &ProviderReportedCtfV2Settlement,
+        index: u64,
+        from: &str,
+        to: &str,
+        token: &str,
+        amount: u128,
+    ) -> RpcCurrentIntervalLog {
+        let indexed = |address: &str| format!("0x{:0>64}", &address[2..]);
+        let token_value = num_bigint::BigUint::parse_bytes(token.as_bytes(), 10)
+            .expect("decimal fixture token id");
+        let token_bytes = token_value.to_bytes_be();
+        assert!(token_bytes.len() <= 32);
+        let mut token_word = [0_u8; 32];
+        token_word[32 - token_bytes.len()..].copy_from_slice(&token_bytes);
+        let owner = format!("{:#x}", settlement.owner());
+        let raw = json!({
+            "address": crate::position_history::CTF_EMITTER,
+            "removed": false,
+            "blockNumber": format!("0x{:x}", settlement.block_number()),
+            "blockHash": settlement.block_hash(),
+            "transactionHash": settlement.transaction_hash(),
+            "transactionIndex": format!("0x{:x}", settlement.transaction_index()),
+            "logIndex": format!("0x{index:x}"),
+            "topics": [
+                crate::position_history::TRANSFER_SINGLE_TOPIC,
+                indexed(OTHER),
+                indexed(from),
+                indexed(to),
+            ],
+            "data": format!("0x{}{:064x}", hex::encode(token_word), amount),
+        });
+        let direction = if to.eq_ignore_ascii_case(&owner) {
+            super::super::Direction::To
+        } else {
+            super::super::Direction::From
+        };
+        super::super::decode_log(
+            &raw,
+            &[owner],
+            settlement.block_number() - 1,
+            settlement.block_number(),
+            direction,
+            super::super::CurrentIntervalLogFamily::Position,
+        )
+        .expect("well-formed CTF V2 fixture transfer")
+    }
+
     fn fifth_fixture(
         settlement: &ProviderReportedFifthSettlement,
         extra_cash: bool,
@@ -1733,6 +2148,92 @@ mod tests {
         };
         wrapped.census.event_headers = vec![wrapped.census.end_header.clone()];
         wrapped
+    }
+
+    fn ctf_v2_fixture(
+        settlement: &ProviderReportedCtfV2Settlement,
+        extra_cash: bool,
+    ) -> RpcCurrentIntervalOwnerFillCensus {
+        let mut logs = Vec::new();
+        let owner = format!("{:#x}", settlement.owner());
+        for leg in settlement.wallet_legs() {
+            let amount = leg.amount().to_string().parse::<u128>().unwrap();
+            let from = format!("{:#x}", leg.from());
+            let to = format!("{:#x}", leg.to());
+            let transaction_hash = settlement.transaction_hash();
+            let mut log = if format!("{:#x}", leg.asset_address())
+                .eq_ignore_ascii_case(crate::collateral_cash::PUSD_ADDRESS)
+            {
+                cash_log(transaction_hash, leg.log_index(), &from, &to, amount)
+            } else {
+                ctf_v2_position_log(
+                    settlement,
+                    leg.log_index(),
+                    &from,
+                    &to,
+                    &leg.token_id().unwrap().to_string(),
+                    amount,
+                )
+            };
+            log.locator = format!("137:{transaction_hash}:{}", leg.log_index());
+            log.block_number = settlement.block_number();
+            log.block_hash = settlement.block_hash().to_owned();
+            log.transaction_hash = transaction_hash.to_owned();
+            log.transaction_index = settlement.transaction_index();
+            log.asset = if format!("{:#x}", leg.asset_address())
+                .eq_ignore_ascii_case(crate::collateral_cash::PUSD_ADDRESS)
+            {
+                RpcCurrentIntervalAsset::Pusd
+            } else {
+                RpcCurrentIntervalAsset::Ctf
+            };
+            logs.push(log);
+        }
+        if extra_cash {
+            let mut extra = cash_log(settlement.transaction_hash(), 999, &owner, OTHER, 7);
+            extra.locator = format!("137:{}:999", settlement.transaction_hash());
+            extra.block_number = settlement.block_number();
+            extra.block_hash = settlement.block_hash().to_owned();
+            extra.transaction_hash = settlement.transaction_hash().to_owned();
+            extra.transaction_index = settlement.transaction_index();
+            logs.push(extra);
+        }
+        let mut wrapped = census(logs);
+        wrapped.census.wallets = vec![owner.clone()];
+        wrapped.census.start_block = settlement.block_number() - 1;
+        wrapped.census.through_block = settlement.block_number();
+        wrapped.census.start_header = RpcCurrentIntervalHeader {
+            number: settlement.block_number() - 1,
+            hash: format!("0x{}", "bb".repeat(32)),
+            timestamp: 1_000,
+        };
+        wrapped.census.end_header = RpcCurrentIntervalHeader {
+            number: settlement.block_number(),
+            hash: settlement.block_hash().to_owned(),
+            timestamp: 1_001,
+        };
+        wrapped.census.event_headers = vec![wrapped.census.end_header.clone()];
+        wrapped
+    }
+
+    fn ctf_v2_activity(
+        settlement: &ProviderReportedCtfV2Settlement,
+        size: u128,
+        token_id: &str,
+        side: &str,
+        ordinal: usize,
+    ) -> ActivityHintOccurrence {
+        let row = occurrence(
+            "TRADE",
+            json!({
+                "asset": token_id,
+                "side": side,
+                "size": format!("{}.{:06}", size / 1_000_000, size % 1_000_000),
+                "usdc_size": "provider-gross-net-unspecified",
+            }),
+            settlement.transaction_hash(),
+        );
+        ActivityHintOccurrence { ordinal, ..row }
     }
 
     fn fifth_activity_window<'a>(
@@ -1940,6 +2441,201 @@ mod tests {
             fifth_activity_window(settlement.owner(), &rows),
             &census,
             std::slice::from_ref(&settlement),
+        );
+        assert_eq!(result.coverage, SourceFlowCoverage::Unknown);
+    }
+
+    #[test]
+    fn ctf_v2_active_taker_accepts_aggregate_or_split_api_corroboration() {
+        let settlement = crate::chain_log_audit::provider_ctf_v2_normal_complementary_settlement();
+        assert_eq!(settlement.owner_fills().len(), 1);
+        assert_eq!(settlement.wallet_legs().len(), 5);
+        assert_eq!(
+            settlement
+                .wallet_legs()
+                .iter()
+                .filter(|leg| leg.amount() == alloy_primitives::U256::from(15_u8))
+                .count(),
+            1
+        );
+        let owner = format!("{:#x}", settlement.owner());
+        let fill = &settlement.owner_fills()[0];
+        let total = if fill.side() == ProviderReportedCtfV2Side::Buy {
+            fill.gross_taking()
+        } else {
+            fill.gross_making()
+        }
+        .to_string()
+        .parse::<u128>()
+        .unwrap();
+        assert!(total > 0);
+        let token_id = fill.token_id().to_string();
+        let side = if fill.side() == ProviderReportedCtfV2Side::Buy {
+            "BUY"
+        } else {
+            "SELL"
+        };
+        let census = ctf_v2_fixture(&settlement, false);
+
+        let no_api_rows = reduce_source_wallet_flows_with_provider_settlements(
+            fifth_activity_window(&owner, &[]),
+            &census,
+            &[],
+            std::slice::from_ref(&settlement),
+        );
+        assert_eq!(
+            no_api_rows.coverage,
+            SourceFlowCoverage::KnownForDeclaredScope,
+            "unresolved reasons: {:?}",
+            no_api_rows
+                .unresolved
+                .iter()
+                .map(|movement| movement.reason)
+                .collect::<Vec<_>>()
+        );
+        assert!(no_api_rows.capital_flows.is_empty());
+
+        let aggregate = ctf_v2_activity(&settlement, total, &token_id, side, 0);
+        let aggregate_result = reduce_source_wallet_flows_with_provider_settlements(
+            fifth_activity_window(&owner, std::slice::from_ref(&aggregate)),
+            &census,
+            &[],
+            std::slice::from_ref(&settlement),
+        );
+        assert_eq!(
+            aggregate_result.coverage,
+            SourceFlowCoverage::KnownForDeclaredScope
+        );
+        assert!(aggregate_result.capital_flows.is_empty());
+
+        assert!(total >= 2);
+        let first = total / 2;
+        let second = total - first;
+        let split_rows = [
+            ctf_v2_activity(&settlement, first, &token_id, side, 0),
+            ctf_v2_activity(&settlement, second, &token_id, side, 1),
+        ];
+        let split_result = reduce_source_wallet_flows_with_provider_settlements(
+            fifth_activity_window(&owner, &split_rows),
+            &census,
+            &[],
+            std::slice::from_ref(&settlement),
+        );
+        assert_eq!(
+            split_result.coverage,
+            SourceFlowCoverage::KnownForDeclaredScope
+        );
+        assert!(split_result.capital_flows.is_empty());
+    }
+
+    #[test]
+    fn ctf_v2_rejects_partial_duplicate_mismatched_and_unprojected_activity() {
+        let settlement = crate::chain_log_audit::provider_ctf_v2_normal_complementary_settlement();
+        let owner = format!("{:#x}", settlement.owner());
+        let fill = &settlement.owner_fills()[0];
+        let total = if fill.side() == ProviderReportedCtfV2Side::Buy {
+            fill.gross_taking()
+        } else {
+            fill.gross_making()
+        }
+        .to_string()
+        .parse::<u128>()
+        .unwrap();
+        let token_id = fill.token_id().to_string();
+        let side = if fill.side() == ProviderReportedCtfV2Side::Buy {
+            "BUY"
+        } else {
+            "SELL"
+        };
+        let census = ctf_v2_fixture(&settlement, false);
+        assert!(total > 0);
+        let cases = [
+            vec![ctf_v2_activity(&settlement, total - 1, &token_id, side, 0)],
+            vec![
+                ctf_v2_activity(&settlement, total, &token_id, side, 0),
+                ctf_v2_activity(&settlement, total, &token_id, side, 1),
+            ],
+            vec![ctf_v2_activity(&settlement, total, "999", side, 0)],
+            vec![ctf_v2_activity(
+                &settlement,
+                total,
+                &token_id,
+                if side == "BUY" { "SELL" } else { "BUY" },
+                0,
+            )],
+        ];
+        for rows in cases {
+            let result = reduce_source_wallet_flows_with_provider_settlements(
+                fifth_activity_window(&owner, &rows),
+                &census,
+                &[],
+                std::slice::from_ref(&settlement),
+            );
+            assert_eq!(result.coverage, SourceFlowCoverage::Unknown);
+        }
+
+        let mut wrong_time = ctf_v2_activity(&settlement, total, &token_id, side, 0);
+        wrong_time.timestamp += 1;
+        wrong_time.raw["timestamp"] = json!(wrong_time.timestamp);
+        let result = reduce_source_wallet_flows_with_provider_settlements(
+            fifth_activity_window(&owner, std::slice::from_ref(&wrong_time)),
+            &census,
+            &[],
+            std::slice::from_ref(&settlement),
+        );
+        assert_eq!(result.coverage, SourceFlowCoverage::Unknown);
+
+        let mut wrong_locator = ctf_v2_fixture(&settlement, false);
+        wrong_locator.census.logs[0].locator = "wrong-locator".to_owned();
+        let result = reduce_source_wallet_flows_with_provider_settlements(
+            fifth_activity_window(&owner, &[]),
+            &wrong_locator,
+            &[],
+            std::slice::from_ref(&settlement),
+        );
+        assert_eq!(result.coverage, SourceFlowCoverage::Unknown);
+
+        let mut wrong_counterparty = ctf_v2_fixture(&settlement, false);
+        let leg = &settlement.wallet_legs()[0];
+        let movement = wrong_counterparty
+            .census
+            .logs
+            .iter_mut()
+            .find(|log| log.log_index == leg.log_index())
+            .unwrap();
+        if format!("{:#x}", leg.from()).eq_ignore_ascii_case(&owner) {
+            movement.to = "0x3333333333333333333333333333333333333333".to_owned();
+        } else {
+            movement.from = "0x3333333333333333333333333333333333333333".to_owned();
+        }
+        let result = reduce_source_wallet_flows_with_provider_settlements(
+            fifth_activity_window(&owner, &[]),
+            &wrong_counterparty,
+            &[],
+            std::slice::from_ref(&settlement),
+        );
+        assert_eq!(result.coverage, SourceFlowCoverage::Unknown);
+
+        let extra = ctf_v2_fixture(&settlement, true);
+        let result = reduce_source_wallet_flows_with_provider_settlements(
+            fifth_activity_window(&owner, &[]),
+            &extra,
+            &[],
+            std::slice::from_ref(&settlement),
+        );
+        assert_eq!(result.coverage, SourceFlowCoverage::Unknown);
+        assert!(result.unresolved.iter().any(|item| {
+            item.movement_locator
+                .as_deref()
+                .is_some_and(|locator| locator.ends_with(":999"))
+        }));
+
+        let duplicate_settlements = [settlement.clone(), settlement.clone()];
+        let result = reduce_source_wallet_flows_with_provider_settlements(
+            fifth_activity_window(&owner, &[]),
+            &census,
+            &[],
+            &duplicate_settlements,
         );
         assert_eq!(result.coverage, SourceFlowCoverage::Unknown);
     }

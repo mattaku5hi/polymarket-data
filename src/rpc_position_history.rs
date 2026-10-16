@@ -16,6 +16,8 @@ use crate::position_history::{
     TRANSFER_BATCH_TOPIC, TRANSFER_SINGLE_TOPIC, normalize_address, normalize_hash, normalize_log,
 };
 
+#[cfg(feature = "chain-audit")]
+pub mod ctf_v2_context;
 pub mod current_interval_census;
 pub mod current_interval_transactions;
 #[cfg(feature = "chain-audit")]
