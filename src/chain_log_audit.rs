@@ -38,6 +38,14 @@ mod ctf_condition_state;
 mod ctf_operations;
 mod ctf_position_identity;
 mod ctf_v2_provider_settlement;
+#[cfg(test)]
+pub(crate) use ctf_v2_provider_settlement::ctf_v2_negrisk_mint_settlement::provider_ctf_v2_negrisk_mint_settlement;
+pub use ctf_v2_provider_settlement::ctf_v2_negrisk_mint_settlement::{
+    ProviderReportedCtfV2NegRiskMintSettlement, ProviderReportedCtfV2NegRiskMintSettlementError,
+    decode_provider_reported_ctf_v2_negrisk_mint_settlement,
+    provider_reported_ctf_v2_negrisk_mint_settlement_candidate,
+};
+
 mod fifth_binary_trades;
 mod fifth_code_context;
 mod fifth_direct_legacy_migration;

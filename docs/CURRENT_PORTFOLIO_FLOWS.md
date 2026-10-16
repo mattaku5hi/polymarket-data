@@ -41,7 +41,7 @@ qualification, NAV, high-water state or an execution guarantee.
 With `chain-audit`, `current_wallet_flow::capture_current_wallet_flow_observation`
 acquires one wallet's declared block/hash interval, derives Activity bounds from
 its headers, reads32-block log chunks and selected transactions/receipts, and
-resolves fifth BinaryModule or standard CTF V2 asset context where needed. Defaults cap the entire
+resolves fifth BinaryModule, standard CTF V2 or NegRisk V2 asset context where needed. Defaults cap the entire
 capture at8 Activity requests,256 RPC calls,32MiB raw response bodies,120seconds
 and32 candidate transactions. Each subsequent phase receives only the remaining
 global budget; there are no automatic retries. Unsupported or omitted candidate
@@ -96,7 +96,10 @@ amounts and complete locators; it never suppresses a whole transaction merely
 because one trade matched. Present V2 Activity TRADE rows must have exact
 aggregate share totals by transaction, full token ID, side and block timestamp.
 One aggregate row or split rows may corroborate the same total; duplicate or
-partial totals remain Unknown. This does not establish row-to-fill identity or
+partial totals remain Unknown. Activity token IDs use `token_id`; previously accepted `asset`-only rows
+remain supported, and conflicting or malformed aliases refuse. Independently
+observed V2 owner fills must match exact settlement locators and economics
+before being consumed. This does not establish Activity-row-to-fill identity or
 a gross/net meaning for Activity `usdc_size`. Absent Activity trades can be
 accepted only through the complete declared owner-leg projection.
 
@@ -130,3 +133,32 @@ strict offline replay still compares the recomputed report with the saved
 report. An old wrong-order projection or a formerly Unknown observation whose
 classification changes can therefore be refused after a decoder correction.
 No old report is silently upgraded to known coverage.
+
+
+## NegRisk V2 one-maker complementary mint
+
+With `chain-audit`, `negrisk_v2_context` binds the selected E222 Exchange,
+its outcome-token factory, legacy NegRisk adapter, wrapped collateral, USDC.e,
+pUSD and pUSD vault through15 ordinary RPC calls,256KiB and30seconds. The
+before/after block headers must match the selected census anchor. Getter
+relationships remain ProviderReported/Unbound; no deployed-code identity or
+historical state proof is inferred.
+
+`decode_provider_reported_ctf_v2_negrisk_mint_settlement` accepts the narrow
+E222 one-maker both-BUY split route. It derives the complementary CTF IDs from
+the declared condition and observed wrapped collateral, binds the signed outer
+transaction and complete ordered receipt, and retains exact owner cash/position
+legs and gross fills with separate fees. The supported principal satisfies
+`active_fill + maker_fill == minted_amount`; refunds, multiple makers, merge,
+mixed calls and other conversions remain unsupported. The three modeled USDC.e
+pairs have Transfer before Approval. Approval values are allowance metadata,
+never extra capital flows. The existing final Bor-fee separation applies.
+
+The additive all-provider-settlements reducer and bounded wallet facade accept
+this opaque projection under the same exact-leg and Activity share-total rules.
+NegRisk contexts consume the existing global capture budgets. Such captures use
+artifact version3; versions1/2 retain their field shape and strict recomputed
+report comparison. No decoder rejection or omitted context becomes known flow
+coverage. Offline acceptance includes two independently saved real E222
+transactions, receipts and15-call contexts; it remains provider-reported evidence
+for those two observations, not a claim of general route completeness.

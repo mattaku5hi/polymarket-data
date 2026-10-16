@@ -24,6 +24,9 @@ use crate::rpc_position_history::ctf_v2_context::{
     RpcCurrentCtfV2Context, RpcCurrentCtfV2ContextSource, RpcCurrentCtfV2ImplementationVersion,
 };
 
+#[path = "ctf_v2_negrisk_mint_settlement.rs"]
+pub(super) mod ctf_v2_negrisk_mint_settlement;
+
 const EXCHANGE: &str = "0xe111180000d2663c0091e4f400237545b87b996b";
 const MATCH_SELECTOR: [u8; 4] = [0x3c, 0x2b, 0x43, 0x99];
 const ORDER_FILLED_SIGNATURE: &str =
@@ -107,6 +110,8 @@ impl ProviderReportedCtfV2WalletLeg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderReportedCtfV2OwnerFill {
     log_index: u64,
+    order_hash: B256,
+    raw_counterparty: Address,
     token_id: U256,
     side: ProviderReportedCtfV2Side,
     gross_making: U256,
@@ -119,6 +124,14 @@ impl ProviderReportedCtfV2OwnerFill {
     #[must_use]
     pub const fn log_index(&self) -> u64 {
         self.log_index
+    }
+    #[must_use]
+    pub const fn order_hash(&self) -> B256 {
+        self.order_hash
+    }
+    #[must_use]
+    pub const fn raw_counterparty(&self) -> Address {
+        self.raw_counterparty
     }
     #[must_use]
     pub const fn token_id(&self) -> U256 {
@@ -345,6 +358,8 @@ pub fn decode_provider_reported_ctf_v2_complementary_settlement(
             {
                 Some(ProviderReportedCtfV2OwnerFill {
                     log_index: log.log_index,
+                    order_hash: fill.hash,
+                    raw_counterparty: fill.taker,
                     token_id: fill.token_id,
                     side: fill.side,
                     gross_making: fill.making,
@@ -830,6 +845,8 @@ fn add_active_owner_fill(
             {
                 fills.push(ProviderReportedCtfV2OwnerFill {
                     log_index: log.log_index,
+                    order_hash: fill.hash,
+                    raw_counterparty: fill.taker,
                     token_id: fill.token_id,
                     side: fill.side,
                     gross_making: fill.making,
@@ -907,6 +924,19 @@ pub(crate) mod tests {
 
     fn fixture() -> (Value, Value, String, RpcCurrentCtfV2Context) {
         fixture_with_active_quote(500)
+    }
+
+    fn assert_fill_matches_receipt(fill: &ProviderReportedCtfV2OwnerFill, receipt: &Value) {
+        let log = &receipt["logs"][usize::try_from(fill.log_index()).unwrap()];
+        let topics = log["topics"].as_array().unwrap();
+        assert_eq!(
+            fill.order_hash(),
+            B256::from_str(topics[1].as_str().unwrap()).unwrap()
+        );
+        assert_eq!(
+            format!("{:#x}", fill.raw_counterparty()),
+            super::super::topic_address(topics[3].as_str().unwrap()).unwrap()
+        );
     }
 
     fn fixture_with_active_quote(
@@ -1473,6 +1503,7 @@ pub(crate) mod tests {
         assert_eq!(settlement.chain_id(), 137);
         assert_eq!(settlement.wallet_legs().len(), 5);
         assert_eq!(settlement.owner_fills().len(), 1);
+        assert_fill_matches_receipt(&settlement.owner_fills()[0], &receipt);
         assert_eq!(
             settlement.owner_fills()[0].role(),
             ProviderReportedCtfV2OrderRole::Active
@@ -1502,6 +1533,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(maker_a_settlement.owner_fills().len(), 1);
+        assert_fill_matches_receipt(&maker_a_settlement.owner_fills()[0], &receipt);
         assert_eq!(
             maker_a_settlement.owner_fills()[0].role(),
             ProviderReportedCtfV2OrderRole::Maker
@@ -1536,6 +1568,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(maker_b_settlement.owner_fills().len(), 1);
+        assert_fill_matches_receipt(&maker_b_settlement.owner_fills()[0], &receipt);
         assert_eq!(
             maker_b_settlement.owner_fills()[0].role(),
             ProviderReportedCtfV2OrderRole::Maker

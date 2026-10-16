@@ -20,9 +20,11 @@ use crate::{
         MAX_ACTIVITY_PAGE_SIZE, PolymarketActivityHintClient, WalletActivityHintLimits,
     },
     chain_log_audit::{
-        ProviderReportedCtfV2Settlement, ProviderReportedFifthSettlement,
-        decode_provider_reported_ctf_v2_complementary_settlement,
+        ProviderReportedCtfV2NegRiskMintSettlement, ProviderReportedCtfV2Settlement,
+        ProviderReportedFifthSettlement, decode_provider_reported_ctf_v2_complementary_settlement,
+        decode_provider_reported_ctf_v2_negrisk_mint_settlement,
         decode_provider_reported_fifth_binary_settlement,
+        provider_reported_ctf_v2_negrisk_mint_settlement_candidate,
         provider_reported_ctf_v2_settlement_context_candidate,
         provider_reported_fifth_settlement_context_candidate,
     },
@@ -46,17 +48,23 @@ use crate::{
             RpcCurrentFifthBinaryContext, RpcCurrentFifthBinaryContextRequest,
             reverify_recorded_current_fifth_binary_context,
         },
+        negrisk_v2_context::{
+            MAX_NEG_RISK_V2_CONTEXT_CALLS, RpcCurrentNegRiskV2Context,
+            RpcCurrentNegRiskV2ContextRequest, reverify_recorded_current_neg_risk_v2_context,
+        },
     },
 };
 
 use super::current_interval_census::portfolio_flow::{
     SourceWalletActivityWindow, SourceWalletFlowReduction,
+    reduce_source_wallet_flows_with_all_provider_settlements,
     reduce_source_wallet_flows_with_fifth_settlements,
     reduce_source_wallet_flows_with_provider_settlements,
 };
 
-pub const CURRENT_WALLET_FLOW_ARTIFACT_VERSION: u32 = 2;
+pub const CURRENT_WALLET_FLOW_ARTIFACT_VERSION: u32 = 3;
 const LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION: u32 = 1;
+const CTF_V2_CURRENT_WALLET_FLOW_ARTIFACT_VERSION: u32 = 2;
 pub const CURRENT_WALLET_FLOW_DEFAULT_ACTIVITY_REQUESTS: usize = 8;
 pub const CURRENT_WALLET_FLOW_DEFAULT_RPC_REQUESTS: usize = 256;
 pub const CURRENT_WALLET_FLOW_DEFAULT_RAW_BYTES: usize = 32 * 1024 * 1024;
@@ -196,6 +204,11 @@ impl CurrentWalletFlowObservation {
     }
 
     #[must_use]
+    pub fn negrisk_v2_context_count(&self) -> usize {
+        self.packet.negrisk_v2_contexts.len()
+    }
+
+    #[must_use]
     pub fn total_rpc_request_count(&self) -> usize {
         self.packet
             .census
@@ -207,6 +220,12 @@ impl CurrentWalletFlowObservation {
             .saturating_add(saturating_sum(
                 self.packet
                     .ctf_v2_contexts
+                    .iter()
+                    .map(|item| item.request_count),
+            ))
+            .saturating_add(saturating_sum(
+                self.packet
+                    .negrisk_v2_contexts
                     .iter()
                     .map(|item| item.request_count),
             ))
@@ -225,6 +244,12 @@ impl CurrentWalletFlowObservation {
             .saturating_add(saturating_sum(
                 self.packet
                     .ctf_v2_contexts
+                    .iter()
+                    .map(|item| item.response_bytes),
+            ))
+            .saturating_add(saturating_sum(
+                self.packet
+                    .negrisk_v2_contexts
                     .iter()
                     .map(|item| item.response_bytes),
             ))
@@ -253,6 +278,7 @@ impl CurrentWalletFlowObservation {
         let packet: CurrentWalletFlowPacket =
             serde_json::from_slice(bytes).map_err(|_| CurrentWalletFlowError::InvalidArtifact)?;
         if packet.version != LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+            && packet.version != CTF_V2_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
             && packet.version != CURRENT_WALLET_FLOW_ARTIFACT_VERSION
         {
             return Err(CurrentWalletFlowError::UnsupportedVersion);
@@ -442,6 +468,8 @@ pub async fn capture_current_wallet_flow_observation(
     let mut skipped_context_blocks = 0usize;
     let mut ctf_v2_context_packets = Vec::new();
     let mut skipped_ctf_v2_context_blocks = 0usize;
+    let mut negrisk_v2_context_packets = Vec::new();
+    let mut skipped_negrisk_v2_context_blocks = 0usize;
     if let Some(capture) = &transactions {
         let mut candidates = BTreeSet::new();
         for tx in &capture.transactions {
@@ -513,12 +541,53 @@ pub async fn capture_current_wallet_flow_observation(
             ctf_v2_context_packets
                 .push(CtfV2ContextPacket::from_capture(&context, context_request));
         }
+
+        let mut negrisk_v2_candidates = BTreeSet::new();
+        for tx in &capture.transactions {
+            if let Some(anchor) =
+                provider_reported_ctf_v2_negrisk_mint_settlement_candidate(&tx.transaction)
+            {
+                negrisk_v2_candidates.insert(anchor);
+            }
+        }
+        for (block_number, expected_hash) in negrisk_v2_candidates {
+            if remaining_rpc < MAX_NEG_RISK_V2_CONTEXT_CALLS || remaining_bytes == 0 {
+                skipped_negrisk_v2_context_blocks += 1;
+                continue;
+            }
+            let context_request = RpcCurrentNegRiskV2ContextRequest {
+                block_number,
+                expected_hash,
+                max_requests: remaining_rpc.min(256),
+                max_total_response_bytes: remaining_bytes.min(256 * 1024),
+                total_timeout: remaining(deadline)?.min(Duration::from_secs(30)),
+            };
+            let context = timeout(
+                remaining(deadline)?,
+                rpc_reader.read_current_neg_risk_v2_context(&census.census, &context_request),
+            )
+            .await
+            .map_err(|_| CurrentWalletFlowError::CaptureFailed)??;
+            remaining_rpc = remaining_rpc
+                .checked_sub(context.request_count())
+                .ok_or(CurrentWalletFlowError::CaptureFailed)?;
+            remaining_bytes = remaining_bytes
+                .checked_sub(context.response_bytes())
+                .ok_or(CurrentWalletFlowError::CaptureFailed)?;
+            negrisk_v2_context_packets.push(NegRiskV2ContextPacket::from_capture(
+                &context,
+                context_request,
+            ));
+        }
     }
     let mut packet = CurrentWalletFlowPacket {
-        version: if ctf_v2_context_packets.is_empty() && skipped_ctf_v2_context_blocks == 0 {
-            LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
-        } else {
+        version: if !negrisk_v2_context_packets.is_empty() || skipped_negrisk_v2_context_blocks > 0
+        {
             CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+        } else if !ctf_v2_context_packets.is_empty() || skipped_ctf_v2_context_blocks > 0 {
+            CTF_V2_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+        } else {
+            LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
         },
         source: "provider_reported".to_owned(),
         capture_started_at,
@@ -532,10 +601,15 @@ pub async fn capture_current_wallet_flow_observation(
         skipped_context_blocks,
         ctf_v2_contexts: ctf_v2_context_packets,
         skipped_ctf_v2_context_blocks,
+        negrisk_v2_contexts: negrisk_v2_context_packets,
+        skipped_negrisk_v2_context_blocks,
         reduction: FlowPacket::empty(),
         content_sha256: String::new(),
     };
-    let reduction = packet.recompute_reduction().await?;
+    let reduction = timeout(remaining(deadline)?, packet.recompute_reduction())
+        .await
+        .map_err(|_| CurrentWalletFlowError::CaptureFailed)??;
+    packet.capture_completed_at = Utc::now();
     packet.reduction = FlowPacket::from_reduction(&reduction);
     packet.content_sha256 = packet.calculate_sha256()?;
     Ok(CurrentWalletFlowObservation { packet, reduction })
@@ -656,6 +730,44 @@ fn decode_ctf_v2_settlements(
         .collect()
 }
 
+async fn decode_negrisk_v2_settlements(
+    wallet: &str,
+    transactions: Option<&RpcCurrentIntervalTransactions>,
+    contexts: &[RpcCurrentNegRiskV2Context],
+) -> Vec<ProviderReportedCtfV2NegRiskMintSettlement> {
+    let Some(transactions) = transactions else {
+        return Vec::new();
+    };
+    let Ok(owner) = wallet.parse() else {
+        return Vec::new();
+    };
+    let mut settlements = Vec::new();
+    for tx in &transactions.transactions {
+        let Some((block_number, block_hash)) =
+            provider_reported_ctf_v2_negrisk_mint_settlement_candidate(&tx.transaction)
+        else {
+            continue;
+        };
+        let Some(context) = contexts.iter().find(|context| {
+            block_number == context.block_number()
+                && block_hash.eq_ignore_ascii_case(context.block_hash())
+        }) else {
+            continue;
+        };
+        if let Ok(settlement) = decode_provider_reported_ctf_v2_negrisk_mint_settlement(
+            &tx.transaction,
+            &tx.receipt,
+            owner,
+            context,
+        )
+        .await
+        {
+            settlements.push(settlement);
+        }
+    }
+    settlements
+}
+
 fn mark_unknown_for_limits(reduction: &mut SourceWalletFlowReduction) {
     use super::current_interval_census::portfolio_flow::{
         SourceFlowCoverage, SourceFlowReason, UnresolvedSourceMovement,
@@ -706,6 +818,10 @@ struct CurrentWalletFlowPacket {
     ctf_v2_contexts: Vec<CtfV2ContextPacket>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     skipped_ctf_v2_context_blocks: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    negrisk_v2_contexts: Vec<NegRiskV2ContextPacket>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    skipped_negrisk_v2_context_blocks: usize,
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -735,7 +851,7 @@ impl CurrentWalletFlowPacket {
         &self,
     ) -> Result<SourceWalletFlowReduction, CurrentWalletFlowError> {
         self.validate_capture_windows()?;
-        let (owner_census, transactions, contexts, ctf_v2_contexts) =
+        let (owner_census, transactions, contexts, ctf_v2_contexts, negrisk_v2_contexts) =
             self.replay_components().await?;
         self.activity
             .validate(&self.request, &owner_census.census)?;
@@ -758,6 +874,11 @@ impl CurrentWalletFlowPacket {
                         .iter()
                         .map(|context| context.request_count),
                 ))
+                .saturating_add(saturating_sum(
+                    self.negrisk_v2_contexts
+                        .iter()
+                        .map(|context| context.request_count),
+                ))
                 > self.request.limits.max_rpc_requests
             || self
                 .census
@@ -771,21 +892,38 @@ impl CurrentWalletFlowPacket {
                         .iter()
                         .map(|context| context.response_bytes),
                 ))
+                .saturating_add(saturating_sum(
+                    self.negrisk_v2_contexts
+                        .iter()
+                        .map(|context| context.response_bytes),
+                ))
                 .saturating_add(self.activity.total_response_bytes)
                 > self.request.limits.max_raw_response_bytes
             || self
                 .contexts
                 .len()
                 .saturating_add(self.ctf_v2_contexts.len())
+                .saturating_add(self.negrisk_v2_contexts.len())
                 > self.request.limits.max_candidate_transactions
             || self.skipped_candidate_transactions > 20_000
             || self.skipped_context_blocks > self.request.limits.max_candidate_transactions
             || self.skipped_ctf_v2_context_blocks > self.request.limits.max_candidate_transactions
+            || self.skipped_negrisk_v2_context_blocks
+                > self.request.limits.max_candidate_transactions
             || (self.version == LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
-                && (!self.ctf_v2_contexts.is_empty() || self.skipped_ctf_v2_context_blocks > 0))
-            || (self.version == CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+                && (!self.ctf_v2_contexts.is_empty()
+                    || self.skipped_ctf_v2_context_blocks > 0
+                    || !self.negrisk_v2_contexts.is_empty()
+                    || self.skipped_negrisk_v2_context_blocks > 0))
+            || (self.version == CTF_V2_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
                 && self.ctf_v2_contexts.is_empty()
                 && self.skipped_ctf_v2_context_blocks == 0)
+            || (self.version == CTF_V2_CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+                && (!self.negrisk_v2_contexts.is_empty()
+                    || self.skipped_negrisk_v2_context_blocks > 0))
+            || (self.version == CURRENT_WALLET_FLOW_ARTIFACT_VERSION
+                && self.negrisk_v2_contexts.is_empty()
+                && self.skipped_negrisk_v2_context_blocks == 0)
         {
             return Err(CurrentWalletFlowError::InvalidArtifact);
         }
@@ -806,23 +944,38 @@ impl CurrentWalletFlowPacket {
             transactions.as_ref(),
             &ctf_v2_contexts,
         );
+        let negrisk_v2_settlements = decode_negrisk_v2_settlements(
+            &self.request.wallet,
+            transactions.as_ref(),
+            &negrisk_v2_contexts,
+        )
+        .await;
         let mut reduction = if self.version == LEGACY_CURRENT_WALLET_FLOW_ARTIFACT_VERSION {
             reduce_source_wallet_flows_with_fifth_settlements(
                 activity,
                 &owner_census,
                 &fifth_settlements,
             )
-        } else {
+        } else if self.version == CTF_V2_CURRENT_WALLET_FLOW_ARTIFACT_VERSION {
             reduce_source_wallet_flows_with_provider_settlements(
                 activity,
                 &owner_census,
                 &fifth_settlements,
                 &ctf_v2_settlements,
             )
+        } else {
+            reduce_source_wallet_flows_with_all_provider_settlements(
+                activity,
+                &owner_census,
+                &fifth_settlements,
+                &ctf_v2_settlements,
+                &negrisk_v2_settlements,
+            )
         };
         if self.skipped_candidate_transactions > 0
             || self.skipped_context_blocks > 0
             || self.skipped_ctf_v2_context_blocks > 0
+            || self.skipped_negrisk_v2_context_blocks > 0
         {
             mark_unknown_for_limits(&mut reduction);
         }
@@ -917,6 +1070,23 @@ impl CurrentWalletFlowPacket {
             }
             previous_completed = context.completed_at;
         }
+        for context in &self.negrisk_v2_contexts {
+            if context.started_at < previous_completed
+                || context.started_at > context.completed_at
+                || context.completed_at > self.capture_completed_at
+                || context.completed_at > now
+                || elapsed_exceeds(
+                    context.started_at,
+                    context.completed_at,
+                    Duration::from_secs(30),
+                )
+                || context.request.timeout_millis == 0
+                || context.request.timeout_millis > duration_millis(limits.total_timeout)
+            {
+                return Err(CurrentWalletFlowError::InvalidArtifact);
+            }
+            previous_completed = context.completed_at;
+        }
         Ok(())
     }
 
@@ -928,6 +1098,7 @@ impl CurrentWalletFlowPacket {
             Option<RpcCurrentIntervalTransactions>,
             Vec<RpcCurrentFifthBinaryContext>,
             Vec<RpcCurrentCtfV2Context>,
+            Vec<RpcCurrentNegRiskV2Context>,
         ),
         CurrentWalletFlowError,
     > {
@@ -1050,6 +1221,32 @@ impl CurrentWalletFlowPacket {
             }
             ctf_v2_contexts.push(context);
         }
+        let mut negrisk_v2_contexts = Vec::with_capacity(self.negrisk_v2_contexts.len());
+        let mut negrisk_v2_context_anchors = BTreeSet::new();
+        for packet in &self.negrisk_v2_contexts {
+            let request = packet.request.to_sdk_request()?;
+            if !negrisk_v2_context_anchors
+                .insert((request.block_number, request.expected_hash.clone()))
+            {
+                return Err(CurrentWalletFlowError::InvalidArtifact);
+            }
+            let context = reverify_recorded_current_neg_risk_v2_context(
+                &owner_census.census,
+                &request,
+                &packet.pages.to_sdk(),
+            )
+            .await?;
+            if context.request_count() != packet.request_count
+                || context.response_bytes() != packet.response_bytes
+                || context.source()
+                    != crate::rpc_position_history::negrisk_v2_context::RpcCurrentNegRiskV2ContextSource::ProviderReported
+                || context.implementation_version()
+                    != crate::rpc_position_history::negrisk_v2_context::RpcCurrentNegRiskV2ImplementationVersion::Unbound
+            {
+                return Err(CurrentWalletFlowError::InvalidArtifact);
+            }
+            negrisk_v2_contexts.push(context);
+        }
         let required_context_anchors = transactions
             .as_ref()
             .into_iter()
@@ -1082,9 +1279,33 @@ impl CurrentWalletFlowPacket {
         {
             return Err(CurrentWalletFlowError::InvalidArtifact);
         }
+        let required_negrisk_v2_context_anchors = transactions
+            .as_ref()
+            .into_iter()
+            .flat_map(|capture| capture.transactions.iter())
+            .filter_map(|tx| {
+                provider_reported_ctf_v2_negrisk_mint_settlement_candidate(&tx.transaction)
+            })
+            .collect::<BTreeSet<_>>();
+        if negrisk_v2_context_anchors
+            .iter()
+            .any(|anchor| !required_negrisk_v2_context_anchors.contains(anchor))
+            || required_negrisk_v2_context_anchors
+                .len()
+                .saturating_sub(negrisk_v2_context_anchors.len())
+                != self.skipped_negrisk_v2_context_blocks
+        {
+            return Err(CurrentWalletFlowError::InvalidArtifact);
+        }
         self.activity
             .validate(&self.request, &owner_census.census)?;
-        Ok((owner_census, transactions, contexts, ctf_v2_contexts))
+        Ok((
+            owner_census,
+            transactions,
+            contexts,
+            ctf_v2_contexts,
+            negrisk_v2_contexts,
+        ))
     }
 }
 
@@ -1738,6 +1959,68 @@ impl CtfV2ContextRequestPacket {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+struct NegRiskV2ContextPacket {
+    request: NegRiskV2ContextRequestPacket,
+    pages: RpcPages,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    request_count: usize,
+    response_bytes: usize,
+}
+
+impl NegRiskV2ContextPacket {
+    fn from_capture(
+        context: &RpcCurrentNegRiskV2Context,
+        request: RpcCurrentNegRiskV2ContextRequest,
+    ) -> Self {
+        Self {
+            request: NegRiskV2ContextRequestPacket::from_request(&request),
+            pages: RpcPages::from_pages(context.pages()),
+            started_at: context.captured_started_at(),
+            completed_at: context.captured_completed_at(),
+            request_count: context.request_count(),
+            response_bytes: context.response_bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct NegRiskV2ContextRequestPacket {
+    block_number: u64,
+    expected_hash: String,
+    max_requests: usize,
+    max_total_response_bytes: usize,
+    timeout_millis: u64,
+}
+
+impl NegRiskV2ContextRequestPacket {
+    fn from_request(request: &RpcCurrentNegRiskV2ContextRequest) -> Self {
+        Self {
+            block_number: request.block_number,
+            expected_hash: request.expected_hash.clone(),
+            max_requests: request.max_requests,
+            max_total_response_bytes: request.max_total_response_bytes,
+            timeout_millis: request.total_timeout.as_millis().try_into().unwrap_or(1),
+        }
+    }
+
+    fn to_sdk_request(&self) -> Result<RpcCurrentNegRiskV2ContextRequest, CurrentWalletFlowError> {
+        if self.timeout_millis == 0 {
+            return Err(CurrentWalletFlowError::InvalidArtifact);
+        }
+        Ok(RpcCurrentNegRiskV2ContextRequest {
+            block_number: self.block_number,
+            expected_hash: self.expected_hash.clone(),
+            max_requests: self.max_requests,
+            max_total_response_bytes: self.max_total_response_bytes,
+            total_timeout: Duration::from_millis(self.timeout_millis),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct FlowPacket {
     wallet: String,
     start_block: u64,
@@ -2066,6 +2349,12 @@ mod tests {
         );
         assert!(legacy_packet.get("ctf_v2_contexts").is_none());
         assert!(legacy_packet.get("skipped_ctf_v2_context_blocks").is_none());
+        assert!(legacy_packet.get("negrisk_v2_contexts").is_none());
+        assert!(
+            legacy_packet
+                .get("skipped_negrisk_v2_context_blocks")
+                .is_none()
+        );
         let replayed = CurrentWalletFlowObservation::from_artifact(&artifact)
             .await
             .unwrap();
