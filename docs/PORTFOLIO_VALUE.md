@@ -24,9 +24,14 @@ evidence, null/missing values, malformed data and wrong-wallet responses.
 `collateral_cash::fetch_collateral_cash_snapshot(&client, rpc_url, &wallets)`
 reads pUSD and USDC.e for1–100 distinct canonical Polygon wallets. It checks
 chain137 and token decimals6, pins calls to one provider-reported finalized
-block and rechecks that block's header. One capture uses exactly `5 + 2*N`
-sequential RPC calls, with a30-second total deadline,10 seconds per call,
-64 KiB per response and1 MiB aggregate response bytes. Balances remain raw
+block and rechecks that block's header. Balances (and both `decimals()` reads)
+go through Multicall3 `aggregate3` at that block, at most 50 wallets per call
+with every sub-call required to succeed, so one capture uses exactly
+`3 + ceil(N/50)` sequential RPC calls (chain id, finalized header, one call per
+chunk, header recheck), starts spaced at least 200 ms apart, with a30-second
+total deadline,10 seconds per call, 64 KiB per response and1 MiB aggregate
+response bytes. Artifact version 2 records this layout; version 1 artifacts
+(`5 + 2*N` single `eth_call`s) still replay and keep their version label. Balances remain raw
 uint256 words; consumers perform their own checked monetary conversion.
 
 `collateral_cash::CollateralCashSnapshot::to_artifact()` writes a versioned
